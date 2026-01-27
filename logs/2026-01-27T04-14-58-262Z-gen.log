@@ -1,0 +1,3 @@
+# meta-gen gen 2026-01-27T04:14:58.262Z
+[2026-01-27T04:15:00.687Z] asset-error game=sr type=material name=星琼 out=C:\Users\X\Desktop\Bot-Dev\Yunzai\temp\metaGenerator\.output\meta-sr\material\normal\星琼.webp url=https://api.hakush.in/hsr/UI/itemfigures/1.webp error=missing from all sources (hakush/hoyowiki) hakush=HTTP 404
+[2026-01-27T04:15:07.896Z] asset-error game=sr type=material name=启行的祝福 out=C:\Users\X\Desktop\Bot-Dev\Yunzai\temp\metaGenerator\.output\meta-sr\material\normal\启行的祝福.webp url=https://api.hakush.in/hsr/UI/itemfigures/801.webp error=missing from all sources (hakush/hoyowiki) hakush=HTTP 404

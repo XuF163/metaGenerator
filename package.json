@@ -1,0 +1,26 @@
+{
+  "name": "meta-generator",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "TS meta generator for miao-plugin (meta-gs/meta-sr)",
+  "bin": {
+    "meta-gen": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "start": "node --enable-source-maps dist/cli.js",
+    "fetch": "node --enable-source-maps dist/cli.js fetch",
+    "gen": "node --enable-source-maps dist/cli.js gen",
+    "validate": "node --enable-source-maps dist/cli.js validate",
+    "calc": "node --enable-source-maps dist/cli.js calc"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0",
+    "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "sharp": "^0.34.5"
+  }
+}

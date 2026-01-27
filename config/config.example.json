@@ -1,0 +1,35 @@
+{
+  "//": "Copy to config.json (gitignored) and edit as needed.",
+  "baselineRoot": "plugins/miao-plugin/resources",
+  "outputRoot": "temp/metaGenerator/.output",
+  "games": ["gs", "sr"],
+  "types": ["artifact", "character", "material", "weapon"],
+  "network": {
+    "//": "Optional proxy/mirror for all HTTP(S) downloads. Either a prefix or a template with placeholders.",
+    "proxy": "",
+    "userAgent": "metaGenerator"
+  },
+  "validate": {
+    "strictExtra": false,
+    "sampleFiles": 800,
+    "seed": ""
+  },
+  "gen": {
+    "force": false,
+    "forceCache": false,
+    "forceAssets": false,
+    "//llmCalc": "可选：是否在 `meta-gen gen` 阶段使用 LLM 生成角色 calc.js（默认 false，建议用 `meta-gen calc` 进行可续跑批量升级）",
+    "llmCalc": false
+  },
+  "llm": {
+    "enabled": false,
+    "baseUrl": "https://api.openai.com",
+    "apiKey": "",
+    "apiKeyEnv": "META_LLM_API_KEY",
+    "chatCompletionsPath": "/v1/chat/completions",
+    "model": "",
+    "timeoutMs": 30000,
+    "retries": 2,
+    "maxConcurrency": 1
+  }
+}
