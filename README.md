@@ -1,4 +1,4 @@
-# metaGenerator (temp/metaGenerator)
+# metaGenerator 
 
 支持自托管的miao-plugin meta 资源生成工具  
 
@@ -52,4 +52,5 @@ metaGenerator 的数据与图片资源主要来自以下公开数据源（按用
 - Enka.Network（GS 武器图标后备）：https://enka.network/
 - HoneyHunterWorld（部分图标/分件图后备）：https://gensh.honeyhunterworld.com/
 
-
+## 许可证  
+CC BY-NC  
