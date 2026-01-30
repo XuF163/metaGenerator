@@ -16,7 +16,7 @@ import { downloadToFileOptional } from '../../../http/download-optional.js'
 import type { HakushClient } from '../../../source/hakush/client.js'
 import type { TurnBasedGameDataClient } from '../../../source/turnBasedGameData/client.js'
 import type { YattaClient } from '../../../source/yatta/client.js'
-import { logAssetError } from '../../../log/run-log.js'
+import { logAssetError, logDataError } from '../../../log/run-log.js'
 import { sortRecordByKey } from '../utils.js'
 import { writeSrArtifactAliasJs } from './artifact-alias.js'
 import { buildSrArtifactCalcJs } from './artifact-calc.js'
@@ -179,6 +179,8 @@ export async function generateSrArtifacts(opts: GenerateSrArtifactOptions): Prom
     const suiteOrder = isPlanar ? ['NECK', 'OBJECT'] : ['HEAD', 'HAND', 'BODY', 'FOOT']
 
     const idxs: Record<string, unknown> = {}
+    let missingDescLore = 0
+    const missingPieces: string[] = []
     for (let i = 0; i < partIds.length; i++) {
       const pid = partIds[i]!
       const p = partsRaw[pid]
@@ -212,12 +214,36 @@ export async function generateSrArtifacts(opts: GenerateSrArtifactOptions): Prom
       const idxKey = String(idxBase + i)
       ;({ desc, lore } = normalizeSrArtifactDescLoreForBaseline(id, idxKey, desc, lore))
 
+      if (!desc && !lore) {
+        missingDescLore++
+        missingPieces.push(`${idxKey}:${pieceName || pid}`)
+      }
+
       idxs[idxKey] = {
         name: pieceName,
         desc,
         lore,
         ids
       }
+    }
+
+    if (missingDescLore > 0) {
+      // Upstream sometimes does not have per-piece description/story for newly added relic sets.
+      // We keep empty fields (baseline compatibility) but record an error for follow-up.
+      const sample = missingPieces.slice(0, 6).join(',')
+      const more = missingPieces.length > 6 ? ` (+${missingPieces.length - 6})` : ''
+      const source = opts.yatta ? (yattaSuite ? 'yatta' : 'yatta:missing') : 'yatta:disabled'
+      const msg = `[meta-gen] (sr) artifact desc/lore missing: ${id} ${name} pieces=${missingDescLore}/${partIds.length} ${sample}${more}`
+      opts.log?.warn?.(msg)
+      logDataError({
+        game: 'sr',
+        type: 'artifact',
+        id: String(id),
+        name,
+        field: 'idxs.*.{desc,lore}',
+        source,
+        error: `missing pieces=${missingDescLore}/${partIds.length}`
+      })
     }
 
     // Skills: prefer list.set CN strings (they include ParamList).

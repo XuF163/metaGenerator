@@ -30,6 +30,8 @@ export interface CalcSuggestInput {
   star?: number
   // Candidate talent table names (must match keys available at runtime).
   tables: Partial<Record<TalentKey, string[]>>
+  // Optional skill description text (helps LLM/heuristics pick correct damage tables).
+  talentDesc?: Partial<Record<TalentKey, string>>
 }
 
 export interface CalcSuggestDetail {
@@ -64,7 +66,7 @@ function normalizeTableList(list: string[] | undefined): string[] {
   return uniq(list.map((s) => String(s || '').trim()).filter(Boolean))
 }
 
-function clampDetails(details: CalcSuggestDetail[], max = 10): CalcSuggestDetail[] {
+function clampDetails(details: CalcSuggestDetail[], max = 20): CalcSuggestDetail[] {
   const out: CalcSuggestDetail[] = []
   for (const d of details) {
     if (!d || typeof d !== 'object') continue
@@ -73,6 +75,34 @@ function clampDetails(details: CalcSuggestDetail[], max = 10): CalcSuggestDetail
     out.push(d)
   }
   return out
+}
+
+function normalizePromptText(text: unknown): string {
+  if (typeof text !== 'string') return ''
+  return text
+    .replace(/\u00a0/g, ' ')
+    .replaceAll('&nbsp;', ' ')
+    .replaceAll('\\n', ' ')
+    .replaceAll('\n', ' ')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/?[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function shortenText(text: string, maxLen: number): string {
+  if (!text) return ''
+  if (text.length <= maxLen) return text
+  return `${text.slice(0, maxLen)}…`
+}
+
+function pickDamageTable(tables: string[]): string | undefined {
+  const list = normalizeTableList(tables)
+  // Prefer explicit damage tables; avoid cooldown/energy/toughness-only tables.
+  const dmg = list.find((t) => /伤害/.test(t))
+  if (dmg) return dmg
+  // If no obvious damage table exists, skip (prevents generating nonsense like "战技伤害" -> "生命上限提高").
+  return undefined
 }
 
 function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
@@ -84,24 +114,31 @@ function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
   const details: CalcSuggestDetail[] = []
 
   if (input.game === 'gs') {
-    if (eTables[0]) details.push({ title: 'E伤害', talent: 'e', table: eTables[0], key: 'e' })
-    if (qTables[0]) details.push({ title: 'Q伤害', talent: 'q', table: qTables[0], key: 'q' })
-    if (aTables[0]) details.push({ title: '普攻伤害', talent: 'a', table: aTables[0], key: 'a', ele: 'phy' })
+    const e = pickDamageTable(eTables)
+    const q = pickDamageTable(qTables)
+    const a = pickDamageTable(aTables)
+    if (e) details.push({ title: 'E伤害', talent: 'e', table: e, key: 'e' })
+    if (q) details.push({ title: 'Q伤害', talent: 'q', table: q, key: 'q' })
+    if (a) details.push({ title: '普攻伤害', talent: 'a', table: a, key: 'a', ele: 'phy' })
     return {
       mainAttr: 'atk,cpct,cdmg',
-      defDmgKey: eTables[0] ? 'e' : qTables[0] ? 'q' : 'a',
+      defDmgKey: e ? 'e' : q ? 'q' : 'a',
       details
     }
   }
 
   // sr
-  if (aTables[0]) details.push({ title: '普攻伤害', talent: 'a', table: aTables[0], key: 'a' })
-  if (eTables[0]) details.push({ title: '战技伤害', talent: 'e', table: eTables[0], key: 'e' })
-  if (qTables[0]) details.push({ title: '终结技伤害', talent: 'q', table: qTables[0], key: 'q' })
-  if (tTables[0]) details.push({ title: '天赋伤害', talent: 't', table: tTables[0], key: 't' })
+  const a = pickDamageTable(aTables)
+  const e = pickDamageTable(eTables)
+  const q = pickDamageTable(qTables)
+  const t = pickDamageTable(tTables)
+  if (a) details.push({ title: '普攻伤害', talent: 'a', table: a, key: 'a' })
+  if (e) details.push({ title: '战技伤害', talent: 'e', table: e, key: 'e' })
+  if (q) details.push({ title: '终结技伤害', talent: 'q', table: q, key: 'q' })
+  if (t) details.push({ title: '天赋伤害', talent: 't', table: t, key: 't' })
   return {
     mainAttr: 'atk,cpct,cdmg',
-    defDmgKey: eTables[0] ? 'e' : qTables[0] ? 'q' : aTables[0] ? 'a' : 'e',
+    defDmgKey: e ? 'e' : q ? 'q' : a ? 'a' : 'e',
     details
   }
 }
@@ -114,19 +151,31 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
 
   const allowedTalents = input.game === 'gs' ? ['a', 'e', 'q'] : ['a', 'e', 'q', 't']
 
+  const descLines: string[] = []
+  const desc = input.talentDesc || {}
+  for (const k of allowedTalents as TalentKey[]) {
+    const t = normalizePromptText((desc as any)[k])
+    if (!t) continue
+    descLines.push(`- ${k}: ${shortenText(t, 260)}`)
+  }
+
   const user = [
-    `为 miao-plugin 生成 ${input.game === 'gs' ? '原神(GS)' : '星铁(SR)'} 角色 calc.js 的“最小可用”配置计划。`,
+    `为 miao-plugin 生成 ${input.game === 'gs' ? '原神(GS)' : '星铁(SR)'} 角色 calc.js 的配置计划（尽量对标基线 calc.js 的“详细程度”）。`,
     '',
     '你只需要输出 JSON（不要 Markdown，不要多余文字）。',
     '',
     '要求：',
     `- 只允许使用 talent 表：${allowedTalents.join(',')}`,
-    '- details 选择 3~8 条最常用的伤害项（不要太多）。',
+    '- details 建议 6~12 条（最多 20）。尽量覆盖普攻/战技/终结技/天赋等核心伤害项，以及常见变体（点按/长按/多段/追加/反击等）。',
+    '- 优先选择“可计算伤害”的表：通常表名包含「伤害」或类似字样；尽量不要选「冷却时间」「能量恢复」「削韧」等非伤害表。',
     '- 每条 detail 的 table 必须来自我给出的表名列表，不能编造。',
     '- mainAttr 只输出逗号分隔的属性 key（例如 atk,cpct,cdmg,mastery,recharge,hp,def,heal）。',
     '',
     `角色：${input.name} elem=${input.elem}${input.weapon ? ` weapon=${input.weapon}` : ''}${typeof input.star === 'number' ? ` star=${input.star}` : ''}`,
     '',
+    ...(descLines.length
+      ? ['技能描述摘要（用于判断哪些表是伤害倍率/选择标题，不要复述）：', ...descLines, '']
+      : []),
     '可用表名（严格从这里选）：',
     `- a: ${JSON.stringify(aTables)}`,
     `- e: ${JSON.stringify(eTables)}`,
@@ -167,7 +216,7 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
   }
 
   const detailsRaw = Array.isArray(plan.details) ? plan.details : []
-  const details = clampDetails(detailsRaw, 10).filter((d) => {
+  const details = clampDetails(detailsRaw, 20).filter((d) => {
     if (!okTalents.has(d.talent)) return false
     const allowed = tables[d.talent] || []
     if (!allowed.includes(d.table)) return false
@@ -206,7 +255,23 @@ export async function suggestCalcPlan(
 }
 
 export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, createdBy: string): string {
+  const inferDmgBase = (descRaw: unknown): 'atk' | 'hp' | 'def' => {
+    const desc = normalizePromptText(descRaw)
+    if (!desc) return 'atk'
+    // Avoid mis-detecting buff-only skills by requiring damage wording.
+    if (!/伤害/.test(desc)) return 'atk'
+    if (/(生命上限|生命值上限|最大生命值|生命值)/.test(desc)) return 'hp'
+    if (/防御力/.test(desc)) return 'def'
+    return 'atk'
+  }
+
+  const ratioFnLine =
+    input.game === 'gs'
+      ? 'const toRatio = (v) => { const n = Number(v); return Number.isFinite(n) ? n / 100 : 0 }\n'
+      : 'const toRatio = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }\n'
+
   const detailsLines: string[] = []
+  detailsLines.push(ratioFnLine.trimEnd())
   detailsLines.push('export const details = [')
 
   plan.details.forEach((d, idx) => {
@@ -220,17 +285,27 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     // Heuristic default: GS 普攻按物理计算（大多数角色）。
     const eleArg = ele ? `, ${ele}` : input.game === 'gs' && talent === 'a' ? `, "phy"` : ''
 
+    const base = inferDmgBase((input.talentDesc as any)?.[talent])
+    const useBasic = base !== 'atk' && /伤害/.test(d.table)
+
     detailsLines.push('  {')
     detailsLines.push(`    title: ${title},`)
     detailsLines.push(`    dmgKey: ${JSON.stringify(d.key || talent)},`)
-    detailsLines.push(`    dmg: ({ talent }, dmg) => dmg(talent.${talent}[${table}], ${key}${eleArg})`)
+    detailsLines.push(
+      useBasic
+        ? `    dmg: ({ talent, attr, calc }, dmg) => dmg.basic(calc(attr.${base}) * toRatio(talent.${talent}[${table}]), ${key}${eleArg})`
+        : `    dmg: ({ talent }, dmg) => dmg(talent.${talent}[${table}], ${key}${eleArg})`
+    )
     detailsLines.push(idx === plan.details.length - 1 ? '  }' : '  },')
   })
 
   detailsLines.push(']')
 
   const defDmgKey = (plan.defDmgKey && plan.defDmgKey.trim()) || (plan.details[0]?.key || plan.details[0]?.talent || 'e')
-  const defDmgIdx = 0
+  const defDmgIdx = Math.max(
+    0,
+    plan.details.findIndex((d) => (d.key || d.talent) === defDmgKey)
+  )
 
   return [
     `// Auto-generated by ${createdBy}.`,

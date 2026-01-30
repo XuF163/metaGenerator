@@ -33,6 +33,37 @@ function splitByLast(name: string, needle: string): { left: string; right: strin
 }
 
 const GENERIC_RIGHT = new Set(['尊者', '贤人', '系囚', '信使'])
+const KEEP_RIGHT_FULL_SUFFIX = new Set(['站点', '轨迹'])
+
+function stripCjkQuotes(s: string): string {
+  return s.replaceAll('「', '').replaceAll('」', '')
+}
+
+function derivePieceAbbr(pieceNameRaw: string): string {
+  const pieceName = cleanName(pieceNameRaw)
+  if (!pieceName) return ''
+
+  const { left, right } = splitByLast(pieceName, '的')
+  if (!left || !right) return pieceName
+
+  const prefix = stripCjkQuotes(cleanName(left))
+  let r = cleanName(right)
+  if (!prefix || !r) return pieceName
+
+  // Baseline-style shortening rules for common SR relic/ornament piece naming patterns.
+  r = r.replaceAll('之', '') // e.g. 诞生之岛 -> 诞生岛
+  if (r.endsWith('马靴')) r = r.replace(/马靴$/, '靴') // e.g. 铆钉马靴 -> 铆钉靴
+  if (r.endsWith('枝蔓') && r.length === 4) r = r.slice(0, 2) // e.g. 建木枝蔓 -> 建木
+
+  if (r.length === 4 && KEEP_RIGHT_FULL_SUFFIX.has(r.slice(-2))) {
+    return `${prefix}的${r}`
+  }
+
+  // Most piece names are "XXYY" where YY is the part noun (2 chars).
+  if (r.length === 4) r = r.slice(-2)
+
+  return `${prefix}的${r}`
+}
 
 function bestToken(segRaw: string): string {
   const seg = cleanName(segRaw)
@@ -111,6 +142,7 @@ function buildExportsJs(k: string, obj: Record<string, string>): string {
 
 export function buildSrArtifactAliasJs(artifactIndex: Record<string, unknown>): string {
   const sets: Array<{ name: string; skills: string[] }> = []
+  const pieceNames = new Set<string>()
   for (const v of Object.values(artifactIndex)) {
     if (!isRecord(v)) continue
     const name = cleanName(toStr(v.name))
@@ -118,6 +150,13 @@ export function buildSrArtifactAliasJs(artifactIndex: Record<string, unknown>): 
     const skillsRaw = isRecord(v.skills) ? (v.skills as Record<string, unknown>) : {}
     const skillTexts = Object.values(skillsRaw).filter((s): s is string => typeof s === 'string' && Boolean(s.trim()))
     sets.push({ name, skills: skillTexts })
+
+    const idxsRaw = isRecord(v.idxs) ? (v.idxs as Record<string, unknown>) : {}
+    for (const idxV of Object.values(idxsRaw)) {
+      if (!isRecord(idxV)) continue
+      const n = cleanName(toStr(idxV.name))
+      if (n) pieceNames.add(n)
+    }
   }
 
   // Element alias count (keep only unique ones to avoid collisions).
@@ -136,6 +175,11 @@ export function buildSrArtifactAliasJs(artifactIndex: Record<string, unknown>): 
   const artiAbbr: Record<string, string> = {}
   const artiSetAbbr: Record<string, string> = {}
   const aliasCfg: Record<string, string> = {}
+
+  for (const piece of [...pieceNames].sort()) {
+    const abbr = derivePieceAbbr(piece)
+    if (abbr && abbr !== piece) artiAbbr[piece] = abbr
+  }
 
   for (const name of namesSorted) {
     const abbr = pickUniqueToken(deriveAbbrCandidates(name), usedAbbr)
@@ -171,7 +215,7 @@ export function buildSrArtifactAliasJs(artifactIndex: Record<string, unknown>): 
     '/**',
     ' * Relic alias/abbr table (generated).',
     ' *',
-    ' * Derived from meta-sr/artifact/data.json set names and effect texts.',
+    ' * Derived from meta-sr/artifact/data.json set/piece names and effect texts.',
     ' * Do NOT edit by hand. Re-run `meta-gen gen` to regenerate.',
     ' */',
     '',

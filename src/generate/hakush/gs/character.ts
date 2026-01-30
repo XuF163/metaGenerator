@@ -692,13 +692,18 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
           const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
           const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
           const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+          const getDesc = (k: 'a' | 'e' | 'q'): string => {
+            const blk = (giTalent.talent as any)?.[k]
+            return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+          }
           const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(llm, {
             game: 'gs',
             name: `旅行者/${elem}`,
             elem,
             weapon,
             star,
-            tables: { a: aTables, e: eTables, q: qTables }
+            tables: { a: aTables, e: eTables, q: qTables },
+            talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
           }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
           if (error) {
             log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (旅行者/${elem}), using heuristic: ${error}`)
@@ -1162,13 +1167,18 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
       const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
       const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
       const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+      const getDesc = (k: 'a' | 'e' | 'q'): string => {
+        const blk = (giTalent.talent as any)?.[k]
+        return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+      }
       const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(llm, {
         game: 'gs',
         name,
         elem,
         weapon,
         star,
-        tables: { a: aTables, e: eTables, q: qTables }
+        tables: { a: aTables, e: eTables, q: qTables },
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
       if (error) {
         log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
@@ -1968,6 +1978,10 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
       const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
       const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+      const getDesc = (k: 'a' | 'e' | 'q'): string => {
+        const blk = (giTalent.talent as any)?.[k]
+        return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+      }
 
       const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(opts.llm, {
         game: 'gs',
@@ -1975,7 +1989,8 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
         elem,
         weapon,
         star,
-        tables: { a: aTables, e: eTables, q: qTables }
+        tables: { a: aTables, e: eTables, q: qTables },
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
 
       if (error) {

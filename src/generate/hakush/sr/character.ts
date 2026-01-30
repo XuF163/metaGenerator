@@ -98,6 +98,29 @@ const srTalentBlockIdStringCompatIds = new Set(['8001', '8002', '8003', '8004', 
 // Baseline stores `allegiance: null` for some Trailblazer forms.
 const srNullAllegianceCompatIds = new Set(['8003', '8004', '8005', '8006'])
 
+// Baseline overrides for missing/fallback allegiance (upstream sources may return null/empty).
+const srAllegianceCompatById: Record<string, string> = {
+  // 三月七·巡猎
+  '1224': '星穹列车',
+  // Trailblazer (Memory)
+  '8007': '星穹列车',
+  '8008': '星穹列车'
+}
+
+// Baseline overrides for missing/combined CV fields.
+const srCvCompatById: Record<string, { cn?: string; jp?: string }> = {
+  // 三月七·巡猎
+  '1224': { cn: '诺亚', jp: '小倉唯' },
+  // 克拉拉（baseline uses only Clara's CV, not both Clara+史瓦罗）
+  '1107': { cn: '紫苏九月', jp: '日高里菜' },
+  // Trailblazer (Memory)
+  '8007': { cn: '秦且歌', jp: '榎木淳弥' },
+  '8008': { cn: '陈婷婷', jp: '石川由依' }
+}
+
+// Baseline rounds a subset of Trailblazer promotion base attrs more aggressively.
+const srAttrBaseRound2CompatIds = new Set(['8001', '8002', '8003', '8004', '8005', '8006'])
+
 const srTalentConsCompatById: Record<string, Record<string, string | number>> = {
   // Baseline icon-selection convention for E3/E5:
   // - 知更鸟 E3 affects E+Q but prefers Q icon; E5 affects A+T but prefers A icon.
@@ -272,7 +295,8 @@ function normalizeTextInline(text: unknown): string {
     .replaceAll('\\n', ' ')
     .replaceAll('\n', ' ')
     .replace(/\s+/g, ' ')
-    .replace(/\s*——\s*/g, '——')
+    // Keep baseline-style spacing before "——" but strip any trailing spaces after it.
+    .replace(/——\s+/g, '——')
     .replace(/\s+([。！？；，、])/g, '$1')
     .replaceAll('?', '•')
     .trim()
@@ -301,6 +325,15 @@ function normalizeSrRichText(text: unknown, opts?: { stripUnderline?: boolean })
     out = out.replace(/<\/?u>/g, '')
   }
   return out.trim()
+}
+
+function applyFateCollabTextCompat(text: string): string {
+  return text
+    .replaceAll('红色衣衫', '红色圣骸布')
+    // Fate collab baseline keeps spaces after `，` but removes sentence-breaking spaces after `。！？；、`.
+    .replace(/([。！？；、])\s+(?=[\u4e00-\u9fff])/g, '$1')
+    // Fate collab baseline also keeps "——" tight (no surrounding spaces).
+    .replace(/\s*——\s*/g, '——')
 }
 
 function wrapElemSpan(desc: string, elemCn: string): string {
@@ -428,25 +461,20 @@ function loadSrMaterialNameToIdMap(metaSrRootAbs: string): Map<string, string> {
 function formatConstParam(value: number, format: string, pct: string, opts?: { charId?: number; mode?: SrConstPercentMode }): string {
   if (pct === '%') {
     const p = value * 100
-    if (format === 'i') {
-      const int = Math.round(p)
-      if (Number.isFinite(int) && Math.abs(p - int) < 1e-9) {
-        const cid = opts?.charId ? String(opts.charId) : ''
-        const mode: SrConstPercentMode = opts?.mode || 'talent'
-        const noDecimal =
-          cid &&
-          ((mode === 'rank' && srPercentNoDecimalInRankIds.has(cid)) ||
-            (mode === 'talent' && srPercentNoDecimalInTalentIds.has(cid)))
-        if (noDecimal) return `${int}%`
-        return `${p.toFixed(1)}%`
-      }
-      return `${p.toFixed(1)}%`
-    }
+    const int = Math.round(p)
+    const isInt = Number.isFinite(int) && Math.abs(p - int) < 1e-9
+    const cid = opts?.charId ? String(opts.charId) : ''
+    const mode: SrConstPercentMode = opts?.mode || 'talent'
+    const noDecimal =
+      cid &&
+      ((mode === 'rank' && srPercentNoDecimalInRankIds.has(cid)) || (mode === 'talent' && srPercentNoDecimalInTalentIds.has(cid)))
+    if (isInt && noDecimal) return `${int}%`
     if (format === 'f2') return `${p.toFixed(2)}%`
     return `${p.toFixed(1)}%`
   }
-  if (format === 'f1') return value.toFixed(1)
-  if (format === 'f2') return value.toFixed(2)
+  // Baseline trims trailing ".0"/".00" for non-percent placeholders.
+  if (format === 'f1') return String(parseFloat(value.toFixed(1)))
+  if (format === 'f2') return String(parseFloat(value.toFixed(2)))
   if (Number.isInteger(value)) return String(value)
   return String(value)
 }
@@ -465,7 +493,8 @@ function renderSrTextWithParams(rawDesc: unknown, paramList: unknown, opts?: { c
     if (v == null) return m
     return formatConstParam(v, fmt, pct, { charId: opts?.charId, mode: 'rank' })
   })
-  return normalizeSrRichText(replaced, { stripUnderline: true })
+  // Baseline keeps <u> underline markers in constellation/trace text.
+  return normalizeSrRichText(replaced)
 }
 
 function guessPrimaryParamName(descPlain: string, idx: number): string {
@@ -1152,16 +1181,16 @@ function buildTreeData(
   return sortRecordByKey(out as Record<string, unknown>)
 }
 
-function buildAttr(detail: Record<string, unknown>, itemAll: Record<string, unknown>, nameToId: Map<string, string>): Record<string, unknown> {
+function buildAttr(detail: Record<string, unknown>, itemAll: Record<string, unknown>, nameToId: Map<string, string>, charId: number): Record<string, unknown> {
   const stats = isRecord(detail.Stats) ? (detail.Stats as Record<string, unknown>) : {}
   const maxLevels = [20, 30, 40, 50, 60, 70, 80]
   const out: Record<string, unknown> = {}
   for (let promote = 0; promote <= 6; promote++) {
     const s = stats[String(promote)]
     if (!isRecord(s)) continue
-    const atkBase = toNum(s.AttackBase) ?? 0
+    let atkBase = toNum(s.AttackBase) ?? 0
     const atkAdd = toNum(s.AttackAdd) ?? 0
-    const hpBase = toNum(s.HPBase) ?? 0
+    let hpBase = toNum(s.HPBase) ?? 0
     const hpAdd = toNum(s.HPAdd) ?? 0
     const defBase = toNum(s.DefenceBase) ?? 0
     const defAdd = toNum(s.DefenceAdd) ?? 0
@@ -1170,6 +1199,11 @@ function buildAttr(detail: Record<string, unknown>, itemAll: Record<string, unkn
     const cdmg = ((toNum(s.CriticalDamage) ?? 0) * 100) || 50
     const aggro = toNum(s.BaseAggro) ?? 0
     const cost = materialListToCost(s.Cost, itemAll, nameToId)
+
+    if (srAttrBaseRound2CompatIds.has(String(charId))) {
+      atkBase = roundDecimal(atkBase, 2)
+      hpBase = roundDecimal(hpBase, 2)
+    }
 
     out[String(promote)] = {
       promote,
@@ -1699,9 +1733,7 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
 
     const isFateCollab = String(charId) === '1014' || String(charId) === '1015'
     if (isFateCollab && yattaDesc) {
-      yattaDesc = yattaDesc.replaceAll('红色衣衫', '红色圣骸布')
-      // Fate collab baseline keeps spaces after `，` but removes sentence-breaking spaces after `。/！/？/；/、`.
-      yattaDesc = yattaDesc.replace(/([。！？；、])\s+(?=[\u4e00-\u9fff])/g, '$1')
+      yattaDesc = applyFateCollabTextCompat(yattaDesc)
     }
 
     const { talent, talentId } = buildTalentAndIdMap(detailRaw, charId, elem)
@@ -1768,10 +1800,19 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     const coreIconId = resolveSrCoreSkillIconId(skillTrees, id)
     const tree = buildTree(skillTrees, charId)
     const treeData = buildTreeData(skillTrees, itemAll, nameToId, charId)
-    const attr = buildAttr(detailRaw, itemAll, nameToId)
+    const attr = buildAttr(detailRaw, itemAll, nameToId, charId)
 
-    const allegianceRaw = isFateCollab ? '？？？' : yattaFaction || (typeof info.Camp === 'string' ? info.Camp : '')
+    const allegianceRaw =
+      srAllegianceCompatById[String(charId)] ?? (isFateCollab ? '？？？' : yattaFaction || (typeof info.Camp === 'string' ? info.Camp : ''))
     const allegiance = srNullAllegianceCompatIds.has(String(charId)) ? null : allegianceRaw
+    const cvCompat = srCvCompatById[String(charId)] ?? {}
+    const cncv = cvCompat.cn ?? (yattaCvCn || (typeof va.Chinese === 'string' ? va.Chinese : ''))
+    const jpcv = cvCompat.jp ?? (yattaCvJp || (typeof va.Japanese === 'string' ? va.Japanese : ''))
+
+    let desc = yattaDesc || normalizeTextInline(detailRaw.Desc)
+    if (isFateCollab && desc) {
+      desc = applyFateCollabTextCompat(desc)
+    }
 
     let detailData: Record<string, unknown> = {
       id: srIdStringCompat.has(String(charId)) ? String(charId) : charId,
@@ -1782,9 +1823,9 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
       allegiance,
       weapon,
       sp: spDetail,
-      desc: yattaDesc || normalizeTextInline(detailRaw.Desc),
-      cncv: yattaCvCn || (typeof va.Chinese === 'string' ? va.Chinese : ''),
-      jpcv: yattaCvJp || (typeof va.Japanese === 'string' ? va.Japanese : ''),
+      desc,
+      cncv,
+      jpcv,
       baseAttr,
       growAttr,
       talentId,
@@ -1830,13 +1871,19 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
           .filter(Boolean)
       }
 
+      const getDesc = (k: 'a' | 'e' | 'q' | 't'): string => {
+        const blk = (talent as Record<string, unknown>)[k]
+        return isRecord(blk) && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+      }
+
       const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(opts.llm, {
         game: 'sr',
         name,
         elem,
         weapon,
         star,
-        tables: { a: getTables('a'), e: getTables('e'), q: getTables('q'), t: getTables('t') }
+        tables: { a: getTables('a'), e: getTables('e'), q: getTables('q'), t: getTables('t') },
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q'), t: getDesc('t') }
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
 
       if (error) {

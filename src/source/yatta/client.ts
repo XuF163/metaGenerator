@@ -8,7 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { writeJsonFile } from '../../fs/json.js'
-import { fetchJsonWithRetry } from '../../http/fetch.js'
+import { fetchWithRetry } from '../../http/fetch.js'
 import { readJsonFile } from './read-json.js'
 
 export type YattaLang = 'cn' | 'en' | string
@@ -48,7 +48,21 @@ export class YattaClient {
       }
     }
 
-    const json = await fetchJsonWithRetry(url, init, 2, 60_000)
+    // Yatta returns JSON bodies even for 404 (e.g. {"code":404,"data":"Data Not Found!"}).
+    // Cache those responses too to avoid repeated network churn/noise across runs.
+    const res = await fetchWithRetry(url, init, 2, 60_000)
+    let json: unknown
+    if (res.ok) {
+      json = await res.json()
+    } else if (res.status === 404) {
+      try {
+        json = await res.json()
+      } catch {
+        json = { code: 404, data: `HTTP 404 ${res.statusText}` }
+      }
+    } else {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`)
+    }
     writeJsonFile(filePath, json)
     this.log?.info?.(`[meta-gen] yatta cached ${relPath}`)
     return json

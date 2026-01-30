@@ -130,6 +130,15 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
             : null
       if (!tables) continue
 
+      const talentDesc: Partial<Record<'a' | 'e' | 'q' | 't', string>> = {}
+      const talentRaw = isRecord(metaRaw.talent) ? (metaRaw.talent as Record<string, unknown>) : null
+      if (talentRaw) {
+        for (const k of ['a', 'e', 'q', 't'] as const) {
+          const blk = talentRaw[k]
+          if (isRecord(blk) && typeof blk.desc === 'string') talentDesc[k] = blk.desc as string
+        }
+      }
+
       const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
         llm,
         {
@@ -138,7 +147,8 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
           elem,
           weapon,
           star,
-          tables
+          tables,
+          talentDesc
         },
         { cacheRootAbs: llmCacheRootAbs, force: options.forceCache }
       )

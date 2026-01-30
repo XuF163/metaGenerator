@@ -65,3 +65,22 @@ export function logAssetError(opts: {
   appendRunLog(parts.join(' '))
 }
 
+export function logDataError(opts: {
+  game: 'gs' | 'sr'
+  type: string
+  name?: string
+  id?: string
+  field?: string
+  source?: string
+  error?: string
+}): void {
+  const parts: string[] = []
+  parts.push(`data-error game=${opts.game} type=${opts.type}`)
+  if (opts.id) parts.push(`id=${opts.id}`)
+  if (opts.name) parts.push(`name=${opts.name}`)
+  if (opts.field) parts.push(`field=${opts.field}`)
+  if (opts.source) parts.push(`source=${opts.source}`)
+  if (opts.error) parts.push(`error=${opts.error}`)
+  appendRunLog(parts.join(' '))
+}
+
