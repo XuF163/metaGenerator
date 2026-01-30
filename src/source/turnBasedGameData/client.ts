@@ -92,4 +92,13 @@ export class TurnBasedGameDataClient {
   async getSrRelicSubAffixConfig(): Promise<unknown> {
     return this.getJsonCached('ExcelOutput/RelicSubAffixConfig.json')
   }
+
+  /**
+   * Lightcone (Equipment) skill config.
+   *
+   * Ref: ExcelOutput/EquipmentSkillConfig.json
+   */
+  async getSrEquipmentSkillConfig(): Promise<unknown> {
+    return this.getJsonCached('ExcelOutput/EquipmentSkillConfig.json')
+  }
 }

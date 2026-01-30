@@ -13,10 +13,12 @@ import type { ToolConfig } from '../config/config.js'
 
 export interface NetworkDefaults {
   proxy?: string
+  httpProxy?: string
   userAgent?: string
 }
 
 let proxy: string | undefined
+let httpProxy: string | undefined
 let userAgent = 'metaGenerator'
 
 function trimStr(v: unknown): string | undefined {
@@ -28,11 +30,16 @@ function trimStr(v: unknown): string | undefined {
 export function initNetworkDefaults(config?: ToolConfig | null): void {
   const cfg = config?.network
   proxy = trimStr(cfg?.proxy)
+  httpProxy = trimStr(cfg?.httpProxy)
   userAgent = trimStr(cfg?.userAgent) || 'metaGenerator'
 }
 
 export function getUserAgent(): string {
   return userAgent
+}
+
+export function getHttpProxy(): string | undefined {
+  return httpProxy
 }
 
 function stripProtocol(url: string): string {

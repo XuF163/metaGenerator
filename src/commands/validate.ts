@@ -40,6 +40,45 @@ function tryReadJson(filePath: string): { ok: true; data: unknown } | { ok: fals
   }
 }
 
+function jsonSubsetDiffPaths(base: unknown, out: unknown, limit: number): string[] {
+  const diffs: string[] = []
+
+  const push = (p: string, why: string): void => {
+    if (diffs.length >= limit) return
+    diffs.push(`${p || '(root)'}${why ? ` (${why})` : ''}`)
+  }
+
+  const walk = (a: unknown, b: unknown, p: string): void => {
+    if (diffs.length >= limit) return
+    if (a === b) return
+    if (a === null || b === null) {
+      push(p, 'null mismatch')
+      return
+    }
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!isDeepStrictEqual(a, b)) push(p, 'array mismatch')
+      return
+    }
+    if (typeof a !== 'object' || typeof b !== 'object') {
+      push(p, 'value mismatch')
+      return
+    }
+    const ao = a as Record<string, unknown>
+    const bo = b as Record<string, unknown>
+    for (const [k, v] of Object.entries(ao)) {
+      if (diffs.length >= limit) return
+      if (!(k in bo)) {
+        push(p ? `${p}.${k}` : k, 'missing')
+        continue
+      }
+      walk(v, bo[k], p ? `${p}.${k}` : k)
+    }
+  }
+
+  walk(base, out, '')
+  return diffs
+}
+
 /**
  * Check whether `base` is a structural subset of `out`.
  *
@@ -70,7 +109,7 @@ function isJsonSubset(base: unknown, out: unknown): boolean {
 export async function validateCommand(ctx: CommandContext, options: ValidateOptions): Promise<void> {
   const baselineRoot = resolveRepoPath(ctx, options.baselineRoot)
   const outputRoot = resolveRepoPath(ctx, options.outputRoot)
-  const { games, types, strictExtra, sampleFiles } = options
+  const { games, types, strictExtra, strictSha, sampleFiles } = options
   const typeSet = new Set(types)
 
   const reportDir = path.join(ctx.projectRoot, 'reports')
@@ -98,10 +137,12 @@ export async function validateCommand(ctx: CommandContext, options: ValidateOpti
       totalCompared: 0,
       missing: 0,
       different: 0,
+      warnings: 0,
       extra: 0
     },
     missingFiles: [],
     differentFiles: [],
+    warningFiles: [],
     extraFiles: []
   }
 
@@ -187,7 +228,13 @@ export async function validateCommand(ctx: CommandContext, options: ValidateOpti
         report.summary.different++
         report.differentFiles.push({
           file: item.relKey,
-          reason: strictExtra ? 'json content differs' : 'json output is not a superset of baseline'
+          reason: strictExtra
+            ? 'json content differs'
+            : (() => {
+                const diffs = jsonSubsetDiffPaths(a.data, b.data, 12)
+                const suffix = diffs.length ? ` (e.g. ${diffs.join(', ')})` : ''
+                return `json output is not a superset of baseline${suffix}`
+              })()
         })
       }
       continue
@@ -195,9 +242,14 @@ export async function validateCommand(ctx: CommandContext, options: ValidateOpti
 
     const [ha, hb] = await Promise.all([sha256File(item.baseFile), sha256File(item.outFile)])
     if (ha !== hb) {
-      report.summary.ok = false
-      report.summary.different++
-      report.differentFiles.push({ file: item.relKey, reason: 'sha256 differs' })
+      if (strictSha) {
+        report.summary.ok = false
+        report.summary.different++
+        report.differentFiles.push({ file: item.relKey, reason: 'sha256 differs' })
+      } else {
+        report.summary.warnings++
+        report.warningFiles.push({ file: item.relKey, reason: 'sha256 differs' })
+      }
     }
   }
 
@@ -237,7 +289,7 @@ export async function validateCommand(ctx: CommandContext, options: ValidateOpti
   const okText = report.summary.ok ? 'OK' : 'FAILED'
   ctx.log.info(
     `[meta-gen] validate ${okText}: compared=${report.summary.totalCompared} ` +
-      `missing=${report.summary.missing} diff=${report.summary.different} extra=${report.summary.extra}`
+      `missing=${report.summary.missing} diff=${report.summary.different} warn=${report.summary.warnings} extra=${report.summary.extra}`
   )
   ctx.log.info(
     `[meta-gen] sampling: mode=${report.meta.sampling.mode} sampleFiles=${report.meta.sampling.sampleFiles} ` +

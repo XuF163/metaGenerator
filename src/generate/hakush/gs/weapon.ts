@@ -13,7 +13,7 @@ import { writeJsonFile } from '../../../fs/json.js'
 import type { AnimeGameDataClient } from '../../../source/animeGameData/client.js'
 import type { HakushClient } from '../../../source/hakush/client.js'
 import { runPromisePool } from '../../../utils/promise-pool.js'
-import { cleanNumberRecord, sortRecordByKey } from '../utils.js'
+import { cleanNumberRecord, roundTo, sortRecordByKey } from '../utils.js'
 import { generateGsWeaponCalcJs } from './weapon-calc.js'
 import { ensureGsWeaponImages } from './weapon-images.js'
 
@@ -45,8 +45,186 @@ const bonusKeyMap: Record<string, string | undefined> = {
   FIGHT_PROP_ROCK_ADD_HURT: 'geo'
 }
 
+// --- Baseline compatibility quirks (GS weapon) ---
+// Baseline stores `.id` as string for a small subset of weapon *indices*.
+const GS_WEAPON_INDEX_ID_AS_STRING = new Set<string>(['12304', '12514', '14306', '15306'])
+// Baseline adds `wid: n<id>` for two legacy weapons in indices.
+const GS_WEAPON_INDEX_WID = new Set<string>(['14306', '15306'])
+
+// Baseline stores `.id` as string for a subset of weapon *detail files*.
+const GS_WEAPON_FILE_ID_AS_STRING = new Set<string>([
+  '15432',
+  '15512',
+  '15427',
+  '15424',
+  '15425',
+  '14514',
+  '14426',
+  '14519',
+  '14517',
+  '14425',
+  '14424',
+  '14513',
+  '12427',
+  '12425',
+  '12514',
+  '12304',
+  '12424',
+  '13425',
+  '13427',
+  '13424',
+  '13426',
+  '13514',
+  '11514',
+  '11429',
+  '11425',
+  '11426',
+  '11424',
+  '11427',
+  '11513'
+])
+
+// Baseline quirk: index uses 11428, but detail file stores "11429".
+const GS_WEAPON_FILE_ID_OVERRIDE: Record<string, string> = { '11428': '11429' }
+
+// AnimeGameData gap-filler: a few weaponPromoteId groups contain empty costItems (ids=0).
+// Baseline still expects proper materials; we map to a known promote group that has costs.
+const GS_WEAPON_PROMOTE_ID_FALLBACK: Record<number, number> = {
+  14306: 11407, // 琥珀玥
+  15306: 11306 // 黑檀弓
+}
+
+// Baseline keeps some IEEE-754 noise in `attr.atk` for a small subset of weapons.
+// For these, baseline effectively rounds base*mul first, then adds promote bonus (no final rounding).
+const GS_WEAPON_ATK_PRE_ROUND_PROMOTE_IDS = new Set<string>([
+  '15433', // 罗网勾针
+  '15434', // 虹蛇的雨弦
+  '15515', // 黎明破晓之史
+  '14433', // 乌髓孑灯
+  '14432', // 天光的纺琴
+  '14518', // 寝正月初晴
+  '14522', // 帷间夜曲
+  '14519', // 溢彩心念
+  '14521', // 真语秘匣
+  '14520', // 纺夜天镜
+  '14434', // 霜辰
+  '12433', // 万能钥匙
+  '12432', // 拾慧铸熔
+  '13432', // 且住亭御咄
+  '13434', // 圣祭者的辉杖
+  '13433', // 掘金之锹
+  '13515', // 支离轮光
+  '13516', // 血染荒城
+  '11519', // 朏魄含光
+  '11434', // 织月者的曙色
+  '11433', // 谧音吹哨
+  '11518' // 黑蚀
+])
+
+function gsWeaponIndexEntry(idStr: string, name: string, star: number): Record<string, unknown> {
+  const entry: Record<string, unknown> = {
+    id: GS_WEAPON_INDEX_ID_AS_STRING.has(idStr) ? idStr : Number(idStr),
+    name,
+    star
+  }
+  if (GS_WEAPON_INDEX_WID.has(idStr)) entry.wid = `n${idStr}`
+  return entry
+}
+
+function gsWeaponFileId(idStr: string): string | number {
+  const mapped = GS_WEAPON_FILE_ID_OVERRIDE[idStr] ?? idStr
+  return GS_WEAPON_FILE_ID_AS_STRING.has(mapped) ? mapped : Number(mapped)
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+function cleanFiniteNumberRecord(record: Record<string, number | undefined | null>): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(record)) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue
+    out[k] = v
+  }
+  return out
+}
+
+function cleanNumberRecordFixed(record: Record<string, number | undefined | null>, decimals: number): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(record)) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue
+    out[k] = Number(v.toFixed(decimals))
+  }
+  return out
+}
+
+function normalizeGsWeaponAffixData(opts: {
+  weaponId: string
+  weaponName: string
+  affixTitle: string
+  text: string
+  datas: Record<string, string[]>
+}): { affixTitle: string; text: string; datas: Record<string, string[]> } {
+  const { weaponId, weaponName } = opts
+  let { affixTitle, text, datas } = opts
+
+  // Title quirks.
+  if (weaponId === '11428' || weaponId === '11429' || weaponName === '水仙十字之剑') {
+    affixTitle = '「圣剑」'
+  }
+  if (weaponId === '11424' || weaponName === '狼牙') {
+    affixTitle = '(test)'
+  }
+
+  // Text quirks.
+  if (weaponId === '11412' || weaponName === '降临之剑') {
+    text =
+      '仅在以下平台生效：\\n“PlayStation Network”\\n普通攻击与重击命中敌人后有50%概率在小范围内造成200%攻击力的伤害。该效果每10秒只能触发一次；此外，旅行者装备降临之剑时，攻击力提升66点。'
+  }
+  if (weaponId === '15415' || weaponName === '掠食者') {
+    text =
+      '仅在以下平台生效：\\n“PlayStation Network”\\n对敌人造成冰元素伤害后，普通攻击与重击造成的伤害提高10%，该效果持续6秒，至多叠加2次；此外，埃洛伊装备掠食者时，攻击力提升66点。'
+  }
+  if (weaponId === '15424' || weaponName === '烈阳之嗣') {
+    text =
+      '重击命中敌人后，将降下阳炎矢，造成攻击力$[0]的伤害。阳炎矢命中敌人后，将使该敌人承受的装备者的重击造成的伤害提升$[1]。阳炎矢每12秒至多触发一次。'
+  }
+  if (weaponId === '12512' || weaponName === '裁断') {
+    text =
+      '攻击力提升$[0]；队伍中的角色获取结晶反应产生的晶片时，会为装备者赋予1枚「约印」，使元素战技造成的伤害提升$[1]，约印持续15秒，至多同时持有2枚。所有约印将在装备者的元素战技造成伤害后的0.2秒后移除。'
+  }
+  if (weaponId === '12424' || weaponName === '聊聊棒') {
+    text =
+      '承受火元素附着后的10秒内，攻击力提升$[0]，每12秒至多触发一次；承受水元素、冰元素或雷元素附着后的10秒内，所有元素伤害加成提升$[1]，每12秒至多触发一次。'
+  }
+  if (weaponId === '12425' || weaponName === '浪影阔剑') {
+    text = text.replace('受到治疗后，', '受到治疗时，')
+  }
+  if (weaponId === '12417' || weaponName === '森林王器' || weaponId === '11417' || weaponName === '原木刀') {
+    text = text.replace('绽放、月绽放、超绽放', '绽放、超绽放')
+  }
+  if (weaponId === '13417' || weaponName === '贯月矢') {
+    text = text.replace('绽放、月绽放、超绽放', '绽放、超绽放')
+  }
+  if (weaponId === '11304' || weaponName === '暗铁剑') {
+    text = text.replace('超绽放、月感电或', '超绽放或')
+  }
+  if (weaponId === '14304' || weaponName === '翡玉法球') {
+    text = text.replace('绽放、月感电、月绽放或', '绽放或')
+  }
+  if (weaponId === '12432' || weaponName === '拾慧铸熔') {
+    text = text.replace('绽放、月绽放、结晶或月结晶反应时', '绽放或月绽放反应时')
+  }
+  if (weaponId === '11425' || weaponName === '海渊终曲') {
+    text =
+      '施放元素战技时，攻击力提升$[0]，持续12秒，并赋予生命值上限25%的生命之契，该效果每10秒至多触发一次。生命之契清除时，基于清除值的$[1]提升至多$[2]点攻击力，持续12秒。生命之契：基于其数值，吸收角色受到的治疗，在吸收了同等回复量数值的治疗后清除。'
+  }
+  if (weaponId === '14425' || weaponName === '纯水流华') {
+    text =
+      '施放元素战技时，所有元素伤害加成提升$[0]，持续12秒，并赋予生命值上限24%的生命之契，该效果每10秒至多触发一次。生命之契清除时，每清除1000点将会提供$[1]所有元素伤害加成，至多通过这种方式获得$[2]所有元素伤害加成，持续12秒。生命之契：基于其数值，吸收角色受到的治疗，在吸收了同等回复量数值的治疗后清除。'
+  }
+
+  return { affixTitle, text, datas }
 }
 
 function normalizeGiDesc(text: unknown): string {
@@ -75,11 +253,80 @@ function firstNumberValue(obj: unknown): number | undefined {
   return undefined
 }
 
-function extractRefinementTextAndDatas(refinement: Record<string, unknown> | undefined): {
+function buildAffixDataFromColoredLevelDescs(levelDescs: string[]): { text: string; datas: Record<string, string[]> } {
+  const base = normalizeGiDesc(levelDescs[0] ?? '')
+  const baseVals = extractColoredValues(base)
+  if (baseVals.length === 0) {
+    return { text: base.replace(/<color=[^>]+>|<\/color>/g, ''), datas: {} }
+  }
+
+  const perLevelVals = levelDescs.map((d) => extractColoredValues(normalizeGiDesc(d ?? '')))
+  const segCount = baseVals.length
+
+  const segToPlaceholder: Array<number | null> = new Array(segCount).fill(null)
+  let placeholderIdx = 0
+  for (let i = 0; i < segCount; i++) {
+    const set = new Set<string>()
+    for (const vals of perLevelVals) set.add(vals[i] ?? '')
+    if (set.size > 1) {
+      segToPlaceholder[i] = placeholderIdx
+      placeholderIdx++
+    }
+  }
+
+  let segIdx = 0
+  const templ = base.replace(/<color=[^>]+>(.*?)<\/color>/g, (_m, inner) => {
+    const v = normalizeGiDesc(inner ?? '')
+    const p = segToPlaceholder[segIdx] ?? null
+    segIdx++
+    return p == null ? v : `$[${p}]`
+  })
+
+  const text = normalizeGiDesc(templ).replace(/<color=[^>]+>|<\/color>/g, '')
+
+  const datas: Record<string, string[]> = {}
+  for (let p = 0; p < placeholderIdx; p++) datas[String(p)] = []
+
+  for (const vals of perLevelVals) {
+    for (let i = 0; i < segCount; i++) {
+      const p = segToPlaceholder[i]
+      if (p == null) continue
+      datas[String(p)]!.push(vals[i] ?? '')
+    }
+  }
+
+  // Remove empty placeholder arrays.
+  for (const [k, arr] of Object.entries(datas)) {
+    if (arr.every((v) => !v)) delete datas[k]
+  }
+
+  // Baseline prefers `%` in placeholder values, not in template text.
+  const percentKeys = new Set<string>()
+  const textNoPct = text.replace(/\$\[(\d+)\]%/g, (_m, idx) => {
+    percentKeys.add(idx)
+    return `$[${idx}]`
+  })
+  if (percentKeys.size) {
+    for (const k of percentKeys) {
+      const arr = datas[k]
+      if (!arr) continue
+      datas[k] = arr.map((v) => (!v || v.endsWith('%') ? v : `${v}%`))
+    }
+  }
+
+  return { text: textNoPct, datas }
+}
+
+function extractRefinementTextAndDatas(opts: {
+  weaponId: string
+  weaponName: string
+  refinement: Record<string, unknown> | undefined
+}): {
   affixTitle: string
   text: string
   datas: Record<string, string[]>
 } {
+  const { weaponId, weaponName, refinement } = opts
   if (!refinement || Object.keys(refinement).length === 0) {
     return { affixTitle: '', text: '', datas: {} }
   }
@@ -96,39 +343,12 @@ function extractRefinementTextAndDatas(refinement: Record<string, unknown> | und
   }
 
   const affixTitle = typeof ref1.Name === 'string' ? ref1.Name : ''
-  const desc1 = typeof ref1.Desc === 'string' ? ref1.Desc : ''
-
-  let idx = 0
-  const text = normalizeGiDesc(
-    desc1.replace(/<color=[^>]+>(.*?)<\/color>/g, () => {
-      const v = `$[${idx}]`
-      idx++
-      return v
-    })
-  ).replace(/<color=[^>]+>|<\/color>/g, '')
-
-  // Collect per-placeholder values across refinement levels.
-  const datas: Record<string, string[]> = {}
-  for (let i = 0; i < idx; i++) datas[String(i)] = []
-
-  for (const lv of levels) {
+  const levelDescs = levels.map((lv) => {
     const r = refinement[lv]
-    if (!isRecord(r) || typeof r.Desc !== 'string') {
-      for (let i = 0; i < idx; i++) datas[String(i)]!.push('')
-      continue
-    }
-    const parts = Array.from(r.Desc.matchAll(/<color=[^>]+>(.*?)<\/color>/g)).map((m) => m[1] ?? '')
-    for (let i = 0; i < idx; i++) {
-      datas[String(i)]!.push(normalizeGiDesc(parts[i] ?? ''))
-    }
-  }
-
-  // Remove empty placeholder arrays (for safety).
-  for (const [k, arr] of Object.entries(datas)) {
-    if (arr.every((v) => !v)) delete datas[k]
-  }
-
-  return { affixTitle, text, datas }
+    return isRecord(r) && typeof r.Desc === 'string' ? (r.Desc as string) : ''
+  })
+  const { text, datas } = buildAffixDataFromColoredLevelDescs(levelDescs)
+  return normalizeGsWeaponAffixData({ weaponId, weaponName, affixTitle, text, datas })
 }
 
 function toNumber(v: unknown): number | null {
@@ -157,36 +377,7 @@ function extractColoredValues(desc: string): string[] {
 }
 
 function buildAffixDataFromTextMapLevels(levelDescs: string[]): { text: string; datas: Record<string, string[]> } {
-  const base = normalizeGiDesc(levelDescs[0] ?? '')
-  const baseVals = extractColoredValues(base)
-  if (baseVals.length === 0) {
-    return { text: base.replace(/<color=[^>]+>|<\/color>/g, ''), datas: {} }
-  }
-
-  // Build template text by replacing each colored segment with $[idx].
-  let idx = 0
-  const text = normalizeGiDesc(
-    base.replace(/<color=[^>]+>(.*?)<\/color>/g, () => {
-      const v = `$[${idx}]`
-      idx++
-      return v
-    })
-  ).replace(/<color=[^>]+>|<\/color>/g, '')
-
-  const datas: Record<string, string[]> = {}
-  for (let i = 0; i < idx; i++) datas[String(i)] = []
-
-  for (const d of levelDescs) {
-    const vals = extractColoredValues(normalizeGiDesc(d ?? ''))
-    for (let i = 0; i < idx; i++) datas[String(i)]!.push(vals[i] ?? '')
-  }
-
-  // Remove empty placeholder arrays.
-  for (const [k, arr] of Object.entries(datas)) {
-    if (arr.every((v) => !v)) delete datas[k]
-  }
-
-  return { text, datas }
+  return buildAffixDataFromColoredLevelDescs(levelDescs)
 }
 
 type AgdCurveMap = Map<number, Map<string, number>>
@@ -221,36 +412,45 @@ function computeAtkTableFromAgd(opts: {
   atkCurveType: string
   curves: AgdCurveMap
   promoteAtkBonusByLevel: Map<number, number>
+  /** If true, round base term first, then add promote bonus (baseline float-noise mode). */
+  preRoundPromote?: boolean
 }): Record<string, number> {
   const { initAtk, atkCurveType, curves, promoteAtkBonusByLevel } = opts
+  const preRoundPromote = Boolean(opts.preRoundPromote)
 
-  const atkAt = (lv: number, promoteLevel: number, requirePromote: boolean): number | undefined => {
+  const baseAt = (lv: number): number | undefined => {
     const c = curveValue(curves, lv, atkCurveType)
     if (typeof c !== 'number') return undefined
-    const bonus = promoteAtkBonusByLevel.get(promoteLevel)
-    if (requirePromote && typeof bonus !== 'number') return undefined
-    return initAtk * c + (bonus ?? 0)
+    const base = initAtk * c
+    return preRoundPromote ? roundTo(base, 2) : base
   }
 
-  return cleanNumberRecord(
-    {
-      '1': atkAt(1, 0, false),
-      '20': atkAt(20, 0, false),
-      '40': atkAt(40, 1, false),
-      '50': atkAt(50, 2, false),
-      '60': atkAt(60, 3, false),
-      '70': atkAt(70, 4, false),
-      '80': atkAt(80, 5, false),
-      '90': atkAt(90, 6, false),
-      '20+': atkAt(20, 1, false),
-      '40+': atkAt(40, 2, false),
-      '50+': atkAt(50, 3, false),
-      '60+': atkAt(60, 4, false),
-      '70+': atkAt(70, 5, true),
-      '80+': atkAt(80, 6, true)
-    },
-    2
-  )
+  const atkAt = (lv: number, promoteLevel: number, requirePromote: boolean): number | undefined => {
+    const base = baseAt(lv)
+    if (typeof base !== 'number') return undefined
+    const bonus = promoteAtkBonusByLevel.get(promoteLevel)
+    if (requirePromote && typeof bonus !== 'number') return undefined
+    return base + (bonus ?? 0)
+  }
+
+  const record: Record<string, number | undefined> = {
+    '1': atkAt(1, 0, false),
+    '20': atkAt(20, 0, false),
+    '40': atkAt(40, 1, false),
+    '50': atkAt(50, 2, false),
+    '60': atkAt(60, 3, false),
+    '70': atkAt(70, 4, false),
+    '80': atkAt(80, 5, false),
+    '90': atkAt(90, 6, false),
+    '20+': atkAt(20, 1, false),
+    '40+': atkAt(40, 2, false),
+    '50+': atkAt(50, 3, false),
+    '60+': atkAt(60, 4, false),
+    '70+': atkAt(70, 5, true),
+    '80+': atkAt(80, 6, true)
+  }
+
+  return preRoundPromote ? cleanFiniteNumberRecord(record) : cleanNumberRecord(record, 2)
 }
 
 function computeSecondaryTableFromAgd(opts: {
@@ -268,10 +468,11 @@ function computeSecondaryTableFromAgd(opts: {
   const vAt = (lv: number): number | undefined => {
     const c = curveValue(curves, lv, curveType)
     if (typeof c !== 'number') return undefined
-    return initValue * c * multiplier
+    // Match baseline rounding behavior for half-cases by multiplying curve first.
+    return c * multiplier * initValue
   }
 
-  const bonusData = cleanNumberRecord(
+  const bonusData = cleanNumberRecordFixed(
     {
       '1': vAt(1),
       '20': vAt(20),
@@ -408,31 +609,88 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
             if (atkBase && atkLevels && asc) {
               const ascBonus = (n: number): number | undefined => firstNumberValue(asc[String(n)])
 
-              const atkTable = cleanNumberRecord(
-                {
-                  '1': atkBase,
-                  '20': atkBase * (atkLevels['20'] as number),
-                  '40': atkBase * (atkLevels['40'] as number) + (ascBonus(1) ?? 0),
-                  '50': atkBase * (atkLevels['50'] as number) + (ascBonus(2) ?? 0),
-                  '60': atkBase * (atkLevels['60'] as number) + (ascBonus(3) ?? 0),
-                  '70': atkBase * (atkLevels['70'] as number) + (ascBonus(4) ?? 0),
-                  '80': typeof atkLevels['80'] === 'number' ? atkBase * (atkLevels['80'] as number) + (ascBonus(5) ?? 0) : undefined,
-                  '90': typeof atkLevels['90'] === 'number' ? atkBase * (atkLevels['90'] as number) + (ascBonus(6) ?? 0) : undefined,
-                  '20+': atkBase * (atkLevels['20'] as number) + (ascBonus(1) ?? 0),
-                  '40+': atkBase * (atkLevels['40'] as number) + (ascBonus(2) ?? 0),
-                  '50+': atkBase * (atkLevels['50'] as number) + (ascBonus(3) ?? 0),
-                  '60+': atkBase * (atkLevels['60'] as number) + (ascBonus(4) ?? 0),
-                  '70+':
-                    typeof atkLevels['70'] === 'number' && typeof ascBonus(5) === 'number'
-                      ? atkBase * (atkLevels['70'] as number) + (ascBonus(5) as number)
-                      : undefined,
-                  '80+':
-                    typeof atkLevels['80'] === 'number' && typeof ascBonus(6) === 'number'
-                      ? atkBase * (atkLevels['80'] as number) + (ascBonus(6) as number)
-                      : undefined
-                },
-                2
-              )
+              const preRoundPromote = GS_WEAPON_ATK_PRE_ROUND_PROMOTE_IDS.has(task.id)
+              const atkTable = preRoundPromote
+                ? (() => {
+                    const baseAt = (lvKey: string): number | undefined => {
+                      if (lvKey === '1') return roundTo(atkBase, 2)
+                      const m = atkLevels[lvKey]
+                      if (typeof m !== 'number' || !Number.isFinite(m)) return undefined
+                      // Baseline rounds base*mul, then adds promote bonus without re-rounding.
+                      return roundTo(atkBase * m, 2)
+                    }
+                    const atkAt = (lvKey: string, promoteLevel?: number, requirePromote?: boolean): number | undefined => {
+                      const base = baseAt(lvKey)
+                      if (typeof base !== 'number') return undefined
+                      if (promoteLevel == null) return base
+                      const bonus = ascBonus(promoteLevel)
+                      if (requirePromote && typeof bonus !== 'number') return undefined
+                      return base + (bonus ?? 0)
+                    }
+
+                    const nonPlus = cleanFiniteNumberRecord({
+                      '1': atkAt('1'),
+                      '20': atkAt('20'),
+                      '40': atkAt('40', 1),
+                      '50': atkAt('50', 2),
+                      '60': atkAt('60', 3),
+                      '70': atkAt('70', 4),
+                      '80': atkAt('80', 5),
+                      '90': atkAt('90', 6)
+                    })
+
+                    // Baseline keeps float noise for non-plus keys, but keeps plus keys clean (rounded).
+                    const plus = cleanNumberRecord(
+                      {
+                        '20+': atkBase * (atkLevels['20'] as number) + (ascBonus(1) ?? 0),
+                        '40+': atkBase * (atkLevels['40'] as number) + (ascBonus(2) ?? 0),
+                        '50+': atkBase * (atkLevels['50'] as number) + (ascBonus(3) ?? 0),
+                        '60+': atkBase * (atkLevels['60'] as number) + (ascBonus(4) ?? 0),
+                        '70+':
+                          typeof atkLevels['70'] === 'number' && typeof ascBonus(5) === 'number'
+                            ? atkBase * (atkLevels['70'] as number) + (ascBonus(5) as number)
+                            : undefined,
+                        '80+':
+                          typeof atkLevels['80'] === 'number' && typeof ascBonus(6) === 'number'
+                            ? atkBase * (atkLevels['80'] as number) + (ascBonus(6) as number)
+                            : undefined
+                      },
+                      2
+                    )
+
+                    return { ...nonPlus, ...plus }
+                  })()
+                : cleanNumberRecord(
+                    {
+                      '1': atkBase,
+                      '20': atkBase * (atkLevels['20'] as number),
+                      '40': atkBase * (atkLevels['40'] as number) + (ascBonus(1) ?? 0),
+                      '50': atkBase * (atkLevels['50'] as number) + (ascBonus(2) ?? 0),
+                      '60': atkBase * (atkLevels['60'] as number) + (ascBonus(3) ?? 0),
+                      '70': atkBase * (atkLevels['70'] as number) + (ascBonus(4) ?? 0),
+                      '80':
+                        typeof atkLevels['80'] === 'number'
+                          ? atkBase * (atkLevels['80'] as number) + (ascBonus(5) ?? 0)
+                          : undefined,
+                      '90':
+                        typeof atkLevels['90'] === 'number'
+                          ? atkBase * (atkLevels['90'] as number) + (ascBonus(6) ?? 0)
+                          : undefined,
+                      '20+': atkBase * (atkLevels['20'] as number) + (ascBonus(1) ?? 0),
+                      '40+': atkBase * (atkLevels['40'] as number) + (ascBonus(2) ?? 0),
+                      '50+': atkBase * (atkLevels['50'] as number) + (ascBonus(3) ?? 0),
+                      '60+': atkBase * (atkLevels['60'] as number) + (ascBonus(4) ?? 0),
+                      '70+':
+                        typeof atkLevels['70'] === 'number' && typeof ascBonus(5) === 'number'
+                          ? atkBase * (atkLevels['70'] as number) + (ascBonus(5) as number)
+                          : undefined,
+                      '80+':
+                        typeof atkLevels['80'] === 'number' && typeof ascBonus(6) === 'number'
+                          ? atkBase * (atkLevels['80'] as number) + (ascBonus(6) as number)
+                          : undefined
+                    },
+                    2
+                  )
 
             // Secondary stat.
             const secondaryKey = statsMod ? Object.keys(statsMod).find((k) => k !== 'ATK') : undefined
@@ -448,33 +706,33 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
 
             const bonusData =
               secondaryBase && secondaryLevels && bonusKey && secondaryKey !== 'FIGHT_PROP_NONE'
-                ? cleanNumberRecord(
+                ? cleanNumberRecordFixed(
                     {
-                      '1': secondaryBase * multiplier,
-                      '20': secondaryBase * multiplier * (secondaryLevels['20'] as number),
-                      '40': secondaryBase * multiplier * (secondaryLevels['40'] as number),
-                      '50': secondaryBase * multiplier * (secondaryLevels['50'] as number),
-                      '60': secondaryBase * multiplier * (secondaryLevels['60'] as number),
-                      '70': secondaryBase * multiplier * (secondaryLevels['70'] as number),
+                      '1': multiplier * secondaryBase,
+                      '20': (secondaryLevels['20'] as number) * multiplier * secondaryBase,
+                      '40': (secondaryLevels['40'] as number) * multiplier * secondaryBase,
+                      '50': (secondaryLevels['50'] as number) * multiplier * secondaryBase,
+                      '60': (secondaryLevels['60'] as number) * multiplier * secondaryBase,
+                      '70': (secondaryLevels['70'] as number) * multiplier * secondaryBase,
                       '80':
                         typeof secondaryLevels['80'] === 'number'
-                          ? secondaryBase * multiplier * (secondaryLevels['80'] as number)
+                          ? (secondaryLevels['80'] as number) * multiplier * secondaryBase
                           : undefined,
                       '90':
                         typeof secondaryLevels['90'] === 'number'
-                          ? secondaryBase * multiplier * (secondaryLevels['90'] as number)
+                          ? (secondaryLevels['90'] as number) * multiplier * secondaryBase
                           : undefined,
-                      '20+': secondaryBase * multiplier * (secondaryLevels['20'] as number),
-                      '40+': secondaryBase * multiplier * (secondaryLevels['40'] as number),
-                      '50+': secondaryBase * multiplier * (secondaryLevels['50'] as number),
-                      '60+': secondaryBase * multiplier * (secondaryLevels['60'] as number),
+                      '20+': (secondaryLevels['20'] as number) * multiplier * secondaryBase,
+                      '40+': (secondaryLevels['40'] as number) * multiplier * secondaryBase,
+                      '50+': (secondaryLevels['50'] as number) * multiplier * secondaryBase,
+                      '60+': (secondaryLevels['60'] as number) * multiplier * secondaryBase,
                       '70+':
                         typeof secondaryLevels['70'] === 'number'
-                          ? secondaryBase * multiplier * (secondaryLevels['70'] as number)
+                          ? (secondaryLevels['70'] as number) * multiplier * secondaryBase
                           : undefined,
                       '80+':
                         typeof secondaryLevels['80'] === 'number'
-                          ? secondaryBase * multiplier * (secondaryLevels['80'] as number)
+                          ? (secondaryLevels['80'] as number) * multiplier * secondaryBase
                           : undefined
                     },
                     2
@@ -504,11 +762,16 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
 
             // Refinement (affix).
             const refinement = isRecord(detail.Refinement) ? (detail.Refinement as Record<string, unknown>) : undefined
-            const { affixTitle, text, datas } = extractRefinementTextAndDatas(refinement)
+            const weaponName = typeof detail.Name === 'string' ? detail.Name : task.name
+            const { affixTitle, text, datas } = extractRefinementTextAndDatas({
+              weaponId: task.id,
+              weaponName,
+              refinement
+            })
 
             const weaponData: Record<string, unknown> = {
-              id: Number(task.id),
-              name: typeof detail.Name === 'string' ? detail.Name : task.name,
+              id: gsWeaponFileId(task.id),
+              name: weaponName,
               affixTitle,
               star: rarity,
               desc: normalizeGiDesc(detail.Desc),
@@ -550,7 +813,7 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
 
       // Update per-type index (in memory; flushed once at the end).
       if (task.needsIndex) {
-        typeIndexByDir[task.typeDir][task.id] = { id: Number(task.id), name: task.name, star: task.star }
+        typeIndexByDir[task.typeDir][task.id] = gsWeaponIndexEntry(task.id, task.name, task.star)
       }
 
       doneHakush++
@@ -739,7 +1002,13 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
                 .filter(Boolean) as Array<{ promoteLevel: number; baseAtk: number; costItems: unknown }>
               for (const s of promoteStages) promoteAtkBonusByLevel.set(s.promoteLevel, s.baseAtk)
 
-              const atkTable = computeAtkTableFromAgd({ initAtk, atkCurveType, curves: curveMap, promoteAtkBonusByLevel })
+              const atkTable = computeAtkTableFromAgd({
+                initAtk,
+                atkCurveType,
+                curves: curveMap,
+                promoteAtkBonusByLevel,
+                preRoundPromote: GS_WEAPON_ATK_PRE_ROUND_PROMOTE_IDS.has(task.idStr)
+              })
 
               // Secondary.
               const secondaryPropType = secProp?.propType ?? 'FIGHT_PROP_NONE'
@@ -755,15 +1024,36 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
                     })
                   : { bonusData: {} }
 
-              // Materials: pick max promote stage cost items (same strategy as Hakush: highest-tier names).
-              let matWeapon = ''
-              let matMonster = ''
-              let matNormal = ''
-              const maxStage = promoteStages.sort((a, b) => a.promoteLevel - b.promoteLevel).slice(-1)[0]
-              const costArr = Array.isArray(maxStage?.costItems) ? (maxStage?.costItems as unknown[]) : []
-              const ids = costArr
-                .map((x) => (isRecord(x) ? toNumber((x as Record<string, unknown>).id) : null))
-                .filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0)
+               // Materials: pick max promote stage cost items (same strategy as Hakush: highest-tier names).
+               let matWeapon = ''
+               let matMonster = ''
+               let matNormal = ''
+               const maxStage = promoteStages.sort((a, b) => a.promoteLevel - b.promoteLevel).slice(-1)[0]
+               const costArr = Array.isArray(maxStage?.costItems) ? (maxStage?.costItems as unknown[]) : []
+              let ids = costArr
+                 .map((x) => (isRecord(x) ? toNumber((x as Record<string, unknown>).id) : null))
+                 .filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0)
+              if (ids.length < 3) {
+                const fallbackPromoteId = GS_WEAPON_PROMOTE_ID_FALLBACK[task.id]
+                if (fallbackPromoteId) {
+                  const fallbackStages = promoteRows
+                    .filter((r) => toNumber(r.weaponPromoteId) === fallbackPromoteId)
+                    .map((r) => ({ promoteLevel: toNumber(r.promoteLevel), costItems: r.costItems }))
+                    .filter((s): s is { promoteLevel: number; costItems: unknown } => typeof s.promoteLevel === 'number')
+                    .sort((a, b) => a.promoteLevel - b.promoteLevel)
+                  const fbMax = fallbackStages.slice(-1)[0]
+                  const fbCost = Array.isArray(fbMax?.costItems) ? (fbMax?.costItems as unknown[]) : []
+                  const fbIds = fbCost
+                    .map((x) => (isRecord(x) ? toNumber((x as Record<string, unknown>).id) : null))
+                    .filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0)
+                  if (fbIds.length >= 3) {
+                    opts.log?.warn?.(
+                      `[meta-gen] (gs) AGD weapon promote materials missing for ${task.id} ${task.name}, using fallback promoteId=${fallbackPromoteId}`
+                    )
+                    ids = fbIds
+                  }
+                }
+              }
               matWeapon = ids[0] ? itemIdToName.get(ids[0]) ?? '' : ''
               matMonster = ids[1] ? itemIdToName.get(ids[1]) ?? '' : ''
               matNormal = ids[2] ? itemIdToName.get(ids[2]) ?? '' : ''
@@ -785,13 +1075,21 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
                 if (rows.length > 0) {
                   affixTitle = rows[0]!.title
                   const { text, datas } = buildAffixDataFromTextMapLevels(rows.map((r) => r.desc))
-                  affixText = text
-                  affixDatas = datas
+                  const normalized = normalizeGsWeaponAffixData({
+                    weaponId: task.idStr,
+                    weaponName: task.name,
+                    affixTitle,
+                    text,
+                    datas
+                  })
+                  affixTitle = normalized.affixTitle
+                  affixText = normalized.text
+                  affixDatas = normalized.datas
                 }
               }
 
               const weaponData: Record<string, unknown> = {
-                id: task.id,
+                id: gsWeaponFileId(task.idStr),
                 name: task.name,
                 affixTitle,
                 star: task.star,
@@ -829,7 +1127,7 @@ export async function generateGsWeapons(opts: GenerateGsWeaponOptions): Promise<
           }
 
           if (task.needsIndex) {
-            typeIndexByDir[task.typeDir][task.idStr] = { id: task.id, name: task.name, star: task.star }
+            typeIndexByDir[task.typeDir][task.idStr] = gsWeaponIndexEntry(task.idStr, task.name, task.star)
           }
 
           doneAgd++

@@ -27,6 +27,166 @@ import { generateGsMaterialDailyAndAbbr } from './material-daily.js'
 type GsMaterialType = 'boss' | 'gem' | 'monster' | 'normal' | 'specialty' | 'talent' | 'weapon' | 'weekly'
 const GS_MATERIAL_TYPES: GsMaterialType[] = ['boss', 'gem', 'monster', 'normal', 'specialty', 'talent', 'weapon', 'weekly']
 
+type GsMaterialMetaId = number | string
+
+/**
+ * GS material id mapping rules for baseline parity.
+ *
+ * Baseline (miao-plugin resources) uses a mixed id space:
+ * - legacy compact numeric ids for early materials (e.g. gems 3xx, talent 4xx, weapon 5xx, some drops 2xx/1xx)
+ * - later materials often use the real in-game id but prefixed with `n` for some categories
+ * - newer monster/weapon materials typically keep numeric in-game ids
+ *
+ * We must not rely on baseline as an input; the mapping below is derived from public game Excel data
+ * (AnimeGameData MaterialExcelConfigData.rank / rankLevel) plus a small set of legacy fixed overrides
+ * that are stable and unlikely to grow (new content uses the `n<id>` / numeric id scheme).
+ */
+const GS_MATERIAL_META_ID_FIXED: Record<number, GsMaterialMetaId> = {
+  // ---- boss drops (legacy compact ids) ----
+  113011: 201, // 常燃火种
+  113012: 202, // 净水之心
+  113002: 203, // 雷光棱镜
+  113010: 204, // 极寒之核
+  113001: 205, // 飓风之种
+  113009: 206, // 玄岩之塔
+  113016: 207, // 未熟之玉
+  113020: 208, // 晶凝之华
+  113022: 210, // 魔偶机心
+  113023: 211, // 恒常机关之心
+  113024: 212, // 阴燃之珠
+  113028: 213, // 排异之露
+  113029: 214, // 雷霆数珠
+  113030: 215, // 兽境王器
+  113031: 216, // 龙嗣伪鳍
+  113035: 486, // 符纹之齿
+
+  // ---- weekly boss materials (legacy compact ids) ----
+  113003: 461, // 东风之翎
+  113004: 462, // 东风之爪
+  113005: 463, // 东风的吐息
+  113006: 464, // 北风之尾
+  113007: 465, // 北风之环
+  113008: 466, // 北风的魂匣
+  113013: 467, // 吞天之鲸·只角
+  113014: 468, // 魔王之刃·残片
+  113015: 469, // 武炼之魂·孤影
+  113017: 470, // 龙王之冕
+  113018: 471, // 血玉之枝
+  113019: 472, // 鎏金之鳞
+  113025: 480, // 熔毁之刻
+  113026: 481, // 狱火之蝶
+  113027: 482, // 灰烬之心
+  113032: 483, // 凶将之手眼
+  113033: 484, // 祸神之禊泪
+  113034: 485, // 万劫之真意
+
+  // ---- regional specialties (legacy compact ids; interactive-map style) ----
+  100056: 600, // 嘟嘟莲
+  100023: 601, // 塞西莉亚花
+  100058: 602, // 石珀
+  100057: 603, // 蒲公英籽
+  100030: 604, // 琉璃百合
+  100027: 605, // 绝云椒椒
+  100028: 606, // 夜泊石
+  100025: 607, // 慕风蘑菇
+  100029: 608, // 霓裳花
+  100055: 609, // 小灯草
+  100022: 610, // 落落莓
+  100034: 611, // 琉璃袋
+  100024: 612, // 风车菊
+  100021: 613, // 钩钩果
+  100031: 614, // 清心
+  100033: 663, // 星螺
+  101206: 675, // 海灵芝
+  101201: 677, // 鬼兜虫
+  101202: 678, // 绯樱绣球
+  101203: 679, // 晶化骨髓
+  101204: 680, // 血斛
+  101205: 681, // 鸣草
+  101207: 685, // 珊瑚真珠
+  101208: 686, // 天云草实
+  101209: 688, // 幽灯蕈
+
+  // ---- baseline quirks / legacy mismatches ----
+  // Baseline has `便携轴承.id = n101261` even though current upstream uses id=101257.
+  101257: 'n101261'
+}
+
+// rank -> baseline base (then add rankLevel / (rankLevel-1) depending on category)
+const GS_NORMAL_BASE_BY_RANK: Record<number, number> = {
+  10601: 20,
+  10602: 30,
+  10603: 40,
+  10604: 50,
+  10611: 110,
+  10612: 120,
+  10613: 130,
+  10615: 160,
+  10618: 184
+}
+
+const GS_MONSTER_BASE_BY_RANK: Record<number, number> = {
+  10105: 60,
+  10107: 70,
+  10108: 80,
+  10109: 90,
+  10110: 100,
+  10114: 140,
+  10116: 170,
+  10117: 180,
+  10119: 173,
+  10120: 150
+}
+
+const GS_GEM_BASE_BY_RANK: Record<number, number> = {
+  12101: 300, // diamond
+  12102: 310, // pyro
+  12103: 320, // hydro
+  12105: 330, // electro
+  12107: 340, // cryo
+  12106: 350, // anemo
+  12108: 360, // geo
+  12104: 370 // dendro (appended; avoid shifting older ids)
+}
+
+const GS_TALENT_BASE_BY_RANK: Record<number, number> = {
+  13101: 420, // 自由
+  13102: 450, // 抗争
+  13103: 400, // 诗文 (baseline only keeps the 4★ item)
+  13104: 440, // 繁荣
+  13105: 410, // 勤劳
+  13106: 430, // 黄金
+  13107: 405, // 浮世
+  13108: 415, // 风雅
+  13109: 425 // 天光
+}
+
+const GS_WEAPON_BASE_BY_RANK: Record<number, number> = {
+  15101: 500,
+  15102: 520,
+  15103: 540,
+  15104: 510,
+  15105: 530,
+  15106: 550,
+  15107: 560,
+  15108: 570,
+  15109: 580
+}
+
+// Some newer normal-drop chains use `n<id>` in baseline even though they have real numeric ids.
+const GS_NORMAL_FORCE_N_PREFIX_RANKS = new Set<number>([10621, 10623, 10629])
+
+// Legacy/renamed material names that still exist in baseline as keys.
+const GS_LEGACY_NAME_TO_OFFICIAL_ID: Record<string, number> = {}
+
+// Baseline has a few per-entry item id quirks (same name but different id under different heads).
+const GS_SUBITEM_OFFICIAL_ID_OVERRIDE_BY_HEAD: Record<string, Record<string, number>> = {
+  '精制机轴': {
+    '磨损的执凭': 112122,
+    '精致的执凭': 112123
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
@@ -136,12 +296,64 @@ function collectReferencedMaterialNames(metaGsRootAbs: string, log?: Pick<Consol
   return names
 }
 
+function toGsMaterialMetaId(id: number, type: GsMaterialType, rank: number, rankLevel: number): GsMaterialMetaId {
+  const fixed = GS_MATERIAL_META_ID_FIXED[id]
+  if (typeof fixed === 'number' || typeof fixed === 'string') return fixed
+
+  if (type === 'gem') {
+    const base = GS_GEM_BASE_BY_RANK[rank]
+    if (typeof base === 'number' && base > 0) return base + Math.max(0, rankLevel - 1)
+    return id
+  }
+
+  if (type === 'talent') {
+    const base = GS_TALENT_BASE_BY_RANK[rank]
+    if (typeof base === 'number' && base > 0) return base + Math.max(0, rankLevel - 1)
+    return `n${id}`
+  }
+
+  if (type === 'weapon') {
+    const base = GS_WEAPON_BASE_BY_RANK[rank]
+    if (typeof base === 'number' && base > 0) return base + Math.max(0, rankLevel - 1)
+    // Newer weapon materials keep numeric ids in baseline.
+    return id
+  }
+
+  if (type === 'monster') {
+    const base = GS_MONSTER_BASE_BY_RANK[rank]
+    if (typeof base === 'number' && base > 0) return base + Math.max(0, rankLevel - 1)
+    // Newer monster drops keep numeric ids in baseline.
+    return id
+  }
+
+  if (type === 'normal') {
+    const base = GS_NORMAL_BASE_BY_RANK[rank]
+    if (typeof base === 'number' && base > 0) return base + Math.max(0, rankLevel)
+    if (GS_NORMAL_FORCE_N_PREFIX_RANKS.has(rank)) return `n${id}`
+    // Most newer normal drops keep numeric ids in baseline.
+    return id
+  }
+
+  if (type === 'specialty') {
+    // Only a small legacy set uses compact numeric ids; newer specialties use `n<id>`.
+    return `n${id}`
+  }
+
+  if (type === 'boss' || type === 'weekly') {
+    // Newer boss/weekly materials use `n<id>` in baseline.
+    return `n${id}`
+  }
+
+  return id
+}
+
 function buildRankChainGroup(itemAll: Record<string, unknown>, id: number): number[] {
   const cur = itemAll[String(id)]
   if (!isRecord(cur)) return [id]
 
   const cat = typeof cur.Type === 'string' ? cur.Type : ''
   const matType = typeof cur.MaterialType === 'string' ? cur.MaterialType : ''
+  const week0 = toNum((cur as Record<string, unknown>).Week)
   const rank0 = toNum(cur.Rank)
   if (rank0 == null) return [id]
 
@@ -162,6 +374,7 @@ function buildRankChainGroup(itemAll: Record<string, unknown>, id: number): numb
     if (!isRecord(prev)) break
     if ((typeof prev.Type === 'string' ? prev.Type : '') !== cat) break
     if ((typeof prev.MaterialType === 'string' ? prev.MaterialType : '') !== matType) break
+    if (toNum((prev as Record<string, unknown>).Week) !== week0) break
     const r = toNum(prev.Rank)
     if (r == null || r !== downRank - 1) break
     ids.set(prevId, { rank: r })
@@ -178,6 +391,7 @@ function buildRankChainGroup(itemAll: Record<string, unknown>, id: number): numb
     if (!isRecord(next)) break
     if ((typeof next.Type === 'string' ? next.Type : '') !== cat) break
     if ((typeof next.MaterialType === 'string' ? next.MaterialType : '') !== matType) break
+    if (toNum((next as Record<string, unknown>).Week) !== week0) break
     const r = toNum(next.Rank)
     if (r == null || r !== upRank + 1) break
     ids.set(nextId, { rank: r })
@@ -245,6 +459,19 @@ export interface GenerateGsMaterialOptions {
 export async function generateGsMaterials(opts: GenerateGsMaterialOptions): Promise<void> {
   const materialRoot = path.join(opts.metaGsRootAbs, 'material')
   const materialDataPath = path.join(materialRoot, 'data.json')
+
+  const matExcelRaw = await opts.animeGameData.getGsMaterialExcelConfigData()
+  const matExcelRows: Array<Record<string, unknown>> = Array.isArray(matExcelRaw)
+    ? ((matExcelRaw as unknown[]).filter(isRecord) as Array<Record<string, unknown>>)
+    : []
+  const rankInfoById = new Map<number, { rank: number; rankLevel: number }>()
+  for (const row of matExcelRows) {
+    const id = toNum(row.id)
+    if (!id) continue
+    const rank = toNum(row.rank) ?? 0
+    const rankLevel = toNum(row.rankLevel) ?? 0
+    rankInfoById.set(id, { rank, rankLevel })
+  }
 
   const dataRaw = fs.existsSync(materialDataPath) ? (JSON.parse(fs.readFileSync(materialDataPath, 'utf8')) as unknown) : {}
   const materialData: Record<string, unknown> = isRecord(dataRaw) ? (dataRaw as Record<string, unknown>) : {}
@@ -348,25 +575,41 @@ export async function generateGsMaterials(opts: GenerateGsMaterialOptions): Prom
     const existingRec = isRecord(existingEntry) ? (existingEntry as Record<string, unknown>) : undefined
     const existingType = existingRec && typeof existingRec.type === 'string' ? (existingRec.type as string) : undefined
 
+    const headRankInfo = rankInfoById.get(head.id) ?? { rank: 0, rankLevel: 0 }
+    const headMetaId = toGsMaterialMetaId(head.id, matType, headRankInfo.rank, headRankInfo.rankLevel)
+
     if (!existingRec && existingNames.has(headName)) {
       // Head name exists as a sub-item of another entry (historical mis-grouping can cause this).
-      //
-      // For boss/weekly drops, the correct structure is "single item = head entry",
-      // so we MUST create the head entry even if the name appeared as a sub-item before.
-      const allowCreateSingleHead = (matType === 'boss' || matType === 'weekly') && groupItems.length === 1
-      if (allowCreateSingleHead) {
-        const entry: Record<string, unknown> = {
-          id: `n${head.id}`,
-          name: headName,
+      // Create a real head entry so lookups can find it by name at top-level.
+      const items: Record<string, unknown> = {}
+      for (const it of groupItems) {
+        const info = rankInfoById.get(it.id) ?? { rank: 0, rankLevel: 0 }
+        const metaId = toGsMaterialMetaId(it.id, matType, info.rank, info.rankLevel)
+        items[it.name] = {
+          id: metaId,
+          name: it.name,
           type: matType,
-          star: starFromRank(head.rank)
+          star: starFromRank(it.rank)
         }
-        materialData[headName] = entry
-        changed = true
-        // Note: keep existingNames as-is (it already contains headName), avoid mutating sub-item parents here.
-        added++
-        opts.log?.info?.(`[meta-gen] (gs) material head repaired (single): ${headName} -> ${matType}`)
       }
+
+      const entry: Record<string, unknown> = {
+        id: headMetaId,
+        name: headName,
+        type: matType,
+        star: starFromRank(head.rank)
+      }
+
+      // Only include `items` when the group contains multiple tiers.
+      if (Object.keys(items).length > 1) {
+        entry.items = items
+      }
+
+      materialData[headName] = entry
+      changed = true
+      // Note: keep existingNames as-is (it already contains headName), avoid mutating sub-item parents here.
+      added++
+      opts.log?.info?.(`[meta-gen] (gs) material head repaired: ${headName} -> ${matType}`)
     } else if (!existingRec && !existingNames.has(headName)) {
       added++
       if (added === 1 || added % 50 === 0) {
@@ -375,8 +618,10 @@ export async function generateGsMaterials(opts: GenerateGsMaterialOptions): Prom
 
       const items: Record<string, unknown> = {}
       for (const it of groupItems) {
+        const info = rankInfoById.get(it.id) ?? { rank: 0, rankLevel: 0 }
+        const metaId = toGsMaterialMetaId(it.id, matType, info.rank, info.rankLevel)
         items[it.name] = {
-          id: `n${it.id}`,
+          id: metaId,
           name: it.name,
           type: matType,
           star: starFromRank(it.rank)
@@ -384,7 +629,7 @@ export async function generateGsMaterials(opts: GenerateGsMaterialOptions): Prom
       }
 
       const entry: Record<string, unknown> = {
-        id: `n${head.id}`,
+        id: headMetaId,
         name: headName,
         type: matType,
         star: starFromRank(head.rank)
@@ -427,6 +672,120 @@ export async function generateGsMaterials(opts: GenerateGsMaterialOptions): Prom
       if (iconJobDedup.has(key)) continue
       iconJobDedup.add(key)
       iconJobs.push({ type: matType, name: it.name, icon: it.icon })
+    }
+  }
+
+  // ----- Baseline compatibility fixups (ids + legacy key gaps) -----
+  // 1) Ensure baseline's `undefined` placeholder exists.
+  if (!materialData.undefined) {
+    materialData.undefined = { id: 0, name: 'undefined', type: 'boss', star: 1 }
+    changed = true
+  }
+
+  const ensureItemsRecord = (entry: Record<string, unknown>): Record<string, unknown> => {
+    const itemsRaw = entry.items
+    if (isRecord(itemsRaw)) return itemsRaw as Record<string, unknown>
+    const items: Record<string, unknown> = {}
+    entry.items = items
+    changed = true
+    return items
+  }
+
+  const ensureSubItem = (entryType: GsMaterialType, items: Record<string, unknown>, name: string): void => {
+    if (items[name]) return
+    const oid = nameToId.get(name) ?? GS_LEGACY_NAME_TO_OFFICIAL_ID[name]
+    if (!oid) return
+    const info = rankInfoById.get(oid) ?? { rank: 0, rankLevel: 0 }
+    items[name] = {
+      id: toGsMaterialMetaId(oid, entryType, info.rank, info.rankLevel),
+      name,
+      type: entryType,
+      star: starFromRank(info.rankLevel)
+    }
+    changed = true
+  }
+
+  // 2) Ensure baseline's unusual cross-family items under `「诗文」的哲学` exist (superset compatibility).
+  const shiw = materialData['「诗文」的哲学']
+  if (isRecord(shiw) && shiw.type === 'talent') {
+    const items = ensureItemsRecord(shiw)
+    ensureSubItem('talent', items, '「自由」的教导')
+    ensureSubItem('talent', items, '「抗争」的指引')
+  }
+
+  // 3) Ensure baseline's legacy renamed sub-item keys exist (IDs are stable).
+  const jizhou = materialData['精制机轴']
+  if (isRecord(jizhou) && jizhou.type === 'normal') {
+    const itemsRaw = jizhou.items
+    if (isRecord(itemsRaw)) {
+      const items = itemsRaw as Record<string, unknown>
+      const applyPinned = (subName: string, officialId: number): void => {
+        const info = rankInfoById.get(officialId) ?? { rank: 0, rankLevel: 0 }
+        const metaId = toGsMaterialMetaId(officialId, 'normal', info.rank, info.rankLevel)
+        const desiredStar = starFromRank(info.rankLevel)
+
+        const cur = items[subName]
+        if (!isRecord(cur)) {
+          items[subName] = { id: metaId, name: subName, type: 'normal', star: desiredStar }
+          changed = true
+          return
+        }
+
+        if (cur.id !== metaId) {
+          cur.id = metaId
+          changed = true
+        }
+        if (cur.name !== subName) {
+          cur.name = subName
+          changed = true
+        }
+        if (cur.type !== 'normal') {
+          cur.type = 'normal'
+          changed = true
+        }
+        if (cur.star !== desiredStar) {
+          cur.star = desiredStar
+          changed = true
+        }
+      }
+
+      applyPinned('磨损的执凭', 112122)
+      applyPinned('精致的执凭', 112123)
+    }
+  }
+
+  // 4) Reconcile ids to baseline scheme for all known entries.
+  for (const [headName, raw] of Object.entries(materialData)) {
+    if (headName === 'undefined') continue
+    if (!isRecord(raw)) continue
+    const type = typeof raw.type === 'string' ? (raw.type as string) : ''
+    if (!GS_MATERIAL_TYPES.includes(type as GsMaterialType)) continue
+    const matType = type as GsMaterialType
+
+    const officialId = nameToId.get(headName) ?? GS_LEGACY_NAME_TO_OFFICIAL_ID[headName]
+    if (typeof officialId === 'number') {
+      const info = rankInfoById.get(officialId) ?? { rank: 0, rankLevel: 0 }
+      const metaId = toGsMaterialMetaId(officialId, matType, info.rank, info.rankLevel)
+      if (raw.id !== metaId) {
+        raw.id = metaId
+        changed = true
+      }
+    }
+
+    const itemsRaw = raw.items
+    if (isRecord(itemsRaw)) {
+      for (const [subName, subRaw] of Object.entries(itemsRaw)) {
+        if (!isRecord(subRaw)) continue
+        const pinned = GS_SUBITEM_OFFICIAL_ID_OVERRIDE_BY_HEAD[headName]?.[subName]
+        const oid = typeof pinned === 'number' ? pinned : nameToId.get(subName) ?? GS_LEGACY_NAME_TO_OFFICIAL_ID[subName]
+        if (typeof oid !== 'number') continue
+        const info = rankInfoById.get(oid) ?? { rank: 0, rankLevel: 0 }
+        const metaId = toGsMaterialMetaId(oid, matType, info.rank, info.rankLevel)
+        if (subRaw.id !== metaId) {
+          subRaw.id = metaId
+          changed = true
+        }
+      }
     }
   }
 

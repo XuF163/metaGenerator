@@ -109,6 +109,26 @@ export class AnimeGameDataClient {
     return this.getJsonCached('ExcelBinOutput/EquipAffixExcelConfigData.json')
   }
 
+  async getGsAvatarExcelConfigData(): Promise<unknown> {
+    return this.getJsonCached('ExcelBinOutput/AvatarExcelConfigData.json')
+  }
+
+  async getGsAvatarCurveExcelConfigData(): Promise<unknown> {
+    return this.getJsonCached('ExcelBinOutput/AvatarCurveExcelConfigData.json')
+  }
+
+  async getGsAvatarPromoteExcelConfigData(): Promise<unknown> {
+    return this.getJsonCached('ExcelBinOutput/AvatarPromoteExcelConfigData.json')
+  }
+
+  async getGsAvatarSkillExcelConfigData(): Promise<unknown> {
+    return this.getJsonCached('ExcelBinOutput/AvatarSkillExcelConfigData.json')
+  }
+
+  async getGsProudSkillExcelConfigData(): Promise<unknown> {
+    return this.getJsonCached('ExcelBinOutput/ProudSkillExcelConfigData.json')
+  }
+
   async getGsTextMapCHS(): Promise<unknown> {
     return this.getJsonCached('TextMap/TextMapCHS.json')
   }

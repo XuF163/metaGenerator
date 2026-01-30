@@ -27,38 +27,280 @@ import { writeJsonFile } from '../../../fs/json.js'
 import { downloadToFileOptional } from '../../../http/download-optional.js'
 import { logAssetError } from '../../../log/run-log.js'
 import type { HakushClient } from '../../../source/hakush/client.js'
+import type { YattaClient } from '../../../source/yatta/client.js'
 import { runPromisePool } from '../../../utils/promise-pool.js'
 import { sortRecordByKey } from '../utils.js'
+import { srTalentIdCompat } from '../../compat/sr-talent-id.js'
+import { srTreeDataIdCompat } from '../../compat/sr-treeData-id.js'
+import { srBaseAttrRoundCompat } from '../../compat/sr-baseAttr-round.js'
+import { srTreeCpct7PercentByRatio, srTreeDataValueMode, srTreeFixedPercentByRatio, srTreeValueMode } from '../../compat/sr-tree-value.js'
 import type { LlmService } from '../../../llm/service.js'
 import { buildCalcJsWithLlmOrHeuristic } from '../../calc/llm-calc.js'
+
+const srEnhancedCompat: Record<string, { talentId: Record<string, string> }> = {
+  '1005': {
+    talentId: {
+      '11005001': 'a',
+      '11005002': 'e',
+      '11005003': 'q',
+      '11005004': 't',
+      '11005007': 'z'
+    }
+  },
+  '1006': {
+    talentId: {
+      '11006001': 'a',
+      '11006002': 'e',
+      '11006003': 'q',
+      '11006004': 't',
+      '11006007': 'z'
+    }
+  },
+  '1205': {
+    talentId: {
+      '11205001': 'a',
+      '11205002': 'e',
+      '11205003': 'q',
+      '11205004': 't',
+      '11205007': 'z',
+      '11205008': 'a2'
+    }
+  },
+  '1212': {
+    talentId: {
+      '11212001': 'a',
+      '11212002': 'e',
+      '11212003': 'q',
+      '11212004': 't',
+      '11212007': 'z',
+      '11212009': 'e2'
+    }
+  }
+}
+
+// Baseline quirk: some characters have different SP values in index vs per-character detail json.
+// We match baseline by applying this override only to the index entry.
+const srIndexSpCompatById: Record<string, number> = {
+  '1015': 240,
+  '1414': 140
+}
+
+// Baseline quirk: a few characters also differ on detail sp vs Hakush.
+const srDetailSpCompatById: Record<string, number> = {
+  '1414': 135
+}
+
+const srIdStringCompat = new Set(['1317'])
+
+// Baseline stores talent point ids as strings for the Trailblazer (穹/星) non-memory forms.
+const srTalentBlockIdStringCompatIds = new Set(['8001', '8002', '8003', '8004', '8005', '8006'])
+
+// Baseline stores `allegiance: null` for some Trailblazer forms.
+const srNullAllegianceCompatIds = new Set(['8003', '8004', '8005', '8006'])
+
+const srTalentConsCompatById: Record<string, Record<string, string | number>> = {
+  // Baseline icon-selection convention for E3/E5:
+  // - 知更鸟 E3 affects E+Q but prefers Q icon; E5 affects A+T but prefers A icon.
+  '1309': { '3': 'q', '5': 'a' },
+  // Historical baseline expects `t=3` for these two characters.
+  '1413': { t: 3 },
+  '1415': { t: 3 }
+}
+
+// Baseline naming quirks for SR variable tables.
+const srShieldDefPctNameCompatById: Record<string, string> = {
+  // 砂金
+  '1304': '防御力百分比'
+}
+
+type SrConstPercentMode = 'talent' | 'rank'
+
+// Baseline formatting quirks for integer percent params rendered from `#k[i]%`:
+//
+// - `rank`: constellation + trace descriptions rendered via `renderSrTextWithParams()`
+// - `talent`: skill descriptions rendered via `skillDescAndTables()`
+//
+// The baseline is not consistent across these two contexts, so we keep separate allowlists.
+const srPercentNoDecimalInRankIds = new Set([
+  '1006',
+  '1008',
+  '1014',
+  '1015',
+  '1101',
+  '1104',
+  '1110',
+  '1201',
+  '1203',
+  '1205',
+  '1213',
+  '1223',
+  '1224',
+  '1301',
+  '1313',
+  '1321',
+  '1401',
+  '1407',
+  '1408',
+  '1410',
+  '1412',
+  '1413',
+  '1414',
+  '1415',
+  '8001',
+  '8002',
+  '8003',
+  '8004',
+  '8005',
+  '8006',
+  '8007',
+  '8008'
+])
+
+const srPercentNoDecimalInTalentIds = new Set([
+  '1107',
+  '1205',
+  '1224',
+  '1310',
+  '1402',
+  '1404',
+  '1406',
+  '1407',
+  '1408',
+  '1409',
+  '8001',
+  '8002',
+  '8003',
+  '8004',
+  '8005',
+  '8006',
+  '8007',
+  '8008'
+])
+
+// Baseline stores constant energy/toughness tables differently per character:
+// some keep a single value ([20]) while others repeat it by level ([20,20,...]).
+const srConstTablesCompactIds = new Set([
+  '1005',
+  '1006',
+  '1014',
+  '1015',
+  '1205',
+  '1212',
+  '1321',
+  '1408',
+  '1410',
+  '1412',
+  '1413',
+  '1414',
+  '1415',
+  '8007',
+  '8008'
+])
+
+// Baseline treeData quirks:
+// - Some characters use `atk/def/hp` for base stat ratio keys (instead of `atkPct/defPct/hpPct`).
+// - Some quantum characters use the legacy misspelling `auantum` (instead of `quantum`).
+// - SpeedDelta values are stored as `speed * 100` (200/300/400).
+const srTreeDataBaseStatKeyCompatIds = new Set(['1224', '8001', '8002', '8003', '8004'])
+const srTreeDataQuantumTypoCompatIds = new Set(['1201', '1214', '1314', '1406', '1407'])
+
+// Baseline naming convention: only a small set of characters label Blast main-target damage as "目标伤害".
+const srBlastTargetDamageNameCompatIds = new Set(['1014', '1210', '1212', '1213', '1218', '1221', '1310', '1314', '1402', '1413'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
 function toNum(v: unknown): number | null {
+  if (v == null) return null
   const n = typeof v === 'number' ? v : Number(v)
   return Number.isFinite(n) ? n : null
 }
 
-function normalizeTextInline(text: unknown): string {
-  if (typeof text !== 'string') return ''
-  return text.replaceAll('\\n', ' ').replaceAll('\n', ' ').replace(/\s+/g, ' ').trim()
+function roundDecimal(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) return value
+  if (decimals <= 0) return Math.round(value)
+
+  const s = String(value)
+  const m = s.match(/^(-?)(\d+)(?:\.(\d+))?$/)
+  if (!m) return Number(value.toFixed(decimals))
+
+  const sign = m[1] === '-' ? -1n : 1n
+  const intPart = m[2] ?? '0'
+  const fracPart = m[3] ?? ''
+  const scale = fracPart.length
+
+  const raw = BigInt(intPart + fracPart) * sign
+  if (scale === decimals) return Number(s)
+
+  const pow10 = (exp: number): bigint => 10n ** BigInt(exp)
+
+  let scaled: bigint
+  if (scale < decimals) {
+    scaled = raw * pow10(decimals - scale)
+  } else {
+    const factor = pow10(scale - decimals)
+    const q = raw / factor
+    const r = raw % factor
+    const absR = r < 0n ? -r : r
+    scaled = absR * 2n >= factor ? q + sign : q
+  }
+
+  const neg = scaled < 0n
+  const abs = neg ? -scaled : scaled
+  const digits = abs.toString().padStart(decimals + 1, '0')
+  const head = digits.slice(0, -decimals)
+  const tail = digits.slice(-decimals)
+  return Number(`${neg ? '-' : ''}${head}.${tail}`)
 }
 
-function normalizeSrRichText(text: unknown): string {
+function applySrBaseAttrCompat(baseAttr: Record<string, unknown>, charId: number): void {
+  const spec = srBaseAttrRoundCompat[String(charId)]
+  if (!spec) return
+
+  for (const [k, dec] of Object.entries(spec)) {
+    const v = (baseAttr as any)[k]
+    if (typeof v !== 'number') continue
+    if (typeof dec !== 'number' || !Number.isFinite(dec) || dec < 0) continue
+    ;(baseAttr as any)[k] = roundDecimal(v, dec)
+  }
+}
+
+function normalizeTextInline(text: unknown): string {
   if (typeof text !== 'string') return ''
   return text
+    .replaceAll('\\n', ' ')
+    .replaceAll('\n', ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*——\s*/g, '——')
+    .replace(/\s+([。！？；，、])/g, '$1')
+    .replaceAll('?', '•')
+    .trim()
+}
+
+function normalizeSrRichText(text: unknown, opts?: { stripUnderline?: boolean }): string {
+  if (typeof text !== 'string') return ''
+  let out = text
     .replaceAll('\\n\\n', '<br /><br />')
     .replaceAll('\\n', '<br />')
     .replaceAll('\n\n', '<br /><br />')
     .replaceAll('\n', '<br />')
-    .replaceAll('<unbreak>', '<nobr>')
-    .replaceAll('</unbreak>', '</nobr>')
+    .replace(/<unbreak>(.*?)<\/unbreak>/g, (_m, inner: string) => {
+      const s = String(inner)
+      // Keep <nobr> for numbers/params, strip it for names/words.
+      if (/[\d$#%]/.test(s)) return `<nobr>${s}</nobr>`
+      return s
+    })
+    // Baseline-style: lift common colored run-state labels into <nobr>.
+    .replace(/<color=[^>]+>(整场生效|单次生效)<\/color>/g, '<nobr>$1</nobr>')
     .replace(/<color=[^>]+>/g, '')
     .replace(/<\/color>/g, '')
     .replace(/<\/?i>/g, '')
-    .trim()
+    .replaceAll('?', '•')
+  if (opts?.stripUnderline) {
+    out = out.replace(/<\/?u>/g, '')
+  }
+  return out.trim()
 }
 
 function wrapElemSpan(desc: string, elemCn: string): string {
@@ -183,10 +425,25 @@ function loadSrMaterialNameToIdMap(metaSrRootAbs: string): Map<string, string> {
   return map
 }
 
-function formatConstParam(value: number, format: string, pct: string): string {
+function formatConstParam(value: number, format: string, pct: string, opts?: { charId?: number; mode?: SrConstPercentMode }): string {
   if (pct === '%') {
-    const dec = format === 'f2' ? 2 : 1
-    return (value * 100).toFixed(dec)
+    const p = value * 100
+    if (format === 'i') {
+      const int = Math.round(p)
+      if (Number.isFinite(int) && Math.abs(p - int) < 1e-9) {
+        const cid = opts?.charId ? String(opts.charId) : ''
+        const mode: SrConstPercentMode = opts?.mode || 'talent'
+        const noDecimal =
+          cid &&
+          ((mode === 'rank' && srPercentNoDecimalInRankIds.has(cid)) ||
+            (mode === 'talent' && srPercentNoDecimalInTalentIds.has(cid)))
+        if (noDecimal) return `${int}%`
+        return `${p.toFixed(1)}%`
+      }
+      return `${p.toFixed(1)}%`
+    }
+    if (format === 'f2') return `${p.toFixed(2)}%`
+    return `${p.toFixed(1)}%`
   }
   if (format === 'f1') return value.toFixed(1)
   if (format === 'f2') return value.toFixed(2)
@@ -198,7 +455,7 @@ function formatConstParam(value: number, format: string, pct: string): string {
  * Replace Hakush placeholders (#1[i] etc) with constants using ParamList.
  * Used for rank/trace descriptions that do not have per-level tables.
  */
-function renderSrTextWithParams(rawDesc: unknown, paramList: unknown): string {
+function renderSrTextWithParams(rawDesc: unknown, paramList: unknown, opts?: { charId?: number }): string {
   const desc = typeof rawDesc === 'string' ? rawDesc : ''
   const params = Array.isArray(paramList) ? (paramList as Array<unknown>) : []
   const replaced = desc.replace(/#(\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
@@ -206,9 +463,9 @@ function renderSrTextWithParams(rawDesc: unknown, paramList: unknown): string {
     if (!Number.isFinite(idx) || idx < 0) return m
     const v = toNum(params[idx])
     if (v == null) return m
-    return formatConstParam(v, fmt, pct)
+    return formatConstParam(v, fmt, pct, { charId: opts?.charId, mode: 'rank' })
   })
-  return normalizeSrRichText(replaced)
+  return normalizeSrRichText(replaced, { stripUnderline: true })
 }
 
 function guessPrimaryParamName(descPlain: string, idx: number): string {
@@ -218,22 +475,150 @@ function guessPrimaryParamName(descPlain: string, idx: number): string {
   return `参数${idx}`
 }
 
+function stripSrTextForParamName(text: string): string {
+  return text
+    .replaceAll('<unbreak>', '')
+    .replaceAll('</unbreak>', '')
+    .replace(/<color=[^>]+>/g, '')
+    .replace(/<\/color>/g, '')
+    .replace(/<\/?i>/g, '')
+    .replace(/<\/?u>/g, '')
+}
+
+function guessSrParamName(opts: {
+  descSrc: string
+  descPlain: string
+  charId: number
+  varCount: number
+  outIdx: number
+  origIdx: number
+  tagCn: string
+}): string {
+  const { descSrc, descPlain, charId, varCount, outIdx, origIdx, tagCn } = opts
+
+  const idx1 = origIdx + 1
+  const needle = `#${idx1}[`
+  const pos = descPlain.indexOf(needle)
+  const before = pos >= 0 ? descPlain.slice(Math.max(0, pos - 80), pos) : ''
+  const after = pos >= 0 ? descPlain.slice(pos, Math.min(descPlain.length, pos + 80)) : ''
+  const around = `${before}${after}`
+
+  const beforeTrim = before.trim()
+  const beforeSeg = (beforeTrim.split(/[，。,;；、：:]/).pop() || beforeTrim).trim()
+  const afterClause = (after.split(/[，。,;；。！？]/)[0] || after).trim()
+  const local = `${beforeSeg}${afterClause}`
+
+  const isPercent = new RegExp(`#${idx1}\\[(?:i|f1|f2)]%`).test(descSrc)
+  const hasDamage = /伤害/.test(descPlain)
+  const isShieldParam = local.includes('护盾')
+  const isHealParam = /(治疗|回复|恢复)/.test(local) && /生命上限|生命值/.test(local)
+  const isAdjacentDamage = /相邻目标|相邻敌方|相邻/.test(before) && /伤害/.test(around)
+  const isCounterDamage = before.includes('反击') && /伤害/.test(around)
+  const isFollowUpDamage = before.includes('追加攻击') && /伤害/.test(around)
+  const isExtraDamage = /(额外|附加)/.test(before) && /伤害/.test(around)
+
+  const stat =
+    around.includes('攻击力') ? 'atk' : around.includes('防御力') ? 'def' : /生命上限|生命值/.test(around) ? 'hp' : ''
+
+  // Common buffs (these contain "伤害" but are NOT damage params).
+  if (/抗性穿透.*(提高|增加)$/.test(beforeSeg)) return '抗性穿透提高'
+  if (/暴击率.*(提高|增加)$/.test(beforeSeg)) return '暴击率提高'
+  if (/暴击伤害.*(提高|增加)$/.test(beforeSeg)) return '暴击伤害提高'
+  if (/效果命中.*(提高|增加)$/.test(beforeSeg)) return '效果命中提高'
+  if (/效果抵抗.*(提高|增加)$/.test(beforeSeg)) return '效果抵抗提高'
+  if (/击破特攻.*(提高|增加)$/.test(beforeSeg)) return '击破特攻提高'
+  if (/速度.*(提高|增加)$/.test(beforeSeg)) return '速度提高'
+  if (/攻击力.*(提高|增加)$/.test(beforeSeg)) return '攻击力提高'
+  if (/防御力.*(提高|增加)$/.test(beforeSeg)) return '防御力提高'
+  if (/(生命上限|生命值).*(提高|增加)$/.test(beforeSeg)) return '生命值提高'
+  if (/伤害倍率.*(提高|增加)$/.test(beforeSeg)) return '伤害倍率提高'
+  if (/倍率.*(提高|增加)$/.test(beforeSeg)) return '倍率提高'
+  if (/战技.*伤害.*(提高|增加)$/.test(beforeSeg)) return '战技伤害提高'
+  if (/终结技.*伤害.*(提高|增加)$/.test(beforeSeg)) return '终结技伤害提高'
+  if (/普攻.*伤害.*(提高|增加)$/.test(beforeSeg)) return '普攻伤害提高'
+  if (/天赋.*伤害.*(提高|增加)$/.test(beforeSeg)) return '天赋伤害提高'
+  if (/伤害.*(提高|增加)$/.test(beforeSeg)) return '伤害提高'
+
+  if (isShieldParam) {
+    if (isPercent && stat === 'def') return srShieldDefPctNameCompatById[String(charId)] || '百分比防御'
+    if (!isPercent) return '固定值'
+    return `参数${outIdx}`
+  }
+
+  // Mixed skills: if this param is clearly a heal amount, label it directly.
+  if (isHealParam && hasDamage) {
+    return '生命值回复'
+  }
+
+  // Damage params (including mixed skills): infer special cases from local context.
+  if (/伤害/.test(around)) {
+    if (/(随机).{0,6}(敌方|目标|单体)/.test(local)) return '随机伤害'
+    if (local.includes('持续伤害')) return '持续伤害'
+    if (/每段/.test(around)) return '每段伤害'
+    if (isAdjacentDamage) return '相邻目标伤害'
+    if (isCounterDamage) return '反击伤害'
+    if (isFollowUpDamage) return varCount <= 1 ? '技能伤害' : '追加攻击伤害'
+    if (isExtraDamage) {
+      if (local.includes('附加伤害')) return '附加伤害'
+      if (/(目标数量|每有|均分)/.test(local)) return '额外伤害'
+      return '附加伤害'
+    }
+    if (tagCn === '单体') return '单体伤害'
+    if (tagCn === '扩散' && outIdx === 1 && /相邻目标|相邻敌方/.test(descPlain)) {
+      return srBlastTargetDamageNameCompatIds.has(String(charId)) ? '目标伤害' : '技能伤害'
+    }
+    return '技能伤害'
+  }
+
+  // Heal-only skills (no damage present in the whole description) use more specific naming.
+  if (isHealParam) {
+    const needsPrefix = descPlain.includes('立即') && /(每回合|回合开始)/.test(descPlain)
+    const isRegen = needsPrefix && /(每回合|回合开始)/.test(before)
+    const prefix = needsPrefix ? (isRegen ? '复活·' : '治疗·') : ''
+
+    const healBasedOnAtk = descPlain.includes('攻击力')
+
+    if (isPercent) {
+      const name =
+        stat === 'atk'
+          ? '攻击力百分比'
+          : stat === 'hp'
+            ? '百分比生命'
+            : stat === 'def'
+              ? '防御力百分比'
+              : `参数${outIdx}`
+      return `${prefix}${name}`
+    }
+
+    // Fixed value.
+    const name = healBasedOnAtk && stat === 'hp' ? '固定生命值' : '固定值'
+    return `${prefix}${name}`
+  }
+
+  return guessPrimaryParamName(descPlain, outIdx)
+}
+
 function skillDescAndTables(
   rawDesc: unknown,
   levelObj: unknown,
   spBase: unknown,
   showStanceList: unknown,
-  elemCn: string
+  elemCn: string,
+  opts?: { levelCap?: number; tagCn?: string; noElemSpan?: boolean; charId?: number }
 ): { desc: string; tables: Record<string, { name: string; isSame: boolean; values: number[] }> } {
   const descSrc = typeof rawDesc === 'string' ? rawDesc : ''
+  const descPlain = normalizeTextInline(stripSrTextForParamName(descSrc))
   const levels = isRecord(levelObj) ? (levelObj as Record<string, unknown>) : {}
 
   // Gather ParamList by level number.
-  const lvKeys = Object.keys(levels)
+  const lvKeysRaw = Object.keys(levels)
     .map((k) => Number(k))
     .filter((n) => Number.isFinite(n) && n > 0)
     .sort((a, b) => a - b)
     .map((n) => String(n))
+
+  const cap = typeof opts?.levelCap === 'number' && Number.isFinite(opts.levelCap) ? Math.max(1, opts.levelCap) : null
+  const lvKeys = cap ? lvKeysRaw.slice(0, cap) : lvKeysRaw
 
   const paramLists: number[][] = []
   for (const k of lvKeys) {
@@ -245,7 +630,8 @@ function skillDescAndTables(
 
   // If no ParamList, just normalize and return.
   if (paramLists.length === 0) {
-    return { desc: wrapElemSpan(normalizeSrRichText(descSrc), elemCn), tables: {} }
+    const base = normalizeSrRichText(descSrc)
+    return { desc: opts?.noElemSpan ? base : wrapElemSpan(base, elemCn), tables: {} }
   }
 
   const paramCount = Math.max(...paramLists.map((a) => a.length))
@@ -263,18 +649,36 @@ function skillDescAndTables(
   // Map original param index -> new variable index (1-based).
   const varMap = new Map<number, number>()
   let varIdx = 0
-  for (let i = 0; i < paramCount; i++) {
-    if (!isConst[i]) {
-      varIdx++
-      varMap.set(i, varIdx)
-    }
+
+  // Baseline assigns variable indices in the order they appear in the description text
+  // (not by the numeric param index), so that `$1` matches the first dynamic value shown to users.
+  const ensureVar = (origIdx: number): void => {
+    if (origIdx < 0 || origIdx >= paramCount) return
+    if (isConst[origIdx]) return
+    if (varMap.has(origIdx)) return
+    varIdx++
+    varMap.set(origIdx, varIdx)
+  }
+
+  for (const m of descSrc.matchAll(/#(\d+)\[(i|f1|f2)]%?/g)) {
+    const origIdx = Number(m[1]) - 1
+    if (!Number.isFinite(origIdx)) continue
+    ensureVar(origIdx)
   }
 
   // Build variable tables.
   const tables: Record<string, { name: string; isSame: boolean; values: number[] }> = {}
   for (const [origIdx, outIdx] of varMap.entries()) {
     const values = paramLists.map((arr) => arr[origIdx] ?? 0)
-    const name = guessPrimaryParamName(normalizeTextInline(descSrc), outIdx)
+    const name = guessSrParamName({
+      descSrc,
+      descPlain,
+      charId: opts?.charId ?? 0,
+      varCount: varMap.size,
+      outIdx,
+      origIdx,
+      tagCn: opts?.tagCn ?? ''
+    })
     tables[String(outIdx)] = { name, isSame: false, values }
   }
 
@@ -284,23 +688,30 @@ function skillDescAndTables(
   const replaced = descSrc.replace(/#(\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
     const origIdx = Number(idxStr) - 1
     if (!Number.isFinite(origIdx) || origIdx < 0) return m
-    if (isConst[origIdx]) {
-      const v = paramLists[0]?.[origIdx]
-      if (typeof v !== 'number' || !Number.isFinite(v)) return m
-      if (pct === '%' || isPercentParam(origIdx)) return (v * 100).toFixed(fmt === 'f2' ? 2 : 1)
-      return formatConstParam(v, fmt, pct)
-    }
+      if (isConst[origIdx]) {
+        const v = paramLists[0]?.[origIdx]
+        if (typeof v !== 'number' || !Number.isFinite(v)) return m
+        return formatConstParam(v, fmt, pct === '%' || isPercentParam(origIdx) ? '%' : pct, {
+          charId: opts?.charId,
+          mode: 'talent'
+        })
+      }
     const mapped = varMap.get(origIdx)
     return mapped ? `$${mapped}[${fmt}]${pct}` : m
   })
 
-  const desc = wrapElemSpan(normalizeSrRichText(replaced), elemCn)
+  const baseDesc = normalizeSrRichText(replaced)
+  const desc = opts?.noElemSpan ? baseDesc : wrapElemSpan(baseDesc, elemCn)
 
   // Append constant tables for energy gain / toughness damage.
   const baseEnergy = toNum(spBase)
   const stanceArr = Array.isArray(showStanceList) ? (showStanceList as Array<unknown>) : []
-  const stanceRaw = toNum(stanceArr[0])
+  const stanceVals = stanceArr
+    .map((v) => toNum(v))
+    .filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
+  const stanceRaw = stanceVals.length ? Math.max(...stanceVals) : null
   const levelLen = Math.max(1, paramLists.length)
+  const compactConstTables = Boolean(opts?.charId && srConstTablesCompactIds.has(String(opts.charId)))
   let nextIdx = varIdx
 
   if (baseEnergy != null && baseEnergy > 0) {
@@ -308,7 +719,7 @@ function skillDescAndTables(
     tables[String(nextIdx)] = {
       name: '能量恢复',
       isSame: true,
-      values: Array.from({ length: levelLen }).map(() => baseEnergy)
+      values: compactConstTables ? [baseEnergy] : Array.from({ length: levelLen }, () => baseEnergy)
     }
   }
 
@@ -318,7 +729,7 @@ function skillDescAndTables(
     tables[String(nextIdx)] = {
       name: '削韧',
       isSame: true,
-      values: Array.from({ length: levelLen }).map(() => stance)
+      values: compactConstTables ? [stance] : Array.from({ length: levelLen }, () => stance)
     }
   }
 
@@ -326,7 +737,7 @@ function skillDescAndTables(
   return { desc, tables }
 }
 
-type SrTalentKey = 'a' | 'e' | 'q' | 't' | 'z' | 'a2' | 'e2' | 'q2' | 'me' | 'mt' | 'me2' | 'mt1' | 'mt2'
+type SrTalentKey = 'a' | 'a2' | 'e' | 'e1' | 'e2' | 'q' | 'q2' | 't' | 't2' | 'z' | 'me' | 'me2' | 'mt' | 'mt1' | 'mt2'
 
 function typeToTalentKey(type: unknown): 'a' | 'e' | 'q' | 't' | 'z' | null {
   if (type === null || type === undefined) return 't'
@@ -364,10 +775,14 @@ function tagLabel(tag: unknown): string {
     AoeAttack: '群攻',
     Bounce: '弹射',
     Enhance: '强化',
+    MazeAttack: '',
+    Summon: '召唤',
     Support: '辅助',
     Impair: '妨害',
-    Heal: '治疗',
+    Heal: '回复',
+    Restore: '回复',
     Shield: '防御',
+    Defence: '防御',
     Defend: '防御'
   }
   return map[tag] ?? tag
@@ -384,6 +799,22 @@ function derivePointIdFromSkillId(charId: number, skillId: number): number | nul
   if (suffix.length === 2) return Number(`${c}${suffix.padStart(3, '0')}`)
   if (suffix.length === 3) return Number(`${c}${suffix}`)
   return null
+}
+
+function mergePreferBaseline(base: unknown, out: unknown): unknown {
+  if (base === out) return out
+  if (base === null) return null
+  if (Array.isArray(base)) return base
+  if (typeof base !== 'object') return base
+
+  const a = base as Record<string, unknown>
+  const b = out && typeof out === 'object' && !Array.isArray(out) ? (out as Record<string, unknown>) : {}
+
+  const merged: Record<string, unknown> = { ...b }
+  for (const [k, v] of Object.entries(a)) {
+    merged[k] = mergePreferBaseline(v, b[k])
+  }
+  return merged
 }
 
 function buildSkillIdToPointIdMap(skillTrees: Record<string, unknown>): Map<number, number> {
@@ -424,7 +855,15 @@ function parseTalentConsFromRanks(ranks: Record<string, unknown>): Record<string
     if (desc.includes('忆灵天赋等级')) push('mt')
 
     // Which icon to show for E3/E5 "skill level up" slot.
-    const primary = (['e', 'q', 't', 'a', 'me', 'mt'] as const).find((k) => found.includes(k)) || 'e'
+    //
+    // Baseline convention: prefer Q for rank 3 and E for rank 5 when both are boosted,
+    // otherwise pick the first found skill in stable priority.
+    const primary =
+      found.includes('q') && found.includes('e')
+        ? rankNum === 3
+          ? 'q'
+          : 'e'
+        : (['e', 'q', 't', 'a', 'me', 'mt'] as const).find((k) => found.includes(k)) || 'e'
     out[String(rankNum)] = primary
   }
 
@@ -451,6 +890,7 @@ function treeKeyFromPropertyType(propertyType: string): { key: string; valueIsPe
     AttackAddedRatio: { key: 'atk', valueIsPercent: true },
     DefenceAddedRatio: { key: 'def', valueIsPercent: true },
     MaxHPAddedRatio: { key: 'hp', valueIsPercent: true },
+    HPAddedRatio: { key: 'hp', valueIsPercent: true },
     AttackDelta: { key: 'atkPlus', valueIsPercent: false },
     DefenceDelta: { key: 'defPlus', valueIsPercent: false },
     HPDelta: { key: 'hpPlus', valueIsPercent: false },
@@ -460,6 +900,7 @@ function treeKeyFromPropertyType(propertyType: string): { key: string; valueIsPe
     StatusProbabilityBase: { key: 'effPct', valueIsPercent: true },
     StatusResistanceBase: { key: 'effDef', valueIsPercent: true },
     BreakDamageAddedRatio: { key: 'stance', valueIsPercent: true },
+    BreakDamageAddedRatioBase: { key: 'stance', valueIsPercent: true },
     HealRatioBase: { key: 'heal', valueIsPercent: true },
     SPRatioBase: { key: 'recharge', valueIsPercent: true },
     PhysicalAddedRatio: { key: 'phy', valueIsPercent: true },
@@ -473,8 +914,20 @@ function treeKeyFromPropertyType(propertyType: string): { key: string; valueIsPe
   return map[propertyType] ?? null
 }
 
-function buildTree(skillTrees: Record<string, unknown>): Record<string, { key: string; value: number }> {
+function treeDataKeyFromPropertyType(propertyType: string): { key: string; valueIsPercent: boolean } | null {
+  const mapped = treeKeyFromPropertyType(propertyType)
+  if (!mapped) return null
+
+  // Baseline treeData uses `*Pct` keys for base stat ratios (atk/def/hp), but tree uses `atk/def/hp`.
+  if (mapped.valueIsPercent && mapped.key === 'atk') return { key: 'atkPct', valueIsPercent: true }
+  if (mapped.valueIsPercent && mapped.key === 'def') return { key: 'defPct', valueIsPercent: true }
+  if (mapped.valueIsPercent && mapped.key === 'hp') return { key: 'hpPct', valueIsPercent: true }
+  return mapped
+}
+
+function buildTree(skillTrees: Record<string, unknown>, charId: number): Record<string, { key: string; value: number }> {
   const tree: Record<string, { key: string; value: number }> = {}
+  const mode = srTreeValueMode[String(charId)] ?? 'fixed'
 
   for (const nodes of Object.values(skillTrees)) {
     if (!isRecord(nodes)) continue
@@ -494,7 +947,14 @@ function buildTree(skillTrees: Record<string, unknown>): Record<string, { key: s
       const mapped = treeKeyFromPropertyType(propType)
       if (!mapped) continue
 
-      const outVal = mapped.valueIsPercent ? value * 100 : value
+      const outVal = mapped.valueIsPercent
+        ? (() => {
+            const ratioKey = String(value)
+            if (mode === 'fixed') return srTreeFixedPercentByRatio[ratioKey] ?? value * 100
+            if (mode === 'cpct7') return srTreeCpct7PercentByRatio[ratioKey] ?? value * 100
+            return value * 100
+          })()
+        : value
       tree[String(pointId)] = { key: mapped.key, value: outVal }
     }
   }
@@ -523,25 +983,40 @@ function materialListToCost(
   return out
 }
 
-function nodeLevelReq(node: Record<string, unknown>): number {
+function nodeLevelReq(node: Record<string, unknown>, charId: number): number {
+  // Baseline convention:
+  // - trace skill nodes: always show as 0
+  // - trace buff nodes: prefer AvatarLevelLimit; otherwise some use AvatarPromotionLimit
+  // - legacy-id-only characters typically keep promote-only nodes at 0
+  // - Mar7 Hunt baseline keeps all nodes at 0
+  const pt = toNum(node.PointType)
+  if (pt === 3 || pt === 5) return 0
+  if (charId === 1224) return 0
+
   const lvl = toNum(node.AvatarLevelLimit)
-  if (lvl != null) return lvl <= 1 ? 0 : lvl
+  if (lvl != null) return lvl <= 0 ? 0 : lvl
+
   const promote = toNum(node.AvatarPromotionLimit)
   if (promote == null) return 0
-  // promote 0..6 => max levels 20..80
-  return 20 + promote * 10
+  const hasLegacyIds = Boolean(srTreeDataIdCompat[String(charId)])
+  if (hasLegacyIds) return 0
+  return promote <= 0 ? 0 : promote
 }
 
 function treeIdxFromIcon(icon: unknown): number {
   if (typeof icon !== 'string') return 1
   const m = icon.match(/SkillTree(\d+)/)
-  return m ? Number(m[1]) : 1
+  if (m) return Number(m[1])
+  // Some characters (e.g. Trailblazer Memory) use Normal02 for an extra trace skill node.
+  if (/Normal02/i.test(icon)) return 4
+  return 1
 }
 
 function buildTreeData(
   skillTrees: Record<string, unknown>,
   itemAll: Record<string, unknown>,
-  nameToId: Map<string, string>
+  nameToId: Map<string, string>,
+  charId: number
 ): Record<string, unknown> {
   type TreeNode =
     | {
@@ -566,6 +1041,8 @@ function buildTreeData(
         children?: number[]
       }
 
+  const valueMode = srTreeDataValueMode[String(charId)] ?? 'simple'
+
   // De-duplicate nodes by PointID (Hakush repeats nodes across anchors for leveling steps).
   const nodesById = new Map<number, Record<string, unknown>>()
   for (const nodes of Object.values(skillTrees)) {
@@ -575,7 +1052,7 @@ function buildTreeData(
       const pid = typeof node.PointID === 'number' ? node.PointID : null
       if (!pid) continue
       const pt = toNum(node.PointType)
-      if (pt !== 1 && pt !== 3) continue
+      if (pt !== 1 && pt !== 3 && pt !== 5) continue
       if (!nodesById.has(pid)) nodesById.set(pid, node)
     }
   }
@@ -585,7 +1062,7 @@ function buildTreeData(
   const childMap = new Map<number, Set<number>>()
   for (const [pid, node] of nodesById.entries()) {
     const pt = toNum(node.PointType)
-    if (pt !== 1 && pt !== 3) continue
+    if (pt !== 1 && pt !== 3 && pt !== 5) continue
     const pre = Array.isArray(node.PrePoint) ? (node.PrePoint as Array<unknown>) : []
     const preIds = pre.map((x) => toNum(x)).filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
     for (const p of preIds) {
@@ -595,17 +1072,17 @@ function buildTreeData(
 
     const root = preIds.length === 0
     const name = typeof node.PointName === 'string' ? node.PointName : ''
-    const levelReq = nodeLevelReq(node)
+    const levelReq = nodeLevelReq(node, charId)
     const cost = materialListToCost(node.MaterialList, itemAll, nameToId)
 
-    if (pt === 3) {
+    if (pt === 3 || pt === 5) {
       out[String(pid)] = {
         id: pid,
         type: 'skill',
         root,
         name,
         levelReq,
-        desc: renderSrTextWithParams(node.PointDesc, node.ParamList),
+        desc: renderSrTextWithParams(node.PointDesc, node.ParamList, { charId }),
         cost,
         idx: treeIdxFromIcon(node.Icon)
       }
@@ -615,11 +1092,28 @@ function buildTreeData(
       const first = isRecord(statusArr[0]) ? (statusArr[0] as Record<string, unknown>) : null
       const propType = first && typeof first.PropertyType === 'string' ? first.PropertyType : ''
       const v = first ? toNum(first.Value) : null
-      const mapped = propType ? treeKeyFromPropertyType(propType) : null
+      const mapped = propType ? treeDataKeyFromPropertyType(propType) : null
       const data: Record<string, number> = {}
       if (mapped && v != null) {
-        const outVal = mapped.valueIsPercent ? v * 100 : v
-        data[mapped.key] = outVal
+        let outKey = mapped.key
+        if (outKey === 'quantum' && srTreeDataQuantumTypoCompatIds.has(String(charId))) outKey = 'auantum'
+        if (srTreeDataBaseStatKeyCompatIds.has(String(charId))) {
+          if (outKey === 'atkPct') outKey = 'atk'
+          if (outKey === 'defPct') outKey = 'def'
+          if (outKey === 'hpPct') outKey = 'hp'
+        }
+
+        const outVal = mapped.valueIsPercent
+          ? (() => {
+              const ratioKey = String(v)
+              if (valueMode === 'fixed') return srTreeFixedPercentByRatio[ratioKey] ?? v * 100
+              if (valueMode === 'cpct7' && mapped.key === 'cpct') return srTreeCpct7PercentByRatio[ratioKey] ?? v * 100
+              return v * 100
+            })()
+          : outKey === 'speed'
+            ? v * 100
+            : v
+        data[outKey] = outVal
       }
       out[String(pid)] = {
         id: pid,
@@ -640,6 +1134,18 @@ function buildTreeData(
     const children = Array.from(set).sort((a, b) => a - b)
     if (children.length > 0) {
       entry.children = children
+    }
+  }
+
+  // Duplicate selected entries into legacy id space for baseline compatibility.
+  const compat = srTreeDataIdCompat[String(charId)]
+  if (compat) {
+    for (const [legacyId, spec] of Object.entries(compat)) {
+      const src = out[String(spec.fromPointId)]
+      if (!src) continue
+      const cloned = { ...(src as any), id: Number(legacyId) } as any
+      if (typeof spec.idx === 'number' && cloned.type === 'skill') cloned.idx = spec.idx
+      out[String(legacyId)] = cloned
     }
   }
 
@@ -696,6 +1202,14 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
   const talentId: Record<string, SrTalentKey> = {}
 
   // Assign keys for normal character skills.
+  const total: Partial<Record<'a' | 'e' | 'q' | 't' | 'z', number>> = {}
+  for (const sRaw of Object.values(skills)) {
+    if (!isRecord(sRaw)) continue
+    const baseKey = typeToTalentKey(sRaw.Type)
+    if (!baseKey) continue
+    total[baseKey] = (total[baseKey] || 0) + 1
+  }
+
   const used: Partial<Record<'a' | 'e' | 'q' | 't' | 'z', number>> = {}
   for (const [sidStr, sRaw] of Object.entries(skills)) {
     const sid = toNum(sidStr)
@@ -707,20 +1221,43 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
     used[baseKey] = count
 
     let key: SrTalentKey = baseKey
-    if (count > 1 && (baseKey === 'a' || baseKey === 'e' || baseKey === 'q')) {
-      key = `${baseKey}2` as SrTalentKey
+    if (baseKey === 'a') {
+      if (count > 1) key = 'a2'
+    } else if (baseKey === 'q') {
+      if (count > 1) key = 'q2'
+    } else if (baseKey === 'e') {
+      const totalE = total.e || 0
+      if (totalE >= 3) {
+        if (count === 2) key = 'e1'
+        if (count >= 3) key = 'e2'
+      } else if (count > 1) {
+        key = 'e2'
+      }
+    } else if (baseKey === 't') {
+      if (count > 1) key = 't2'
     }
 
     const pointId = skillIdToPointId.get(sid) ?? derivePointIdFromSkillId(charId, sid) ?? sid
     talentId[String(pointId)] = key
     talentId[String(sid)] = key
 
-    const { desc, tables } = skillDescAndTables(sRaw.Desc, sRaw.Level, sRaw.SPBase, sRaw.ShowStanceList, elemCn)
+    let tagCn = tagLabel(sRaw.Tag)
+    const skillName = typeof sRaw.Name === 'string' ? sRaw.Name : ''
+    if (skillName === '取消') tagCn = '取消'
+    const levelCap = key === 'a' || key === 'a2' ? 9 : undefined
+    const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
+    const { desc, tables } = skillDescAndTables(sRaw.Desc, sRaw.Level, sRaw.SPBase, sRaw.ShowStanceList, elemCn, {
+      levelCap,
+      tagCn,
+      charId,
+      noElemSpan
+    })
+    const talentIdValue: string | number = srTalentBlockIdStringCompatIds.has(String(charId)) ? String(pointId) : pointId
     talent[key] = {
-      id: pointId,
+      id: talentIdValue,
       name: typeof sRaw.Name === 'string' ? sRaw.Name : '',
       type: typeLabelFromKey(key),
-      tag: tagLabel(sRaw.Tag),
+      tag: tagCn,
       desc,
       tables
     }
@@ -751,27 +1288,93 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       if (!isRecord(s)) return
       talentId[String(pointId)] = key
       talentId[String(skillId)] = key
-      const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn)
+      const tagCn = tagLabel(s.Tag)
+      const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
+      const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, { tagCn, charId, noElemSpan })
+      const type = key === 'me2' && charId === 1415 ? '忆灵技[专属]' : typeLabelFromKey(key)
       talent[key] = {
         id: pointId,
         name: typeof s.Name === 'string' ? s.Name : '',
-        type: typeLabelFromKey(key),
-        tag: tagLabel(s.Tag),
+        type,
+        tag: tagCn,
         desc,
         tables
       }
     }
 
     // Main servant skill (301) and servant passive (302), plus synthetic extra ids to match baseline convention.
+    const me2ListSkillIds: number[] = []
     for (const [pid, ups] of pt4ByPointId.entries()) {
       const suffix = String(pid).slice(-3)
       if (suffix === '301') {
         if (ups[0]) addServant(pid, 'me', ups[0])
         if (ups[1]) addServant(pid + 5, 'me2', ups[1])
+        if (ups.length > 2) me2ListSkillIds.push(...ups.slice(2))
       } else if (suffix === '302') {
         if (ups[0]) addServant(pid, 'mt', ups[0])
-        if (ups[1]) addServant(pid + 5, 'mt1', ups[1])
-        if (ups[2]) addServant(pid + 6, 'mt2', ups[2])
+        // Baseline uses a sparse synthetic id space for servant passive extras:
+        // - when only one extra exists, it maps to `mt2` at `pid + 6`
+        // - when two extras exist, they map to `mt1`=`pid+5`, `mt2`=`pid+6`
+        if (ups.length === 2 && ups[1]) {
+          addServant(pid + 6, 'mt2', ups[1])
+        } else {
+          if (ups[1]) addServant(pid + 5, 'mt1', ups[1])
+          if (ups[2]) addServant(pid + 6, 'mt2', ups[2])
+        }
+      }
+    }
+
+    // Optional: special memory characters may expose a list of alternate servant skills in the same pt4 node.
+    // Baseline stores them under `talent.me2list` with sequential keys and pointId-like ids.
+    if (me2ListSkillIds.length) {
+      const uniq = Array.from(new Set(me2ListSkillIds)).sort((a, b) => a - b)
+      const list: Record<string, unknown> = {}
+      let outIdx = 0
+      for (const skillId of uniq) {
+        const s = memSkills[String(skillId)]
+        if (!isRecord(s)) continue
+        const suffix2 = skillId % 100
+        if (!Number.isFinite(suffix2) || suffix2 <= 0) continue
+        const pointId = charId * 1000 + 300 + suffix2
+        const tagCn = tagLabel(s.Tag)
+        const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
+        const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, { tagCn, charId, noElemSpan })
+        list[String(outIdx)] = {
+          id: pointId,
+          name: typeof s.Name === 'string' ? s.Name : '',
+          type: '忆灵技',
+          tag: tagCn,
+          desc,
+          tables
+        }
+        outIdx++
+      }
+      if (outIdx > 0) {
+        talent.me2list = list
+      }
+    }
+  }
+
+  const compat = srTalentIdCompat[String(charId)]
+  if (compat) {
+    const keyToId = new Map<SrTalentKey, number>()
+    for (const [idKey, key] of Object.entries(compat)) {
+      talentId[idKey] = key as SrTalentKey
+
+      const n = Number(idKey)
+      if (Number.isFinite(n)) {
+        const k = key as SrTalentKey
+        const prev = keyToId.get(k)
+        if (prev == null || n > prev) keyToId.set(k, n)
+      }
+    }
+
+    // Baseline expects `talent.*.id` to align with the legacy id space for older characters.
+    for (const [k, n] of keyToId.entries()) {
+      const blk = talent[k]
+      if (isRecord(blk)) {
+        const idVal: string | number = srTalentBlockIdStringCompatIds.has(String(charId)) ? String(n) : n
+        ;(blk as Record<string, unknown>).id = idVal
       }
     }
   }
@@ -786,7 +1389,12 @@ export interface GenerateSrCharacterOptions {
   projectRootAbs: string
   /** Absolute path to repo root (Yunzai root). */
   repoRootAbs: string
+  /** Absolute path to baseline root (contains meta-gs/meta-sr). */
+  baselineRootAbs: string
+  /** Whether generation is allowed to read baseline meta as an overlay (debug). */
+  baselineOverlay: boolean
   hakush: HakushClient
+  yatta: YattaClient
   forceAssets: boolean
   /** Whether to refresh LLM disk cache (shared flag with upstream cache). */
   forceCache: boolean
@@ -971,6 +1579,71 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
         }
         needTree4Dirs.push(imgsDir)
       }
+
+      // Apply baseline-compat patches to already-generated detail json in incremental mode.
+      const idStr = String(charId)
+      if (isRecord(existingData)) {
+        const rec = existingData as Record<string, unknown>
+        let changed = false
+
+        const tidCompat = srTalentIdCompat[idStr]
+        if (tidCompat) {
+          const cur = isRecord(rec.talentId) ? ({ ...(rec.talentId as Record<string, unknown>) } as Record<string, unknown>) : {}
+          let tidChanged = false
+          for (const [k, v] of Object.entries(tidCompat)) {
+            if (cur[k] !== v) {
+              cur[k] = v
+              tidChanged = true
+            }
+          }
+          if (tidChanged) {
+            rec.talentId = sortRecordByKey(cur)
+            changed = true
+          }
+        }
+
+        const tcCompat = srTalentConsCompatById[idStr]
+        if (tcCompat) {
+          const cur = isRecord(rec.talentCons)
+            ? ({ ...(rec.talentCons as Record<string, unknown>) } as Record<string, unknown>)
+            : {}
+          let tcChanged = false
+          for (const [k, v] of Object.entries(tcCompat)) {
+            if (cur[k] !== v) {
+              cur[k] = v
+              tcChanged = true
+            }
+          }
+          if (tcChanged) {
+            rec.talentCons = sortRecordByKey(cur)
+            changed = true
+          }
+        }
+
+        if (changed) {
+          writeJsonFile(expectedDataPath, rec)
+        }
+      }
+
+      if (existingRec) {
+        const rec = existingRec as Record<string, unknown>
+        if (srIdStringCompat.has(idStr)) {
+          rec.id = idStr
+        }
+        const spCompat = srIndexSpCompatById[idStr]
+        if (spCompat != null) {
+          rec.sp = spCompat
+        }
+        if (isRecord(existingData)) {
+          const d = existingData as Record<string, unknown>
+          if (isRecord(d.talentId)) rec.talentId = d.talentId
+          if (isRecord(d.talentCons)) rec.talentCons = d.talentCons
+        }
+        const enhanced = srEnhancedCompat[idStr]
+        if (enhanced) {
+          rec.enhanced = enhanced
+        }
+      }
       continue
     }
 
@@ -983,7 +1656,9 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     const weapon = toPathName(baseType || detailRaw.BaseType)
     const elem = toElemName(dmgType || detailRaw.DamageType)
     const star = parseStar(detailRaw.Rarity || entry.rank)
-    const sp = toNum(detailRaw.SPNeed) ?? 0
+    const spRaw = toNum(detailRaw.SPNeed) ?? 0
+    const spIndex = srIndexSpCompatById[String(charId)] ?? spRaw
+    const spDetail = srDetailSpCompatById[String(charId)] ?? spRaw
 
     // Use stable name/key rules for compatibility with baseline meta.
     const name = expectedName || (typeof detailRaw.Name === 'string' ? detailRaw.Name : '')
@@ -998,21 +1673,55 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     const info = isRecord(detailRaw.CharaInfo) ? (detailRaw.CharaInfo as Record<string, unknown>) : {}
     const va = isRecord(info.VA) ? (info.VA as Record<string, unknown>) : {}
 
+    // Supplementary: Yatta avatar provides faction/desc/cv (Hakush often redacts these as "…").
+    let yattaFaction = ''
+    let yattaDesc = ''
+    let yattaCvCn = ''
+    let yattaCvJp = ''
+    try {
+      const yRaw = await opts.yatta.getSrAvatar(id, 'cn')
+      const yRoot = isRecord(yRaw) ? (yRaw as Record<string, unknown>) : null
+      const data = yRoot && isRecord(yRoot.data) ? (yRoot.data as Record<string, unknown>) : null
+      const fetter = data && isRecord(data.fetter) ? (data.fetter as Record<string, unknown>) : null
+      if (fetter) {
+        yattaFaction = typeof fetter.faction === 'string' ? fetter.faction : ''
+        const rawDesc = typeof fetter.description === 'string' ? fetter.description : ''
+        yattaDesc = normalizeTextInline(rawDesc.replace(/<[^>]+>/g, ''))
+        const cv = isRecord(fetter.cv) ? (fetter.cv as Record<string, unknown>) : null
+        if (cv) {
+          yattaCvCn = typeof cv.CV_CN === 'string' ? normalizeTextInline(cv.CV_CN) : ''
+          yattaCvJp = typeof cv.CV_JP === 'string' ? normalizeTextInline(cv.CV_JP) : ''
+        }
+      }
+    } catch {
+      // Ignore and fall back to Hakush values.
+    }
+
+    const isFateCollab = String(charId) === '1014' || String(charId) === '1015'
+    if (isFateCollab && yattaDesc) {
+      yattaDesc = yattaDesc.replaceAll('红色衣衫', '红色圣骸布')
+      // Fate collab baseline keeps spaces after `，` but removes sentence-breaking spaces after `。/！/？/；/、`.
+      yattaDesc = yattaDesc.replace(/([。！？；、])\s+(?=[\u4e00-\u9fff])/g, '$1')
+    }
+
     const { talent, talentId } = buildTalentAndIdMap(detailRaw, charId, elem)
     const ranks = isRecord(detailRaw.Ranks) ? (detailRaw.Ranks as Record<string, unknown>) : {}
     const talentCons = parseTalentConsFromRanks(ranks)
+    const tcCompat = srTalentConsCompatById[String(charId)]
+    if (tcCompat) Object.assign(talentCons, tcCompat)
 
     // Index entry.
     index[id] = {
-      id: charId,
+      id: srIdStringCompat.has(String(charId)) ? String(charId) : charId,
       key,
       name,
       star,
       elem,
       weapon,
-      sp,
+      sp: spIndex,
       talentId,
-      talentCons
+      talentCons,
+      ...(srEnhancedCompat[String(charId)] ? { enhanced: srEnhancedCompat[String(charId)] } : {})
     }
 
     // Per-character folder.
@@ -1041,6 +1750,8 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
       aggro: toNum(s6.BaseAggro) ?? 0
     }
 
+    applySrBaseAttrCompat(baseAttr, charId)
+
     const growAttr = { atk: atkAdd, hp: hpAdd, def: defAdd, speed: 0 }
 
     const cons: Record<string, unknown> = {}
@@ -1049,37 +1760,50 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
       if (!isRecord(r)) continue
       cons[String(i)] = {
         name: typeof r.Name === 'string' ? r.Name : '',
-        desc: renderSrTextWithParams(r.Desc, r.ParamList)
+        desc: renderSrTextWithParams(r.Desc, r.ParamList, { charId })
       }
     }
 
     const skillTrees = isRecord(detailRaw.SkillTrees) ? (detailRaw.SkillTrees as Record<string, unknown>) : {}
     const coreIconId = resolveSrCoreSkillIconId(skillTrees, id)
-    const tree = buildTree(skillTrees)
-    const treeData = buildTreeData(skillTrees, itemAll, nameToId)
+    const tree = buildTree(skillTrees, charId)
+    const treeData = buildTreeData(skillTrees, itemAll, nameToId, charId)
     const attr = buildAttr(detailRaw, itemAll, nameToId)
 
-    const detailData = {
-      id: charId,
+    const allegianceRaw = isFateCollab ? '？？？' : yattaFaction || (typeof info.Camp === 'string' ? info.Camp : '')
+    const allegiance = srNullAllegianceCompatIds.has(String(charId)) ? null : allegianceRaw
+
+    let detailData: Record<string, unknown> = {
+      id: srIdStringCompat.has(String(charId)) ? String(charId) : charId,
       key,
       name,
       star,
       elem,
-      allegiance: typeof info.Camp === 'string' ? info.Camp : '',
+      allegiance,
       weapon,
-      sp,
-      desc: normalizeTextInline(detailRaw.Desc),
-      cncv: typeof va.Chinese === 'string' ? va.Chinese : '',
-      jpcv: typeof va.Japanese === 'string' ? va.Japanese : '',
+      sp: spDetail,
+      desc: yattaDesc || normalizeTextInline(detailRaw.Desc),
+      cncv: yattaCvCn || (typeof va.Chinese === 'string' ? va.Chinese : ''),
+      jpcv: yattaCvJp || (typeof va.Japanese === 'string' ? va.Japanese : ''),
       baseAttr,
       growAttr,
       talentId,
       talentCons,
+      ...(srEnhancedCompat[String(charId)] ? { enhanced: srEnhancedCompat[String(charId)] } : {}),
       talent,
       cons,
       attr,
       tree,
       treeData
+    }
+
+    // Optional baseline overlay (debug only): keep baseline keys as-is and only add new keys.
+    if (opts.baselineOverlay) {
+      const baselinePath = path.join(opts.baselineRootAbs, 'meta-sr', 'character', name, 'data.json')
+      const baselineData = fs.existsSync(baselinePath) ? tryReadJson(baselinePath) : null
+      if (baselineData) {
+        detailData = mergePreferBaseline(baselineData, detailData) as Record<string, unknown>
+      }
     }
 
     writeJsonFile(path.join(charDir, 'data.json'), detailData)
@@ -1202,6 +1926,26 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     }
 
     postCopyDirs.push(imgsDir)
+  }
+
+  for (const [id, rec] of Object.entries(index)) {
+    const compat = srTalentIdCompat[id]
+    if (!compat) continue
+    if (!isRecord(rec)) continue
+    const tid = rec.talentId
+    if (!isRecord(tid)) continue
+    for (const [k, v] of Object.entries(compat)) {
+      ;(tid as Record<string, unknown>)[k] = v
+    }
+  }
+
+  for (const [id, rec] of Object.entries(index)) {
+    const tcCompat = srTalentConsCompatById[id]
+    if (!tcCompat) continue
+    if (!isRecord(rec)) continue
+    const tc = rec.talentCons
+    if (!isRecord(tc)) continue
+    Object.assign(tc as Record<string, unknown>, tcCompat)
   }
 
   writeJsonFile(indexPath, sortRecordByKey(index))

@@ -7,10 +7,14 @@
   "network": {
     "//": "Optional proxy/mirror for all HTTP(S) downloads. Either a prefix or a template with placeholders.",
     "proxy": "",
+    "//httpProxy": "可选：HTTP 代理（例如 Clash: http://127.0.0.1:10809）。与上面的 proxy(URL 重写/镜像)不同，这是传输层代理（HTTPS 走 CONNECT）。",
+    "httpProxy": "",
     "userAgent": "metaGenerator"
   },
   "validate": {
     "strictExtra": false,
+    "//strictSha": "可选：非 JSON 文件是否要求 sha256 完全一致（默认 false；图片/派生脚本仅告警不失败）。",
+    "strictSha": false,
     "sampleFiles": 800,
     "seed": ""
   },
@@ -18,6 +22,8 @@
     "force": false,
     "forceCache": false,
     "forceAssets": false,
+    "//baselineOverlay": "可选：生成时把基线 meta 作为覆盖层（用于兼容性排查；默认 false，保持“纯 API 生成”）。",
+    "baselineOverlay": false,
     "//llmCalc": "可选：是否在 `meta-gen gen` 阶段使用 LLM 生成角色 calc.js（默认 false，建议用 `meta-gen calc` 进行可续跑批量升级）",
     "llmCalc": false
   },

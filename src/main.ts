@@ -4,6 +4,7 @@
  * This file is intentionally small: it wires argv -> command handlers.
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { genCommand } from './commands/gen.js'
@@ -26,8 +27,26 @@ function getProjectRoot(): string {
 }
 
 function getRepoRoot(): string {
-  // temp/metaGenerator -> repo root
-  return path.resolve(getProjectRoot(), '..', '..')
+  // Resolve repo root robustly:
+  // - When metaGenerator lives under `temp/metaGenerator`, repo root is 2 levels up.
+  // - When metaGenerator is a standalone repo, repo root is the project root.
+  //
+  // We use the nearest ancestor that contains a `.git` directory/file.
+  // (This also works for worktrees where `.git` is a file.)
+  const start = getProjectRoot()
+  let cur = start
+
+  while (true) {
+    const gitPath = path.join(cur, '.git')
+    if (fs.existsSync(gitPath)) return cur
+
+    const parent = path.dirname(cur)
+    if (!parent || parent === cur) break
+    cur = parent
+  }
+
+  // Fallback: preserve previous behavior (two levels up) in non-git environments.
+  return path.resolve(start, '..', '..')
 }
 
 /**

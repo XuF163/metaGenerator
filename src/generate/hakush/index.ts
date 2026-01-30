@@ -17,6 +17,7 @@ import { AnimeGameDataClient } from '../../source/animeGameData/client.js'
 import { HakushClient } from '../../source/hakush/client.js'
 import { TurnBasedGameDataClient } from '../../source/turnBasedGameData/client.js'
 import { HoYoWikiClient } from '../../source/hoyoWiki/client.js'
+import { YattaClient } from '../../source/yatta/client.js'
 import type { LlmService } from '../../llm/service.js'
 import { generateGsWeapons } from './gs/weapon.js'
 import { generateGsArtifacts } from './gs/artifact.js'
@@ -35,12 +36,16 @@ function metaGameDir(outputRootAbs: string, game: Game): string {
 export interface HakushUpdateOptions {
   ctx: CommandContext
   outputRootAbs: string
+  /** Absolute path to baseline root (contains meta-gs/meta-sr). */
+  baselineRootAbs: string
   games: Game[]
   types: MetaType[]
   /** Whether to refresh cached JSON files. */
   forceCache: boolean
   /** Whether to overwrite downloaded assets (images) if they exist. */
   forceAssets: boolean
+  /** Whether generation is allowed to read baseline meta as an overlay (debug). */
+  baselineOverlay: boolean
   /** Optional LLM service used to generate calc.js for new characters. */
   llm?: LlmService
 }
@@ -68,9 +73,20 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
     log: opts.ctx.log
   })
 
+  const yatta = new YattaClient({
+    cacheRootAbs: path.join(opts.ctx.projectRoot, '.cache', 'yatta'),
+    force: opts.forceCache,
+    log: opts.ctx.log
+  })
+
+  // Some generation steps depend on outputs produced by other types:
+  // - character costs need material name->id mapping, so material must run before character
+  const typePriority: Record<MetaType, number> = { material: 0, weapon: 1, artifact: 2, character: 3 }
+
   for (const game of opts.games) {
     const metaRoot = metaGameDir(opts.outputRootAbs, game)
-    for (const type of opts.types) {
+    const orderedTypes = Array.from(new Set(opts.types)).sort((a, b) => (typePriority[a] ?? 99) - (typePriority[b] ?? 99))
+    for (const type of orderedTypes) {
       if (game === 'gs') {
         if (type === 'weapon') {
           await generateGsWeapons({
@@ -102,6 +118,7 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
             projectRootAbs: opts.ctx.projectRoot,
             repoRootAbs: opts.ctx.repoRoot,
             hakush,
+            animeGameData,
             forceAssets: opts.forceAssets,
             forceCache: opts.forceCache,
             llm: opts.llm,
@@ -113,6 +130,8 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
           await generateSrWeapons({
             metaSrRootAbs: metaRoot,
             hakush,
+            yatta,
+            turnBasedGameData,
             forceAssets: opts.forceAssets,
             log: opts.ctx.log
           })
@@ -128,6 +147,7 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
           await generateSrArtifacts({
             metaSrRootAbs: metaRoot,
             hakush,
+            yatta,
             turnBasedGameData,
             forceAssets: opts.forceAssets,
             log: opts.ctx.log
@@ -137,7 +157,10 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
             metaSrRootAbs: metaRoot,
             projectRootAbs: opts.ctx.projectRoot,
             repoRootAbs: opts.ctx.repoRoot,
+            baselineRootAbs: opts.baselineRootAbs,
+            baselineOverlay: opts.baselineOverlay,
             hakush,
+            yatta,
             forceAssets: opts.forceAssets,
             forceCache: opts.forceCache,
             llm: opts.llm,

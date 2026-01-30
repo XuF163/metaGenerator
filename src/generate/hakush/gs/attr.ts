@@ -37,6 +37,11 @@ function toNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+function roundToFixed(value: number, decimals: number): number {
+  // Match baseline half-case behavior (`toFixed` is used in baseline generators for curve tables).
+  return Number(value.toFixed(decimals))
+}
+
 function getMul(mul: Record<string, unknown>, levelKey: string): number {
   return toNum(mul[levelKey])
 }
@@ -92,50 +97,77 @@ function promotionAtStage(
 }
 
 export function buildGiAttrTable(opts: BuildGiAttrTableOptions): GiAttrTable {
-  // Baseline meta generation rounds base stats to 3 decimals before applying multipliers.
-  // This avoids edge-case 0.01 differences caused by float precision when rounding to 2 decimals later.
-  const baseHP = roundTo(opts.baseHP, 3)
-  const baseATK = roundTo(opts.baseATK, 3)
-  const baseDEF = roundTo(opts.baseDEF, 3)
+  // Keep full base stat precision; baseline milestone rounding happens at the final 2-decimal step.
+  const baseHP = opts.baseHP
+  const baseATK = opts.baseATK
+  const baseDEF = opts.baseDEF
 
   const keys = ['hpBase', 'atkBase', 'defBase']
   if (opts.growKey) keys.push(opts.growKey)
 
-  // Milestone keys follow the baseline meta convention.
-  const milestones: Array<{ key: string; lv: string; stage: number }> = [
-    { key: '1', lv: '1', stage: 0 },
-    { key: '20', lv: '20', stage: 0 },
-    { key: '20+', lv: '20', stage: 1 },
-    { key: '40', lv: '40', stage: 1 },
-    { key: '40+', lv: '40', stage: 2 },
-    { key: '50', lv: '50', stage: 2 },
-    { key: '50+', lv: '50', stage: 3 },
-    { key: '60', lv: '60', stage: 3 },
-    { key: '60+', lv: '60', stage: 4 },
-    { key: '70', lv: '70', stage: 4 },
-    { key: '70+', lv: '70', stage: 5 },
-    { key: '80', lv: '80', stage: 5 },
-    { key: '80+', lv: '80', stage: 6 },
-    { key: '90', lv: '90', stage: 6 },
-    { key: '90+', lv: '90', stage: 7 },
-    { key: '100', lv: '100', stage: 6 }
-  ]
-
   const details: Record<string, number[]> = {}
 
-  for (const m of milestones) {
-    const mulHp = getMul(opts.hpMul, m.lv)
-    const mulAtk = getMul(opts.atkMul, m.lv)
-    const mulDef = getMul(opts.defMul, m.lv)
+  const buildBaseRow = (lv: string, stage: number): number[] => {
+    const mulHp = getMul(opts.hpMul, lv)
+    const mulAtk = getMul(opts.atkMul, lv)
+    const mulDef = getMul(opts.defMul, lv)
 
-    const promo = promotionAtStage(m.stage, opts.ascArr, opts.growProp, opts.growKey)
+    const promo = promotionAtStage(stage, opts.ascArr, opts.growProp, opts.growKey)
 
-    const hp = roundTo(baseHP * mulHp + promo.hp, 2)
-    const atk = roundTo(baseATK * mulAtk + promo.atk, 2)
-    const def = roundTo(baseDEF * mulDef + promo.def, 2)
+    const hpScaled = baseHP * mulHp
+    const atkScaled = baseATK * mulAtk
+    const defScaled = baseDEF * mulDef
+
+    // Baseline rounds base milestones to 2 decimals.
+    const hp = roundToFixed(hpScaled + promo.hp, 2)
+    const atk = roundToFixed(atkScaled + promo.atk, 2)
+    const def = roundToFixed(defScaled + promo.def, 2)
 
     const row = [hp, atk, def]
     if (opts.growKey) row.push(promo.grow)
+    return row
+  }
+
+  // Non-plus milestones: compute directly from base scaling + cumulative promote bonus.
+  // (These match baseline exactly and serve as the rounding base for `xx+` milestones.)
+  const nonPlusMilestones: Array<{ key: string; lv: string; stage: number }> = [
+    { key: '1', lv: '1', stage: 0 },
+    { key: '20', lv: '20', stage: 0 },
+    { key: '40', lv: '40', stage: 1 },
+    { key: '50', lv: '50', stage: 2 },
+    { key: '60', lv: '60', stage: 3 },
+    { key: '70', lv: '70', stage: 4 },
+    { key: '80', lv: '80', stage: 5 },
+    { key: '90', lv: '90', stage: 6 },
+    { key: '100', lv: '100', stage: 6 }
+  ]
+  for (const m of nonPlusMilestones) {
+    details[m.key] = buildBaseRow(m.lv, m.stage)
+  }
+
+  // Plus milestones: baseline applies promote bonus *incrementally* on top of the already-rounded
+  // non-plus milestone (e.g. `40+ = round2(40 + (promote2 - promote1))`), which can shift 0.01 at half-cases.
+  const plusMilestones: Array<{ key: string; baseKey: string; lv: string; fromStage: number; toStage: number }> = [
+    { key: '20+', baseKey: '20', lv: '20', fromStage: 0, toStage: 1 },
+    { key: '40+', baseKey: '40', lv: '40', fromStage: 1, toStage: 2 },
+    { key: '50+', baseKey: '50', lv: '50', fromStage: 2, toStage: 3 },
+    { key: '60+', baseKey: '60', lv: '60', fromStage: 3, toStage: 4 },
+    { key: '70+', baseKey: '70', lv: '70', fromStage: 4, toStage: 5 },
+    { key: '80+', baseKey: '80', lv: '80', fromStage: 5, toStage: 6 },
+    { key: '90+', baseKey: '90', lv: '90', fromStage: 6, toStage: 7 }
+  ]
+  for (const m of plusMilestones) {
+    const baseRow = details[m.baseKey] || [0, 0, 0]
+
+    const promoFrom = promotionAtStage(m.fromStage, opts.ascArr, opts.growProp, opts.growKey)
+    const promoTo = promotionAtStage(m.toStage, opts.ascArr, opts.growProp, opts.growKey)
+
+    const hp = roundToFixed((baseRow[0] ?? 0) + (promoTo.hp - promoFrom.hp), 2)
+    const atk = roundToFixed((baseRow[1] ?? 0) + (promoTo.atk - promoFrom.atk), 2)
+    const def = roundToFixed((baseRow[2] ?? 0) + (promoTo.def - promoFrom.def), 2)
+
+    const row = [hp, atk, def]
+    if (opts.growKey) row.push(promoTo.grow)
     details[m.key] = row
   }
 

@@ -67,11 +67,13 @@ function getHelpText(): string {
     '  --force                  gen: wipe output meta-{game} before generating',
     '  --force-cache            gen: refresh cached upstream JSON (Hakush)',
     '  --force-assets           gen: re-download assets (images) if they exist',
+    '  --baseline-overlay       gen: overlay baseline meta while generating (debug; default: false)',
     '  --sample-files <n>       validate: random sample file count (default from config or 800)',
     '  --sample <n>             alias of --sample-files',
     '  --full                   validate: compare all files (ignore sampling)',
     '  --seed <seed>            validate: reproducible sampling seed',
     '  --strict-extra           validate: fail if output has extra files',
+    '  --strict-sha             validate: fail if non-JSON sha256 differs',
     '  -h, --help               show help',
     ''
   ].join('\n')
@@ -104,7 +106,15 @@ export function parseCliArgs(argv: string[], config?: ToolConfig): ParsedOk | Pa
       return { ok: false, error: `Unexpected arg: ${a}\n\n${helpText}` }
     }
     const key = a.slice(2)
-    if (key === 'force' || key === 'force-cache' || key === 'force-assets' || key === 'strict-extra' || key === 'full') {
+    if (
+      key === 'force' ||
+      key === 'force-cache' ||
+      key === 'force-assets' ||
+      key === 'baseline-overlay' ||
+      key === 'strict-extra' ||
+      key === 'strict-sha' ||
+      key === 'full'
+    ) {
       optsRaw[key] = true
       continue
     }
@@ -151,7 +161,9 @@ export function parseCliArgs(argv: string[], config?: ToolConfig): ParsedOk | Pa
     force: Boolean(optsRaw['force']) || defaults.force,
     forceCache: Boolean(optsRaw['force-cache']) || defaults.forceCache,
     forceAssets: Boolean(optsRaw['force-assets']) || defaults.forceAssets,
+    baselineOverlay: Boolean(optsRaw['baseline-overlay']) || defaults.baselineOverlay,
     strictExtra: Boolean(optsRaw['strict-extra']) || defaults.strictExtra,
+    strictSha: Boolean(optsRaw['strict-sha']) || defaults.strictSha,
     sampleFiles,
     seed
   }
@@ -177,7 +189,9 @@ function getDefaultOptions(config?: ToolConfig): GenOptions & ValidateOptions {
     force: Boolean(config?.gen?.force),
     forceCache: Boolean(config?.gen?.forceCache),
     forceAssets: Boolean(config?.gen?.forceAssets),
+    baselineOverlay: Boolean(config?.gen?.baselineOverlay),
     strictExtra: Boolean(config?.validate?.strictExtra),
+    strictSha: Boolean(config?.validate?.strictSha),
     sampleFiles: Number.isFinite(config?.validate?.sampleFiles) ? (config?.validate?.sampleFiles as number) : 800,
     seed: config?.validate?.seed || undefined
   }

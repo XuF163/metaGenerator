@@ -19,6 +19,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function stripGiRichText(text: string): string {
   return text
+    .replace(/\{LINK#[^}]*\}/g, '')
+    .replace(/\{\/LINK\}/g, '')
     .replaceAll('\\n', '\n')
     .replaceAll('\r\n', '\n')
     .replace(/<color=[^>]+>/g, '')
@@ -28,7 +30,7 @@ function stripGiRichText(text: string): string {
 }
 
 function normalizeSkillNameForMatch(name: string): string {
-  return name.trim()
+  return name.trim().replace(/[「」『』【】《》〈〉“”"']/g, '')
 }
 
 function isNameMatch(a: string, b: string): boolean {
@@ -66,6 +68,12 @@ export function inferGiTalentConsFromParts(parts: {
 
   apply(3, parts.c3Desc)
   apply(5, parts.c5Desc)
+
+  // If only one of E/Q matched, fill the other with the common pattern.
+  if (!out.a) {
+    if (!out.e && (out.q === 3 || out.q === 5)) out.e = out.q === 3 ? 5 : 3
+    if (!out.q && (out.e === 3 || out.e === 5)) out.q = out.e === 3 ? 5 : 3
+  }
 
   return out
 }

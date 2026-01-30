@@ -76,6 +76,84 @@ export interface GenerateGsMaterialDailyOptions {
   log?: Pick<Console, 'info' | 'warn'>
 }
 
+function stripQuotes(s: string): string {
+  return s.replace(/[「」『』《》“”]/g, '').trim()
+}
+
+function splitAfterLast(s: string, sep: string): string {
+  const i = s.lastIndexOf(sep)
+  if (i === -1) return ''
+  return s.slice(i + sep.length).trim()
+}
+
+function tryReadJson(filePath: string): unknown | null {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8')
+    return JSON.parse(raw) as unknown
+  } catch {
+    return null
+  }
+}
+
+function collectMaterialNamesFromDataJson(data: unknown): Array<{ name: string; type: string }> {
+  const out: Array<{ name: string; type: string }> = []
+  if (!isRecord(data)) return out
+
+  const walk = (v: unknown): void => {
+    if (!isRecord(v)) return
+    const name = typeof v.name === 'string' ? v.name.trim() : ''
+    const type = typeof v.type === 'string' ? v.type.trim() : ''
+    if (name && type) out.push({ name, type })
+
+    const items = v.items
+    if (!isRecord(items)) return
+    for (const child of Object.values(items)) walk(child)
+  }
+
+  for (const v of Object.values(data)) walk(v)
+  return out
+}
+
+function deriveMaterialAbbr(nameRaw: string): string[] {
+  const name = nameRaw.trim()
+  if (!name) return []
+
+  const out: string[] = []
+  const push = (s: string): void => {
+    const t = s.trim()
+    if (!t) return
+    if (t === name) return
+    if (t.length < 2) return
+    if (t.length > 12) return
+    if (!out.includes(t)) out.push(t)
+  }
+
+  // Common punctuation/quote stripping (e.g. 「图比昂装置」 -> 图比昂装置).
+  const noQuotes = stripQuotes(name)
+  if (noQuotes && noQuotes !== name) push(noQuotes)
+
+  // "未能达成X" -> "未X" (baseline convention for some boss drops).
+  if (name.startsWith('未能达成')) push(`未${name.slice('未能达成'.length)}`)
+
+  // "奇械..." -> drop the prefix for brevity (common Fontaine chain naming).
+  if (name.startsWith('奇械') && name.length > 2) push(name.slice(2))
+
+  // "xxx·yyy" -> yyy
+  const afterDot = splitAfterLast(name, '·')
+  if (afterDot) push(afterDot)
+
+  // Pattern compression for "...之X": keep the leading 2 chars + trailing 2 chars.
+  if (/之.$/.test(name) && name.length >= 5) {
+    push(`${name.slice(0, 2)}${name.slice(-2)}`)
+  }
+
+  // Generic fallbacks (only useful when unique).
+  if (name.length >= 4) push(name.slice(-4))
+  if (name.length >= 4) push(name.slice(2))
+
+  return out
+}
+
 export async function generateGsMaterialDailyAndAbbr(opts: GenerateGsMaterialDailyOptions): Promise<void> {
   const materialRoot = path.join(opts.metaGsRootAbs, 'material')
   fs.mkdirSync(materialRoot, { recursive: true })
@@ -232,19 +310,55 @@ export async function generateGsMaterialDailyAndAbbr(opts: GenerateGsMaterialDai
   ].join('\n')
   fs.writeFileSync(outDaily, dailyJs, 'utf8')
 
-  // Keep abbr overrides minimal and user-extensible; most abbr is derived at runtime (abbr2).
-  const abbrJs = [
-    '/**',
-    ' * Material abbreviation overrides (generated).',
-    ' *',
-    ' * Intentionally minimal: prefer deriving abbreviations from material names and daily.js.',
-    ' * Users can extend this file after generation if they need extra nicknames.',
-    ' */',
-    '',
-    'export const abbr = {}',
-    ''
-  ].join('\n')
-  fs.writeFileSync(outAbbr, abbrJs, 'utf8')
+  // Abbr overrides: derive a small, collision-safe set from material/data.json.
+  // (Talent/weapon abbreviations are already derived at runtime via abbr2; focus on boss/weekly/normal/etc.)
+  const abbr: Record<string, string> = {}
+  try {
+    const materialDataPath = path.join(materialRoot, 'data.json')
+    if (fs.existsSync(materialDataPath)) {
+      const raw = tryReadJson(materialDataPath)
+      if (!raw) return
+      const entries = collectMaterialNamesFromDataJson(raw)
+      const used = new Set<string>()
+
+      // Skip types that already have derived abbr (abbr2) to avoid conflicts.
+      const skipTypes = new Set(['talent', 'weapon'])
+
+      // Stable order for deterministic output.
+      entries
+        .filter((e) => !skipTypes.has(e.type))
+        .map((e) => e.name)
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+        .forEach((name) => {
+          const cands = deriveMaterialAbbr(name)
+          const pick = cands.find((c) => !used.has(c))
+          if (!pick) return
+          used.add(pick)
+          abbr[name] = pick
+        })
+    }
+  } catch (e) {
+    opts.log?.warn?.(`[meta-gen] (gs) material abbr.js derive failed: ${String(e)}`)
+  }
+
+  const keys = Object.keys(abbr).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+  const lines: string[] = []
+  lines.push('/**')
+  lines.push(' * Material abbreviation overrides (generated).')
+  lines.push(' *')
+  lines.push(' * Derived from meta-gs/material/data.json names.')
+  lines.push(' * Do NOT edit by hand. Re-run `meta-gen gen` to regenerate.')
+  lines.push(' */')
+  lines.push('')
+  lines.push('export const abbr = {')
+  for (const k of keys) {
+    lines.push(`  ${JSON.stringify(k)}: ${JSON.stringify(abbr[k])},`)
+  }
+  lines.push('}')
+  lines.push('')
+
+  fs.writeFileSync(outAbbr, lines.join('\n'), 'utf8')
 
   opts.log?.info?.('[meta-gen] (gs) generated material daily.js/abbr.js from AnimeGameData')
 }

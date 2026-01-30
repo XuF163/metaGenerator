@@ -29,6 +29,12 @@ export interface GenOptions {
   forceCache: boolean
   /** When true, re-download assets (images) even if they exist. */
   forceAssets: boolean
+  /**
+   * When true, use local baseline meta as an overlay during generation (for compatibility debugging).
+   *
+   * Default: false (pure API generation).
+   */
+  baselineOverlay: boolean
 }
 
 export interface ValidateOptions {
@@ -38,6 +44,13 @@ export interface ValidateOptions {
   types: MetaType[]
   /** If true, require no extra files in output. */
   strictExtra: boolean
+  /**
+   * If true, require non-JSON files to be byte-identical (sha256 match).
+   *
+   * Default (false): non-JSON differences are reported as warnings and do NOT fail validation.
+   * Rationale: images and derived JS files are often regenerated with different compression/formatting.
+   */
+  strictSha: boolean
   /**
    * When set, validate only a random subset of files (plus critical top-level files).
    * Use `seed` to make the sampling reproducible.
@@ -69,9 +82,11 @@ export interface ValidateReport {
     totalCompared: number
     missing: number
     different: number
+    warnings: number
     extra: number
   }
   missingFiles: string[]
   differentFiles: Array<{ file: string; reason: string }>
+  warningFiles: Array<{ file: string; reason: string }>
   extraFiles: string[]
 }

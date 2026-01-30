@@ -20,14 +20,19 @@ import path from 'node:path'
 import { writeJsonFile } from '../../../fs/json.js'
 import { downloadToFileOptional } from '../../../http/download-optional.js'
 import { logAssetError } from '../../../log/run-log.js'
+import type { AnimeGameDataClient } from '../../../source/animeGameData/client.js'
 import type { HakushClient } from '../../../source/hakush/client.js'
 import { runPromisePool } from '../../../utils/promise-pool.js'
 import { roundTo, sortRecordByKey } from '../utils.js'
+import type { AgdAvatarAttrContext } from './attr-agd.js'
 import { buildGiAttrTable } from './attr.js'
-import { buildGiTalent } from './talent.js'
+import { buildGiAttrTableFromAgd, tryCreateAgdAvatarAttrContext } from './attr-agd.js'
+import { buildGiTalent, buildGiTablesFromPromote, normalizePromoteList } from './talent.js'
+import type { GiSkillDescOptions } from './talent.js'
 import { inferGiTalentConsFromHakushDetail, inferGiTalentConsFromMetaJson } from './talent-cons.js'
 import type { LlmService } from '../../../llm/service.js'
 import { buildCalcJsWithLlmOrHeuristic } from '../../calc/llm-calc.js'
+import type { GiTalentCons } from './talent-cons.js'
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -71,23 +76,104 @@ const growKeyMap: Record<string, string | undefined> = {
 
 function normalizeTextInline(text: unknown): string {
   if (typeof text !== 'string') return ''
-  return text.replaceAll('\\n', ' ').replaceAll('\n', ' ').replace(/\s+/g, ' ').trim()
+  return text
+    .replace(/\{LINK#[^}]*\}/g, '')
+    .replace(/\{\/LINK\}/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replaceAll('\\n', ' ')
+    .replaceAll('\n', ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function giPlainDescToLines(raw: unknown): string[] {
   if (typeof raw !== 'string') return []
   const text = raw
-    .replaceAll('{LINK#', '')
-    .replaceAll('{/LINK}', '')
+    .replace(/\{LINK#[^}]*\}/g, '')
+    .replace(/\{\/LINK\}/g, '')
+    .replaceAll('{TIMEZONE}', 'GMT+8')
     .replaceAll('\\n', '\n')
     .replaceAll('\r\n', '\n')
-    .replace(/<color=[^>]+>/g, '')
-    .replace(/<\/color>/g, '')
     .trim()
-  return text
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
+
+  const out: string[] = []
+  let italicOpen = false
+  for (const rawLine of text.split('\n')) {
+    let line = rawLine.trim()
+    if (!line) continue
+    // Hakush sometimes prepends markdown-ish markers.
+    line = line.replace(/^#+\s*/, '').trim()
+    if (!line) continue
+
+    const headingMatch = line.match(/^<color=#FFD780FF>(.*?)<\/color>$/)
+    if (headingMatch) {
+      const heading = headingMatch[1].replace(/<[^>]+>/g, '').trim().replace(/\s*\/\s*/g, '/')
+      out.push(`<h3>${heading}</h3>`)
+      continue
+    }
+
+    line = line.replace(/<color=[^>]+>/g, '').replace(/<\/color>/g, '')
+    // Keep <i>...</i> (baseline uses it for flavor lines), strip other tags.
+    line = line.replace(/<i[^>]*>/g, '<i>').replace(/<\/i>/g, '</i>')
+    line = line
+      .replace(/<(?!\/?i\b)[^>]+>/g, '')
+      .trim()
+      .replace(/\s*\/\s*/g, '/')
+      .replace(/\s+([：:])/g, '$1')
+    if (!line) continue
+
+    // Baseline-compat: split multi-line <i>...</i> blocks into per-line "<i>...</i>" entries.
+    const startedItalic = line.includes('<i>')
+    const endedItalic = line.includes('</i>')
+
+    if (!startedItalic && endedItalic) {
+      line = `<i>${line}`
+    } else if (italicOpen && !startedItalic) {
+      line = `<i>${line}`
+    }
+
+    if ((italicOpen || startedItalic) && !line.includes('</i>')) {
+      line = `${line}</i>`
+    }
+
+    out.push(line)
+
+    if (endedItalic) italicOpen = false
+    else if (startedItalic) italicOpen = true
+  }
+
+  return out
+}
+
+function preferSpecialDesc(obj: Record<string, unknown>): unknown {
+  const s = obj.SpecialDesc
+  const d = obj.Desc
+
+  const score = (raw: unknown): number => {
+    if (typeof raw !== 'string') return 0
+    return raw
+      .replace(/\{LINK#[^}]*\}/g, '')
+      .replace(/\{\/LINK\}/g, '')
+      .replaceAll('\\n', '\n')
+      .replaceAll('\r\n', '\n')
+      .replace(/<[^>]+>/g, '')
+      .trim().length
+  }
+
+  const sScore = score(s)
+  const dScore = score(d)
+  if (!sScore) return d
+  if (!dScore) return s
+  return sScore >= dScore ? s : d
+}
+
+function passiveUnlockRank(unlock: number): { group: number; order: number } {
+  if (!Number.isFinite(unlock)) return { group: 99, order: 999 }
+  // Baseline prefers special system passives (unlock>=1,000,000) first.
+  if (unlock >= 1_000_000) return { group: 0, order: unlock }
+  // Then exploration (0), then A1/A4/etc by unlock asc.
+  if (unlock === 0) return { group: 1, order: 0 }
+  return { group: 2, order: unlock }
 }
 
 function ensurePlaceholderCalcJs(calcPath: string, name: string): void {
@@ -136,9 +222,11 @@ function getCostumeInfo(charInfo: Record<string, unknown>): { ids: number[]; pri
     if (!id || !icon) continue
     alts.push({ id, icon })
   }
-  // Baseline meta stores only non-default costumes; Hakush usually uses empty Icon for default.
-  const ids = alts.map((c) => c.id)
-  const primaryIcon = alts[0]?.icon || ''
+  // Baseline meta keeps at most one non-default costume id (even if upstream lists multiple).
+  alts.sort((a, b) => a.id - b.id)
+  const primary = alts[0]
+  const ids = primary ? [primary.id] : []
+  const primaryIcon = primary?.icon || ''
   const primarySuffix = primaryIcon.startsWith('UI_AvatarIcon_')
     ? primaryIcon.replace('UI_AvatarIcon_', '')
     : primaryIcon.replace(/^UI_/, '')
@@ -167,11 +255,114 @@ function parseHakushVariantId(id: string): { baseId: string; variant: string } |
   return { baseId: m[1]!, variant: m[2]! }
 }
 
+// Abbreviation overrides (baseline-compatible):
+// - index (`character/data.json`) uses stable short-hands to avoid collisions.
+// - per-character (`character/<name>/data.json`) may keep full names for some characters.
+const gsAbbrIndexOverrideByName: Record<string, string> = {
+  阿蕾奇诺: '仆人',
+  艾尔海森: '海森',
+  艾梅莉埃: '艾梅',
+  八重神子: '八重',
+  达达利亚: '公子',
+  枫原万叶: '万叶',
+  哥伦比娅: '少女',
+  荒泷一斗: '一斗',
+  九条裟罗: '九条',
+  克洛琳德: '琳德',
+  莱欧斯利: '莱欧',
+  雷电将军: '雷神',
+  鹿野院平藏: '平藏',
+  罗莎莉亚: '罗莎',
+  梦见月瑞希: '瑞希',
+  那维莱特: '那维',
+  '奇偶·男性': '男偶',
+  '奇偶·女性': '女偶',
+  茜特菈莉: '茜特',
+  珊瑚宫心海: '心海',
+  神里绫华: '绫华',
+  神里绫人: '绫人'
+}
+
+const gsAbbrDetailOverrideByName: Record<string, string> = {
+  阿蕾奇诺: '仆人',
+  艾尔海森: '海森',
+  八重神子: '神子',
+  达达利亚: '公子',
+  枫原万叶: '万叶',
+  哥伦比娅: '少女',
+  荒泷一斗: '一斗',
+  九条裟罗: '九条',
+  克洛琳德: '琳德',
+  雷电将军: '雷神',
+  鹿野院平藏: '平藏',
+  罗莎莉亚: '罗莎',
+  梦见月瑞希: '瑞希',
+  '奇偶·男性': '男偶',
+  '奇偶·女性': '女偶',
+  茜特菈莉: '茜特',
+  珊瑚宫心海: '心海',
+  神里绫华: '绫华',
+  神里绫人: '绫人'
+}
+
+function gsIndexAbbr(name: string): string {
+  return gsAbbrIndexOverrideByName[name] ?? (name.length >= 5 ? name.slice(-2) : name)
+}
+
+function gsDetailAbbr(name: string): string {
+  return gsAbbrDetailOverrideByName[name] ?? (name.length >= 5 ? name.slice(-2) : name)
+}
+
+const gsTalentConsOverrideById: Record<string, GiTalentCons> = {
+  // Hakush text for these two does not match the C3/C5 pattern; enforce baseline-compatible values.
+  '10000046': { a: 0, e: 3, q: 5 }, // 胡桃
+  // Baseline index expects the default C3/C5 pattern for 埃洛伊 (even though per-character data.json keeps all zeros).
+  '10000062': { a: 0, e: 5, q: 3 }
+}
+
+const gsCncvOverrideById: Record<string, string> = {
+  // Hakush swapped these two CN voice actors; keep baseline-compatible output.
+  '10000126': '昱头', // 兹白
+  '10000127': 'Mace' // 叶洛亚
+}
+
+const gsEtaCompatById: Record<string, number> = {
+  '10000061': 1684893600000,
+  '10000070': 1665712800000,
+  '10000073': 1667354400000,
+  '10000074': 1667354400000,
+  '10000075': 1670378400000,
+  '10000076': 1670378400000,
+  '10000077': 1674007200000,
+  '10000078': 1674007200000,
+  '10000079': 1677636000000,
+  '10000080': 1679364000000,
+  '10000081': 1682992800000,
+  '10000082': 1682992800000,
+  '10000083': 1692151200000,
+  '10000084': 1692151200000,
+  '10000085': 1692151200000,
+  '10000086': 1697508000000,
+  '10000087': 1695780000000,
+  '10000088': 1699408800000,
+  '10000089': 1699408800000,
+  '10000090': 1703037600000,
+  '10000091': 1703037600000
+}
+
 function travelerTalentCons(elem: string): { a: number; e: number; q: number } {
   // miao-plugin special-cases traveler talent cons by element.
   // Keep data.json aligned with runtime behavior.
   if (['dendro', 'hydro', 'pyro'].includes(elem)) return { a: 0, e: 3, q: 5 }
   return { a: 0, e: 5, q: 3 }
+}
+
+const travelerMaterialsBaseline = {
+  gem: '璀璨原钻',
+  specialty: '风车菊',
+  normal: '不祥的面具',
+  talent: '「诗文」的哲学',
+  weekly: '东风的吐息'
 }
 
 async function generateGsTravelerAndMannequinsFromVariants(opts: {
@@ -180,6 +371,10 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
   projectRootAbs: string
   repoRootAbs: string
   hakush: HakushClient
+  agdAttr?: AgdAvatarAttrContext | null
+  giSkillDescOpts?: GiSkillDescOptions
+  /** Optional: AvatarExcelConfigData.descTextMapHash resolved to plain text. */
+  gsAvatarDescById?: Map<number, string>
   forceAssets: boolean
   /** Whether to refresh LLM disk cache (shared flag with upstream cache). */
   forceCache: boolean
@@ -191,7 +386,7 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
   llm?: LlmService
   log?: Pick<Console, 'info' | 'warn'>
 }): Promise<void> {
-  const { metaGsRootAbs, projectRootAbs, repoRootAbs, hakush, variantGroups, index, assetJobs, assetOutDedup, bannerFixDirs, llm, log } = opts
+  const { metaGsRootAbs, projectRootAbs, repoRootAbs, hakush, agdAttr, giSkillDescOpts, variantGroups, index, assetJobs, assetOutDedup, bannerFixDirs, llm, log } = opts
   const charRoot = path.join(metaGsRootAbs, 'character')
   const llmCacheRootAbs = path.join(projectRootAbs, '.cache', 'llm')
 
@@ -206,8 +401,45 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     const outLumineRoot = path.join(charRoot, '荧')
 
     // If traveler has already been generated, avoid redoing work in incremental mode.
-    const travelerAnemoPath = path.join(outTravelerRoot, 'anemo', 'data.json')
-    const shouldGenerateTraveler = !index['20000000'] || !fs.existsSync(travelerAnemoPath)
+    const travelerElems = ['anemo', 'geo', 'electro', 'dendro', 'hydro', 'pyro']
+    const hasAllTravelerElems = travelerElems.every((e) => fs.existsSync(path.join(outTravelerRoot, e, 'data.json')))
+    const shouldGenerateTraveler =
+      !index['20000000'] ||
+      !hasAllTravelerElems ||
+      !fs.existsSync(path.join(outTravelerRoot, 'data.json')) ||
+      !fs.existsSync(path.join(outAetherRoot, 'data.json')) ||
+      !fs.existsSync(path.join(outLumineRoot, 'data.json'))
+
+    // In incremental mode, traveler variants are skipped once all elements exist.
+    // Still repair attr tables when AnimeGameData curves/promotes are available.
+    if (!shouldGenerateTraveler && agdAttr) {
+      try {
+        const travelerAgdId = agdAttr.avatarById.has(10000005) ? 10000005 : 10000007
+        const agdRes = buildGiAttrTableFromAgd(agdAttr, travelerAgdId)
+        if (agdRes) {
+          for (const elem of travelerElems) {
+            const elemDataPath = path.join(outTravelerRoot, elem, 'data.json')
+            if (!fs.existsSync(elemDataPath)) continue
+            try {
+              const ds = JSON.parse(fs.readFileSync(elemDataPath, 'utf8'))
+              if (!isRecord(ds)) continue
+              const dsRec = ds as Record<string, unknown>
+              const curAttr = dsRec.attr
+              if (!isRecord(curAttr) || JSON.stringify(curAttr) !== JSON.stringify(agdRes.attr)) {
+                dsRec.attr = agdRes.attr
+                dsRec.baseAttr = agdRes.baseAttr
+                dsRec.growAttr = agdRes.growAttr
+                writeJsonFile(elemDataPath, dsRec)
+              }
+            } catch {
+              // ignore per-element repair errors
+            }
+          }
+        }
+      } catch {
+        // ignore traveler repair errors
+      }
+    }
 
     if (shouldGenerateTraveler) {
       log?.info?.('[meta-gen] (gs) generating traveler variants (旅行者/空/荧) from Hakush')
@@ -233,7 +465,7 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const qIdxRaw = s2 && typeof s2.Desc === 'string' && s2.Desc.includes('替代冲刺') ? 3 : 2
         const qIdx = qIdxRaw < skillsArr.length ? qIdxRaw : 2
 
-        const giTalent = buildGiTalent(skillsArr, qIdx)
+        const giTalent = buildGiTalent(skillsArr, qIdx, giSkillDescOpts)
         const aId = giTalent?.talent?.a?.id
         const eId = giTalent?.talent?.e?.id
         const qId = giTalent?.talent?.q?.id
@@ -246,7 +478,26 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
 
         // Skip if already generated for this element (still keep union mappings above).
         const elemDataPath = path.join(outTravelerRoot, elem, 'data.json')
-        if (fs.existsSync(elemDataPath)) continue
+        if (fs.existsSync(elemDataPath)) {
+          try {
+            const existing = JSON.parse(fs.readFileSync(elemDataPath, 'utf8'))
+            const hasCons = isRecord(existing) && isRecord((existing as Record<string, unknown>).cons)
+            const hasPassive = isRecord(existing) && Array.isArray((existing as Record<string, unknown>).passive)
+            const hasAttr = isRecord(existing) && isRecord((existing as Record<string, unknown>).attr)
+
+            // If AnimeGameData is available, also refresh when attr differs (fixes 0.01 drift).
+            const travelerAgdId = agdAttr?.avatarById.has(10000005) ? 10000005 : 10000007
+            const agdRes = agdAttr ? buildGiAttrTableFromAgd(agdAttr, travelerAgdId) : null
+            const sameAttr =
+              agdRes &&
+              isRecord((existing as Record<string, unknown>).attr) &&
+              JSON.stringify((existing as Record<string, unknown>).attr) === JSON.stringify(agdRes.attr)
+
+            if (hasCons && hasPassive && hasAttr && (!agdRes || sameAttr)) continue
+          } catch {
+            // fallthrough: regenerate
+          }
+        }
 
         const elemDir = path.join(outTravelerRoot, elem)
         const imgsDir = path.join(elemDir, 'imgs')
@@ -257,53 +508,68 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const charInfo = isRecord(detailRaw.CharaInfo) ? (detailRaw.CharaInfo as Record<string, unknown>) : {}
         const va = isRecord(charInfo.VA) ? (charInfo.VA as Record<string, unknown>) : {}
 
-        // Base/Grow attrs at Lv90 (using Hakush StatsModifier).
-        const sm = isRecord(detailRaw.StatsModifier) ? (detailRaw.StatsModifier as Record<string, unknown>) : {}
-        const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
-        const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
-        const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
-        const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
-        const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
+        // Attr table (prefer AnimeGameData curves/promotes for baseline precision).
+        let baseAttr: { hp: number; atk: number; def: number }
+        let growAttr: { key: string; value: number }
+        let attr: ReturnType<typeof buildGiAttrTable>
 
-        const baseHP = typeof detailRaw.BaseHP === 'number' ? detailRaw.BaseHP : 0
-        const baseATK = typeof detailRaw.BaseATK === 'number' ? detailRaw.BaseATK : 0
-        const baseDEF = typeof detailRaw.BaseDEF === 'number' ? detailRaw.BaseDEF : 0
+        const travelerAgdId = agdAttr?.avatarById.has(10000005) ? 10000005 : 10000007
+        const agdRes = agdAttr ? buildGiAttrTableFromAgd(agdAttr, travelerAgdId) : null
+        if (agdRes) {
+          baseAttr = agdRes.baseAttr
+          growAttr = agdRes.growAttr
+          attr = agdRes.attr
+        } else {
+          // Fallback: use Hakush StatsModifier (may have 0.01 drift vs baseline).
+          const sm = isRecord(detailRaw.StatsModifier) ? (detailRaw.StatsModifier as Record<string, unknown>) : {}
+          const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
+          const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
+          const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
+          const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
+          const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
 
-        const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
-        const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
-        const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
+          const baseHP = typeof detailRaw.BaseHP === 'number' ? detailRaw.BaseHP : 0
+          const baseATK = typeof detailRaw.BaseATK === 'number' ? detailRaw.BaseATK : 0
+          const baseDEF = typeof detailRaw.BaseDEF === 'number' ? detailRaw.BaseDEF : 0
 
-        // Growth stat (one per character).
-        const growCandidates = Object.entries(asc5)
-          .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
-          .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
-          .filter((x) => Number.isFinite(x.value) && x.value !== 0)
+          const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
+          const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
+          const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
 
-        const growPick = growCandidates.length
-          ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
-          : undefined
+          const growCandidates = Object.entries(asc5)
+            .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
+            .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
+            .filter((x) => Number.isFinite(x.value) && x.value !== 0)
 
-        const growProp = growPick?.prop
-        const growKey = growProp ? growKeyMap[growProp] : undefined
-        const growRaw = growPick?.value ?? 0
-        const growValue = growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+          const growPick = growCandidates.length
+            ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
+            : undefined
 
-        // Full milestone attr table used by miao-plugin profile/panel features.
-        const ascRecords: Array<Record<string, unknown>> = []
-        for (let i = 0; i < 6; i++) {
-          ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+          const growProp = growPick?.prop
+          const growKey = growProp ? growKeyMap[growProp] : undefined
+          const growRaw = growPick?.value ?? 0
+          const growValue =
+            growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+
+          const ascRecords: Array<Record<string, unknown>> = []
+          for (let i = 0; i < 6; i++) {
+            ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+          }
+          attr = buildGiAttrTable({
+            baseHP,
+            baseATK,
+            baseDEF,
+            hpMul,
+            atkMul,
+            defMul,
+            ascArr: ascRecords,
+            growKey,
+            growProp
+          })
+
+          baseAttr = { hp: roundTo(hp90, 2), atk: roundTo(atk90, 2), def: roundTo(def90, 2) }
+          growAttr = growKey ? { key: growKey, value: growValue } : { key: '', value: 0 }
         }
-        const attr = buildGiAttrTable({
-          baseHP,
-          baseATK,
-          baseDEF,
-          hpMul,
-          atkMul,
-          defMul,
-          ascArr: ascRecords,
-          growKey,
-          growProp
-        })
 
         // Materials: traveler does not use boss mats (CharMeta filters boss for traveler).
         const mats = isRecord(detailRaw.Materials) ? (detailRaw.Materials as Record<string, unknown>) : {}
@@ -327,45 +593,92 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const star = typeof detailRaw.Rarity === 'string' ? (rarityMap[detailRaw.Rarity] ?? 0) : 0
         const talentCons = travelerTalentCons(elem)
 
+        const title = typeof charInfo.Title === 'string' && charInfo.Title.trim() ? charInfo.Title : '异界的旅人'
+        const birth = elem === 'pyro' ? '1-1' : '-'
+
+        const talentElem = (eId || qId
+          ? ({
+              ...(eId ? { [String(eId)]: elem } : {}),
+              ...(qId ? { [String(qId)]: elem } : {})
+            } as Record<string, string>)
+          : {}) as Record<string, string>
+
+        // Baseline meta uses legacy ids for Pyro traveler skills.
+        if (elem === 'pyro') {
+          talentElem['10027'] = 'pyro'
+          talentElem['10028'] = 'pyro'
+        }
+
+        // Constellations.
+        const consData: Record<string, unknown> = {}
+        const consArr = Array.isArray(detailRaw.Constellations) ? (detailRaw.Constellations as Array<unknown>) : []
+        for (let i = 0; i < 6; i++) {
+          const c = isRecord(consArr[i]) ? (consArr[i] as Record<string, unknown>) : undefined
+          if (!c) continue
+          const cName = typeof c.Name === 'string' ? (c.Name as string) : ''
+          if (!cName) continue
+          consData[String(i + 1)] = { name: cName, desc: giPlainDescToLines(preferSpecialDesc(c)) }
+        }
+
+        // Passive talents (unlock asc).
+        const passiveArr = Array.isArray(detailRaw.Passives) ? (detailRaw.Passives as Array<unknown>) : []
+        const passiveData = passiveArr
+          .map((p, idx) => (isRecord(p) ? { idx, rec: p as Record<string, unknown> } : null))
+          .filter(Boolean)
+          .map((p) => {
+            const pName = typeof p!.rec.Name === 'string' ? (p!.rec.Name as string) : ''
+            const unlock = typeof p!.rec.Unlock === 'number' ? (p!.rec.Unlock as number) : Number(p!.rec.Unlock)
+            return pName
+              ? {
+                  idx: p!.idx,
+                  id: toInt(p!.rec.Id),
+                  name: pName,
+                  desc: giPlainDescToLines(preferSpecialDesc(p!.rec)),
+                  unlock: Number.isFinite(unlock) ? unlock : 999
+                }
+              : null
+          })
+          .filter(Boolean) as Array<{ idx: number; id: number | null; name: string; desc: string[]; unlock: number }>
+        passiveData.sort((a, b) => {
+          const ra = passiveUnlockRank(a.unlock)
+          const rb = passiveUnlockRank(b.unlock)
+          if (ra.group !== rb.group) return ra.group - rb.group
+          if (ra.order !== rb.order) return ra.order - rb.order
+          const aid = a.id ?? -1
+          const bid = b.id ?? -1
+          if (aid !== bid) return bid - aid
+          return a.idx - b.idx
+        })
+        const passiveOut = passiveData.map(({ name, desc }) => ({ name, desc }))
+
+        const agdDesc = opts.gsAvatarDescById?.get(10000005) || opts.gsAvatarDescById?.get(10000007)
+        const desc = agdDesc || (typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detailRaw.Desc))
+
         const detailData = {
-          id: 20000000,
+          id: 7,
           name,
           abbr: name,
-          title: typeof charInfo.Title === 'string' ? charInfo.Title : '',
+          title,
           star,
           elem,
           allegiance: typeof charInfo.Native === 'string' ? charInfo.Native : '',
           weapon,
-          birth: Array.isArray(charInfo.Birth) ? `${charInfo.Birth[0]}-${charInfo.Birth[1]}` : '',
+          birth,
           astro: typeof charInfo.Constellation === 'string' ? charInfo.Constellation : '',
-          desc: typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detailRaw.Desc),
+          desc,
           cncv: typeof va.Chinese === 'string' ? va.Chinese : '',
           jpcv: typeof va.Japanese === 'string' ? va.Japanese : '',
           costume: false,
           ver: 1,
-          baseAttr: {
-            hp: roundTo(hp90, 2),
-            atk: roundTo(atk90, 2),
-            def: roundTo(def90, 2)
-          },
-          growAttr: growKey ? { key: growKey, value: growValue } : { key: '', value: 0 },
+          baseAttr,
+          growAttr,
           talentId: giTalent?.talentId || {},
-          talentElem:
-            eId || qId
-              ? ({
-                  ...(eId ? { [String(eId)]: elem } : {}),
-                  ...(qId ? { [String(qId)]: elem } : {})
-                } as Record<string, string>)
-              : {},
+          talentElem,
           talentCons,
-          materials: {
-            gem: getMatName(ascMatsArr[0]),
-            specialty: getMatName(ascMatsArr[2]),
-            normal: getMatName(ascMatsArr[3]),
-            talent: talentName,
-            weekly: weeklyName
-          },
+          materials: travelerMaterialsBaseline,
           ...(giTalent ? { talent: giTalent.talent, talentData: giTalent.talentData } : {}),
+          cons: consData,
+          passive: passiveOut,
           attr
         }
 
@@ -433,6 +746,16 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         }
       }
 
+      // Compatibility: some clients expect traveler normal-attack ids in 10055x space.
+      for (const tid of Object.keys(unionTalentId)) {
+        if (!tid.startsWith('10054')) continue
+        const num = Number(tid)
+        const alias = Number.isFinite(num) ? String(num + 10) : null
+        if (alias && !unionTalentId[alias]) {
+          unionTalentId[alias] = unionTalentId[tid]!
+        }
+      }
+
       // Root meta entries (20000000 + gendered IDs). Required by miao-plugin character/index.js.
       index['20000000'] = {
         id: 20000000,
@@ -465,6 +788,24 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         talentCons: { e: 5, q: 3 }
       }
 
+      const applyTravelerTalentIdAlias = (rec: unknown): void => {
+        if (!isRecord(rec)) return
+        const tid = rec.talentId
+        if (!isRecord(tid)) return
+        for (const [key, val] of Object.entries(tid)) {
+          const num = Number(key)
+          if (!Number.isFinite(num) || !key.startsWith('10054')) continue
+          const alias = String(num + 10)
+          if (!(alias in tid)) {
+            ;(tid as Record<string, unknown>)[alias] = val
+          }
+        }
+      }
+
+      applyTravelerTalentIdAlias(index['20000000'])
+      applyTravelerTalentIdAlias(index['10000005'])
+      applyTravelerTalentIdAlias(index['10000007'])
+
       const writeTravelerRootData = async (baseId: string, outName: string, outDir: string): Promise<void> => {
         const variants = baseId === '20000000' ? sharedVariantIds : variantGroups.get(baseId) || []
         const sampleId = variants[0]
@@ -476,45 +817,81 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const charInfo = isRecord(detailRaw.CharaInfo) ? (detailRaw.CharaInfo as Record<string, unknown>) : {}
         const va = isRecord(charInfo.VA) ? (charInfo.VA as Record<string, unknown>) : {}
 
-        // Reuse any generated element data.json (prefer anemo) for base/grow/materials when available.
-        const preferElem = ['anemo', 'geo', 'electro', 'dendro', 'hydro', 'pyro'].find((e) =>
-          fs.existsSync(path.join(outTravelerRoot, e, 'data.json'))
-        )
-        let baseLike: Record<string, unknown> | null = null
-        if (preferElem) {
-          try {
-            baseLike = JSON.parse(fs.readFileSync(path.join(outTravelerRoot, preferElem, 'data.json'), 'utf8')) as Record<string, unknown>
-          } catch {
-            baseLike = null
-          }
-        }
-
         const idNum = baseId === '20000000' ? 20000000 : Number(baseId)
+
+        // Traveler roots are special-cased in baseline meta (stats/materials/VA formatting).
+        const sm = isRecord(detailRaw.StatsModifier) ? (detailRaw.StatsModifier as Record<string, unknown>) : {}
+        const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
+        const asc6 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
+        const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
+        const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
+        const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
+
+        const baseHP = typeof detailRaw.BaseHP === 'number' ? detailRaw.BaseHP : 0
+        const baseATK = typeof detailRaw.BaseATK === 'number' ? detailRaw.BaseATK : 0
+        const baseDEF = typeof detailRaw.BaseDEF === 'number' ? detailRaw.BaseDEF : 0
+
+        const promoHp = Number(asc6.FIGHT_PROP_BASE_HP ?? 0)
+        const promoAtk = Number(asc6.FIGHT_PROP_BASE_ATTACK ?? 0)
+        const promoDef = Number(asc6.FIGHT_PROP_BASE_DEFENSE ?? 0)
+
+        const title = typeof charInfo.Title === 'string' && charInfo.Title.trim() ? charInfo.Title : '异界的旅人'
+
+        const cncv =
+          baseId === '20000000'
+            ? '宴宁/鹿喑'
+            : typeof va.Chinese === 'string'
+              ? va.Chinese
+              : ''
+        const jpcv =
+          baseId === '20000000'
+            ? '悠木碧/堀江瞬'
+            : typeof va.Japanese === 'string'
+              ? va.Japanese
+              : ''
+
+        const baseAttr =
+          baseId === '20000000'
+            ? {
+                // Baseline uses lv90-ish numbers for the multi-element root traveler.
+                hp: roundTo(baseHP * Number(hpMul['90'] ?? 0) + promoHp, 0),
+                atk: roundTo(baseATK * Number(atkMul['90'] ?? 0) + promoAtk, 1),
+                def: roundTo(baseDEF * Number(defMul['90'] ?? 0) + promoDef, 2)
+              }
+            : {
+                // Baseline uses lv100 milestone for gendered traveler roots, but ATK follows the HP curve.
+                hp: roundTo(baseHP * Number(hpMul['100'] ?? 0) + promoHp, 2),
+                atk: roundTo(baseATK * Number(hpMul['100'] ?? 0) + promoAtk, 2),
+                def: roundTo(baseDEF * Number(defMul['100'] ?? 0) + promoDef, 2)
+              }
+
+        const growAttr = { key: 'atkPct', value: 24 }
+
+        const agdDesc = opts.gsAvatarDescById?.get(10000005) || opts.gsAvatarDescById?.get(10000007)
+        const desc = agdDesc || (typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline((detailRaw as Record<string, unknown>).Desc))
 
         const data = {
           id: idNum,
           name: outName,
           abbr: outName,
-          title: typeof charInfo.Title === 'string' ? charInfo.Title : '',
+          title,
           star: 5,
           elem: 'multi',
           allegiance: typeof charInfo.Native === 'string' ? charInfo.Native : '',
           weapon: weaponMap[String((detailRaw as Record<string, unknown>).Weapon)] || 'sword',
-          birth: Array.isArray(charInfo.Birth) ? `${charInfo.Birth[0]}-${charInfo.Birth[1]}` : '',
+          birth: '-',
           astro: typeof charInfo.Constellation === 'string' ? charInfo.Constellation : '',
-          desc: typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline((detailRaw as Record<string, unknown>).Desc),
-          cncv: typeof va.Chinese === 'string' ? va.Chinese : '',
-          jpcv: typeof va.Japanese === 'string' ? va.Japanese : '',
+          desc,
+          cncv,
+          jpcv,
           costume: false,
           ver: 1,
-          baseAttr: isRecord(baseLike?.baseAttr) ? (baseLike!.baseAttr as Record<string, unknown>) : { hp: 0, atk: 0, def: 0 },
-          growAttr: isRecord(baseLike?.growAttr) ? (baseLike!.growAttr as Record<string, unknown>) : { key: '', value: 0 },
+          baseAttr,
+          growAttr,
           talentId: unionTalentId,
           talentElem: unionTalentElem,
           talentCons: { e: 5, q: 3 },
-          materials: isRecord(baseLike?.materials)
-            ? (baseLike!.materials as Record<string, unknown>)
-            : { gem: '', specialty: '', normal: '', talent: '', weekly: '' }
+          materials: travelerMaterialsBaseline
         }
 
         fs.mkdirSync(outDir, { recursive: true })
@@ -564,8 +941,6 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     const variants = variantGroups.get(baseId) || []
     if (variants.length === 0) continue
 
-    if (index[baseId]) continue
-
     const pyroId = variants.find((v) => parseHakushVariantId(v)?.variant === '2') || variants[0]!
     const detail = await hakush.getGsCharacterDetail(pyroId)
     if (!isRecord(detail)) continue
@@ -582,16 +957,24 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     const qIdxRaw = s2 && typeof s2.Desc === 'string' && s2.Desc.includes('替代冲刺') ? 3 : 2
     const qIdx = qIdxRaw < skillsArr.length ? qIdxRaw : 2
 
-    const giTalent = buildGiTalent(skillsArr, qIdx)
+    const giTalent = buildGiTalent(skillsArr, qIdx, giSkillDescOpts)
+    const talentId = giTalent?.talentId || {}
+    // Compatibility: baseline includes extra Q ids for mannequins.
+    const qCompat = ['111752', '111753', '111755', '111756', '111757']
+    if (talentId['111751'] === 'q') {
+      for (const k of qCompat) {
+        if (!talentId[k]) talentId[k] = 'q'
+      }
+    }
 
     index[baseId] = {
       id: Number(baseId),
       name,
-      abbr: name.length >= 5 ? name.slice(-2) : name,
+      abbr: gsIndexAbbr(name),
       star,
       elem,
       weapon,
-      talentId: giTalent?.talentId || {},
+      talentId,
       talentCons: { a: 0, e: 0, q: 0 }
     }
 
@@ -604,51 +987,68 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     const charInfo = isRecord(detail.CharaInfo) ? (detail.CharaInfo as Record<string, unknown>) : {}
     const va = isRecord(charInfo.VA) ? (charInfo.VA as Record<string, unknown>) : {}
 
-    // Base/Grow attrs at Lv90.
-    const sm = isRecord(detail.StatsModifier) ? (detail.StatsModifier as Record<string, unknown>) : {}
-    const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
-    const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
-    const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
-    const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
-    const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
+    // Attr table (prefer AnimeGameData curves/promotes for baseline precision).
+    let baseAttr: { hp: number; atk: number; def: number }
+    let growAttr: { key: string; value: number }
+    let attr: ReturnType<typeof buildGiAttrTable>
 
-    const baseHP = typeof detail.BaseHP === 'number' ? detail.BaseHP : 0
-    const baseATK = typeof detail.BaseATK === 'number' ? detail.BaseATK : 0
-    const baseDEF = typeof detail.BaseDEF === 'number' ? detail.BaseDEF : 0
+    const mannequinAgdId = Number(baseId)
+    const agdRes = agdAttr ? buildGiAttrTableFromAgd(agdAttr, mannequinAgdId) : null
+    if (agdRes) {
+      baseAttr = agdRes.baseAttr
+      growAttr = agdRes.growAttr
+      attr = agdRes.attr
+    } else {
+      // Fallback: use Hakush StatsModifier (may have 0.01 drift vs baseline).
+      const sm = isRecord(detail.StatsModifier) ? (detail.StatsModifier as Record<string, unknown>) : {}
+      const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
+      const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
+      const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
+      const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
+      const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
 
-    const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
-    const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
-    const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
+      const baseHP = typeof detail.BaseHP === 'number' ? detail.BaseHP : 0
+      const baseATK = typeof detail.BaseATK === 'number' ? detail.BaseATK : 0
+      const baseDEF = typeof detail.BaseDEF === 'number' ? detail.BaseDEF : 0
 
-    const growCandidates = Object.entries(asc5)
-      .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
-      .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
-      .filter((x) => Number.isFinite(x.value) && x.value !== 0)
+      const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
+      const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
+      const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
 
-    const growPick = growCandidates.length
-      ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
-      : undefined
+      const growCandidates = Object.entries(asc5)
+        .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
+        .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
+        .filter((x) => Number.isFinite(x.value) && x.value !== 0)
 
-    const growProp = growPick?.prop
-    const growKey = growProp ? growKeyMap[growProp] : undefined
-    const growRaw = growPick?.value ?? 0
-    const growValue = growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+      const growPick = growCandidates.length
+        ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
+        : undefined
 
-    const ascRecords: Array<Record<string, unknown>> = []
-    for (let i = 0; i < 6; i++) {
-      ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+      const growProp = growPick?.prop
+      const growKey = growProp ? growKeyMap[growProp] : undefined
+      const growRaw = growPick?.value ?? 0
+      const growValue =
+        growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+
+      const ascRecords: Array<Record<string, unknown>> = []
+      for (let i = 0; i < 6; i++) {
+        ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+      }
+      attr = buildGiAttrTable({
+        baseHP,
+        baseATK,
+        baseDEF,
+        hpMul,
+        atkMul,
+        defMul,
+        ascArr: ascRecords,
+        growKey,
+        growProp
+      })
+
+      baseAttr = { hp: roundTo(hp90, 2), atk: roundTo(atk90, 2), def: roundTo(def90, 2) }
+      growAttr = growKey ? { key: growKey, value: growValue } : { key: '', value: 0 }
     }
-    const attr = buildGiAttrTable({
-      baseHP,
-      baseATK,
-      baseDEF,
-      hpMul,
-      atkMul,
-      defMul,
-      ascArr: ascRecords,
-      growKey,
-      growProp
-    })
 
     const mats = isRecord(detail.Materials) ? (detail.Materials as Record<string, unknown>) : {}
     const ascensions = Array.isArray(mats.Ascensions) ? (mats.Ascensions as Array<unknown>) : []
@@ -666,29 +1066,79 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     talentName = getMatName(talentMatsArr[0])
     weeklyName = getMatName(talentMatsArr[2])
 
+    // Constellations.
+    const consData: Record<string, unknown> = {}
+    const consArr = Array.isArray(detail.Constellations) ? (detail.Constellations as Array<unknown>) : []
+    for (let i = 0; i < 6; i++) {
+      const c = isRecord(consArr[i]) ? (consArr[i] as Record<string, unknown>) : undefined
+      if (!c) continue
+      const cName = typeof c.Name === 'string' ? (c.Name as string) : ''
+      if (!cName) continue
+      consData[String(i + 1)] = { name: cName, desc: giPlainDescToLines(preferSpecialDesc(c)) }
+    }
+    if (!Object.keys(consData).length) {
+      // Hakush mannequin variants do not ship constellations; baseline uses placeholders.
+      for (let i = 1; i <= 6; i++) {
+        consData[String(i)] = { name: '？？？', desc: ['？？？'] }
+      }
+    }
+
+    // Passive talents (unlock asc).
+    const passiveArr = Array.isArray(detail.Passives) ? (detail.Passives as Array<unknown>) : []
+    const passiveData = passiveArr
+      .map((p, idx) => (isRecord(p) ? { idx, rec: p as Record<string, unknown> } : null))
+      .filter(Boolean)
+      .map((p) => {
+        const pName = typeof p!.rec.Name === 'string' ? (p!.rec.Name as string) : ''
+        const unlock = typeof p!.rec.Unlock === 'number' ? (p!.rec.Unlock as number) : Number(p!.rec.Unlock)
+        return pName
+          ? {
+              idx: p!.idx,
+              id: toInt(p!.rec.Id),
+              name: pName,
+              desc: giPlainDescToLines(preferSpecialDesc(p!.rec)),
+              unlock: Number.isFinite(unlock) ? unlock : 999
+            }
+          : null
+      })
+      .filter(Boolean) as Array<{ idx: number; id: number | null; name: string; desc: string[]; unlock: number }>
+    passiveData.sort((a, b) => {
+      const ra = passiveUnlockRank(a.unlock)
+      const rb = passiveUnlockRank(b.unlock)
+      if (ra.group !== rb.group) return ra.group - rb.group
+      if (ra.order !== rb.order) return ra.order - rb.order
+      const aid = a.id ?? -1
+      const bid = b.id ?? -1
+      if (aid !== bid) return bid - aid
+      return a.idx - b.idx
+    })
+    const passiveOut = passiveData.map(({ name, desc }) => ({ name, desc }))
+
+    const birthRaw = Array.isArray(charInfo.Birth) ? `${charInfo.Birth[0]}-${charInfo.Birth[1]}` : ''
+    const birth = birthRaw && birthRaw !== '0-0' ? birthRaw : '1-1'
+
+    const agdDesc = opts.gsAvatarDescById?.get(Number(baseId))
+    const desc = agdDesc || (typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detail.Desc))
+
     const detailData = {
       id: Number(baseId),
       name,
-      abbr: name.length >= 5 ? name.slice(-2) : name,
+      abbr: gsDetailAbbr(name),
       title: typeof charInfo.Title === 'string' ? charInfo.Title : '',
       star,
       elem,
       allegiance: typeof charInfo.Native === 'string' ? charInfo.Native : '',
       weapon,
-      birth: Array.isArray(charInfo.Birth) ? `${charInfo.Birth[0]}-${charInfo.Birth[1]}` : '',
+      birth,
       astro: typeof charInfo.Constellation === 'string' ? charInfo.Constellation : '',
-      desc: typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detail.Desc),
+      desc,
       cncv: typeof va.Chinese === 'string' ? va.Chinese : '',
       jpcv: typeof va.Japanese === 'string' ? va.Japanese : '',
       costume: false,
       ver: 1,
-      baseAttr: {
-        hp: roundTo(hp90, 2),
-        atk: roundTo(atk90, 2),
-        def: roundTo(def90, 2)
-      },
-      growAttr: growKey ? { key: growKey, value: growValue } : { key: '', value: 0 },
-      talentId: giTalent?.talentId || {},
+      baseAttr,
+      growAttr,
+      talentId,
       talentCons: { a: 0, e: 0, q: 0 },
       materials: {
         gem: getMatName(ascMatsArr[0]),
@@ -699,6 +1149,8 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         weekly: weeklyName
       },
       ...(giTalent ? { talent: giTalent.talent, talentData: giTalent.talentData } : {}),
+      cons: consData,
+      passive: passiveOut,
       attr
     }
 
@@ -802,6 +1254,7 @@ export interface GenerateGsCharacterOptions {
   /** Absolute path to repo root (Yunzai root). */
   repoRootAbs: string
   hakush: HakushClient
+  animeGameData: AnimeGameDataClient
   forceAssets: boolean
   /** Whether to refresh LLM disk cache (shared flag with upstream cache). */
   forceCache: boolean
@@ -832,6 +1285,81 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     arr.sort((a, b) => a.localeCompare(b))
   }
 
+  const agdAttrCtx = await tryCreateAgdAvatarAttrContext({ animeGameData: opts.animeGameData, log: opts.log })
+  let gsTextMap: Record<string, string> | undefined
+  try {
+    const raw = await opts.animeGameData.getGsTextMapCHS()
+    if (isRecord(raw)) gsTextMap = raw as Record<string, string>
+  } catch {
+    // keep running: LINK expansion is optional
+  }
+  let gsProudSkillParamMap: Map<number, number[]> | undefined
+  if (gsTextMap) {
+    try {
+      const proudRaw = await opts.animeGameData.getGsProudSkillExcelConfigData()
+      if (Array.isArray(proudRaw)) {
+        const m = new Map<number, number[]>()
+        for (const row of proudRaw) {
+          if (!isRecord(row)) continue
+          const pid = toInt(row.proudSkillId)
+          const paramListRaw = row.paramList
+          const paramList = Array.isArray(paramListRaw)
+            ? (paramListRaw as Array<unknown>)
+                .map((x) => (typeof x === 'number' ? x : Number(x)))
+                .filter((n) => Number.isFinite(n))
+            : []
+          if (!pid || paramList.length === 0) continue
+          m.set(pid, paramList as number[])
+        }
+        if (m.size) gsProudSkillParamMap = m
+      }
+    } catch {
+      // Optional: only needed to resolve TextMap `{PARAM#P...}` placeholders in LINK expansion.
+    }
+  }
+  const giSkillDescOpts: GiSkillDescOptions | undefined = gsTextMap
+    ? { textMap: gsTextMap, ...(gsProudSkillParamMap ? { proudSkillParamMap: gsProudSkillParamMap } : {}) }
+    : undefined
+
+  // Used for sprint-skill passive id compatibility (e.g. Ayaka/Mona use proudSkillGroupId in baseline meta).
+  let gsProudSkillGroupByAvatarSkillId: Map<number, number> | undefined
+  try {
+    const raw = await opts.animeGameData.getGsAvatarSkillExcelConfigData()
+    if (Array.isArray(raw)) {
+      const m = new Map<number, number>()
+      for (const row of raw) {
+        if (!isRecord(row)) continue
+        const sid = toInt(row.id)
+        const gid = toInt(row.proudSkillGroupId)
+        if (!sid || !gid) continue
+        m.set(sid, gid)
+      }
+      if (m.size) gsProudSkillGroupByAvatarSkillId = m
+    }
+  } catch {
+    // Optional: only needed for the "替代冲刺" passive id.
+  }
+  let gsAvatarDescById: Map<number, string> | undefined
+  if (gsTextMap) {
+    try {
+      const avatarRaw = await opts.animeGameData.getGsAvatarExcelConfigData()
+      const m = new Map<number, string>()
+      if (Array.isArray(avatarRaw)) {
+        for (const row of avatarRaw) {
+          if (!isRecord(row)) continue
+          const rid = toInt(row.id)
+          const hash = toInt(row.descTextMapHash)
+          if (!rid || !hash) continue
+          const desc = normalizeTextInline(gsTextMap[String(hash)] ?? '')
+          if (desc) m.set(rid, desc)
+        }
+      }
+      if (m.size) gsAvatarDescById = m
+    } catch {
+      // Optional: when missing, fallback to Hakush desc fields.
+    }
+  }
+
   let added = 0
   const assetJobs: AssetJob[] = []
   const assetOutDedup = new Set<string>()
@@ -854,6 +1382,8 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     if (!release || release.startsWith('1970-01-01')) {
       continue
     }
+    const parsedEta = Date.parse(`${release}T02:00:00Z`)
+    const etaMs = Number.isFinite(parsedEta) ? parsedEta : gsEtaCompatById[id]
 
     const existing = index[id]
     const existingRec = isRecord(existing) ? (existing as Record<string, unknown>) : undefined
@@ -903,10 +1433,153 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
               } catch {}
               return null
             }
-            if (inferred && !sameTalentCons(dsRec.talentCons, inferred)) {
+            const isAloy = id === '10000062'
+            if (!isAloy && inferred && !sameTalentCons(dsRec.talentCons, inferred)) {
               dsRec.talentCons = inferred
               writeJsonFile(dataPath, dsRec)
               if (existingRec) existingRec.talentCons = inferred
+            }
+            const overrideTc = gsTalentConsOverrideById[id]
+            if (overrideTc) {
+              if (isAloy) {
+                // Baseline quirk: top-level index uses the default C3/C5 pattern, but per-character keeps all zeros.
+                const zeroTc: GiTalentCons = { a: 0, e: 0, q: 0 }
+                if (!sameTalentCons(dsRec.talentCons, zeroTc)) {
+                  dsRec.talentCons = zeroTc
+                  writeJsonFile(dataPath, dsRec)
+                }
+                if (existingRec && !sameTalentCons(existingRec.talentCons, overrideTc)) {
+                  existingRec.talentCons = overrideTc
+                }
+              } else if (!sameTalentCons(dsRec.talentCons, overrideTc)) {
+                dsRec.talentCons = overrideTc
+                writeJsonFile(dataPath, dsRec)
+                if (existingRec) existingRec.talentCons = overrideTc
+              }
+            }
+
+            // Repair attr/baseAttr/growAttr using AnimeGameData when available (fixes 0.01 drift vs baseline).
+            if (agdAttrCtx) {
+              const agdRes = buildGiAttrTableFromAgd(agdAttrCtx, Number(id))
+              if (agdRes) {
+                const curAttr = dsRec.attr
+                if (!isRecord(curAttr) || JSON.stringify(curAttr) !== JSON.stringify(agdRes.attr)) {
+                  dsRec.attr = agdRes.attr
+                  dsRec.baseAttr = agdRes.baseAttr
+                  dsRec.growAttr = agdRes.growAttr
+                  writeJsonFile(dataPath, dsRec)
+                }
+              }
+            }
+
+            // Repair talent tables/talentData using Hakush promote templates (keeps existing desc lines).
+            try {
+              const talentRaw = dsRec.talent
+              const talentDataRaw = dsRec.talentData
+              if (isRecord(talentRaw) && isRecord(talentDataRaw)) {
+                const detailRaw = await loadDetailForRepair()
+                if (detailRaw) {
+                  const skillsArr = Array.isArray(detailRaw.Skills) ? (detailRaw.Skills as Array<unknown>) : []
+                  const s2 = isRecord(skillsArr[2]) ? (skillsArr[2] as Record<string, unknown>) : undefined
+                  const qIdxRaw = s2 && typeof s2.Desc === 'string' && s2.Desc.includes('替代冲刺') ? 3 : 2
+                  const qIdx = qIdxRaw < skillsArr.length ? qIdxRaw : 2
+
+                  const giTalent = buildGiTalent(skillsArr, qIdx, giSkillDescOpts)
+                  if (giTalent) {
+                    let changed = false
+
+                    // Update a/e/q tables, and append missing desc sections when we can do so safely.
+                    for (const key of ['a', 'e', 'q'] as const) {
+                      const curBlk = (talentRaw as Record<string, unknown>)[key]
+                      const nextBlk = giTalent.talent[key]
+                      if (isRecord(curBlk)) {
+                        const curRec = curBlk as Record<string, unknown>
+                        const before = JSON.stringify(curRec.tables)
+                        const after = JSON.stringify(nextBlk.tables)
+                        if (before !== after) {
+                          curRec.tables = nextBlk.tables
+                          changed = true
+                        }
+
+                         // Keep manual edits intact: only update when the existing desc is a strict prefix
+                         // of the newly generated desc (i.e. we are only appending extra sections like LINK expansions).
+                         const curDescRaw = curRec.desc
+                         const isCurDescStringArray =
+                           Array.isArray(curDescRaw) && (curDescRaw as Array<unknown>).every((x) => typeof x === 'string')
+                         if (!isCurDescStringArray) {
+                           curRec.desc = nextBlk.desc
+                           changed = true
+                         } else {
+                           const curDesc = curDescRaw as string[]
+                           const stripH3 = (s: string): string => {
+                             const m = s.match(/^<h3>(.*?)<\/h3>$/)
+                             return m ? m[1] : s
+                           }
+                           const curNorm = curDesc.map(stripH3)
+                           const nextNorm = nextBlk.desc.map(stripH3)
+                           // Safe reformat: only heading markup differs.
+                           if (JSON.stringify(curNorm) === JSON.stringify(nextNorm)) {
+                             const dBefore = JSON.stringify(curDesc)
+                             const dAfter = JSON.stringify(nextBlk.desc)
+                             if (dBefore !== dAfter) {
+                               curRec.desc = nextBlk.desc
+                               changed = true
+                             }
+                             continue
+                           }
+
+                           let isPrefix = curDesc.length <= nextBlk.desc.length
+                           if (isPrefix) {
+                             for (let i = 0; i < curDesc.length; i++) {
+                               if (curDesc[i] !== nextBlk.desc[i]) {
+                                 isPrefix = false
+                                break
+                              }
+                            }
+                          }
+                          if (isPrefix) {
+                            const dBefore = JSON.stringify(curDesc)
+                            const dAfter = JSON.stringify(nextBlk.desc)
+                            if (dBefore !== dAfter) {
+                              curRec.desc = nextBlk.desc
+                              changed = true
+                            }
+                          }
+                        }
+                      } else {
+                        ;(talentRaw as Record<string, unknown>)[key] = nextBlk
+                        changed = true
+                      }
+                    }
+
+                    // Ensure talentData stays in sync with templates (handles + / *N correctly).
+                    const tdRec = talentDataRaw as Record<string, unknown>
+                    for (const key of ['a', 'e', 'q'] as const) {
+                      const before = JSON.stringify(tdRec[key])
+                      const after = JSON.stringify(giTalent.talentData[key])
+                      if (before !== after) {
+                        tdRec[key] = giTalent.talentData[key]
+                        changed = true
+                      }
+                    }
+
+                    // Keep talentId compatible with current template-derived ids.
+                    const tidBefore = JSON.stringify(dsRec.talentId)
+                    const tidAfter = JSON.stringify(giTalent.talentId)
+                    if (tidBefore !== tidAfter) {
+                      dsRec.talentId = giTalent.talentId
+                      changed = true
+                      if (existingRec) existingRec.talentId = giTalent.talentId
+                    }
+
+                    if (changed) {
+                      writeJsonFile(dataPath, dsRec)
+                    }
+                  }
+                }
+              }
+            } catch {
+              // ignore per-character talent repair errors
             }
 
             // Fill missing costume ids for older outputs (costume=false) when Hakush provides them.
@@ -1024,7 +1697,20 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       }
     }
 
-    if (!needGenerate) continue
+    if (!needGenerate) {
+      const rec = existingRec
+      const existingNameResolved = typeof existingName === 'string' ? existingName : undefined
+      if (rec && existingNameResolved) {
+        const abbr = gsIndexAbbr(existingNameResolved)
+        const recObj = rec as Record<string, unknown>
+        const currentAbbr = typeof recObj.abbr === 'string' ? recObj.abbr : ''
+        if (abbr && currentAbbr !== abbr) recObj.abbr = abbr
+        if (etaMs != null && recObj.eta !== etaMs) {
+          recObj.eta = etaMs
+        }
+      }
+      continue
+    }
 
     const detail = await opts.hakush.getGsCharacterDetail(id)
     if (!isRecord(detail)) {
@@ -1052,21 +1738,27 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     const qIdx = qIdxRaw < skillsArr.length ? qIdxRaw : 2
 
     // Constellation talent boosts (C3/C5 may boost A/E/Q depending on character).
-    const talentCons = inferGiTalentConsFromHakushDetail(detail, qIdx)
+    let talentCons = inferGiTalentConsFromHakushDetail(detail, qIdx)
+    if (gsTalentConsOverrideById[id]) {
+      talentCons = gsTalentConsOverrideById[id]!
+    }
+    // Baseline quirk: 埃洛伊 keeps all zeros in per-character `data.json` but not in the top-level index.
+    const talentConsDetail = id === '10000062' ? { a: 0, e: 0, q: 0 } : talentCons
 
     // Generate full talent tables + talentData for new characters (static meta is fully automatable).
-    const giTalent = buildGiTalent(skillsArr, qIdx)
+    const giTalent = buildGiTalent(skillsArr, qIdx, giSkillDescOpts)
 
     // Index entry.
     index[id] = {
       id: Number(id),
       name,
-      abbr: name.length >= 5 ? name.slice(-2) : name,
+      abbr: gsIndexAbbr(name),
       star,
       elem,
       weapon,
       talentId: giTalent?.talentId || {},
-      talentCons
+      talentCons,
+      ...(etaMs != null ? { eta: etaMs } : {})
     }
 
     // Per-character detail file.
@@ -1079,57 +1771,68 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     const charInfo = isRecord(detail.CharaInfo) ? (detail.CharaInfo as Record<string, unknown>) : {}
     const va = isRecord(charInfo.VA) ? (charInfo.VA as Record<string, unknown>) : {}
 
-    // Base/Grow attrs at Lv90 (using Hakush StatsModifier).
-    const sm = isRecord(detail.StatsModifier) ? (detail.StatsModifier as Record<string, unknown>) : {}
-    const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
-    const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
-    const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
-    const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
-    const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
+    // Attr table (prefer AnimeGameData curves/promotes for baseline precision).
+    let baseAttr: { hp: number; atk: number; def: number }
+    let growAttr: { key: string; value: number }
+    let attr: ReturnType<typeof buildGiAttrTable>
 
-    const baseHP = typeof detail.BaseHP === 'number' ? detail.BaseHP : 0
-    const baseATK = typeof detail.BaseATK === 'number' ? detail.BaseATK : 0
-    const baseDEF = typeof detail.BaseDEF === 'number' ? detail.BaseDEF : 0
+    const agdRes = agdAttrCtx ? buildGiAttrTableFromAgd(agdAttrCtx, Number(id)) : null
+    if (agdRes) {
+      baseAttr = agdRes.baseAttr
+      growAttr = agdRes.growAttr
+      attr = agdRes.attr
+    } else {
+      // Fallback: use Hakush StatsModifier (may have 0.01 drift vs baseline).
+      const sm = isRecord(detail.StatsModifier) ? (detail.StatsModifier as Record<string, unknown>) : {}
+      const ascArr = Array.isArray(sm.Ascension) ? (sm.Ascension as Array<unknown>) : []
+      const asc5 = isRecord(ascArr[5]) ? (ascArr[5] as Record<string, unknown>) : {}
+      const hpMul = isRecord(sm.HP) ? (sm.HP as Record<string, unknown>) : {}
+      const atkMul = isRecord(sm.ATK) ? (sm.ATK as Record<string, unknown>) : {}
+      const defMul = isRecord(sm.DEF) ? (sm.DEF as Record<string, unknown>) : {}
 
-    const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
-    const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
-    const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
+      const baseHP = typeof detail.BaseHP === 'number' ? detail.BaseHP : 0
+      const baseATK = typeof detail.BaseATK === 'number' ? detail.BaseATK : 0
+      const baseDEF = typeof detail.BaseDEF === 'number' ? detail.BaseDEF : 0
 
-    // Growth stat (one per character).
-    // Hakush encodes the ascension bonus as a single non-base prop inside StatsModifier.Ascension[5].
-    // Most props are stored as a ratio (0.192 => 19.2%), except Elemental Mastery which is a flat number.
-    const growCandidates = Object.entries(asc5)
-      .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
-      .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
-      .filter((x) => Number.isFinite(x.value) && x.value !== 0)
+      const hp90 = baseHP * Number(hpMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_HP ?? 0)
+      const atk90 = baseATK * Number(atkMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_ATTACK ?? 0)
+      const def90 = baseDEF * Number(defMul['100'] ?? 0) + Number(asc5.FIGHT_PROP_BASE_DEFENSE ?? 0)
 
-    const growPick = growCandidates.length
-      ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
-      : undefined
+      const growCandidates = Object.entries(asc5)
+        .filter(([k]) => !k.startsWith('FIGHT_PROP_BASE_'))
+        .map(([k, v]) => ({ prop: k, value: typeof v === 'number' ? v : Number(v) }))
+        .filter((x) => Number.isFinite(x.value) && x.value !== 0)
 
-    const growProp = growPick?.prop
-    const growKey = growProp ? growKeyMap[growProp] : undefined
-    const growRaw = growPick?.value ?? 0
+      const growPick = growCandidates.length
+        ? growCandidates.reduce((a, b) => (Math.abs(b.value) > Math.abs(a.value) ? b : a))
+        : undefined
 
-    const growValue =
-      growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+      const growProp = growPick?.prop
+      const growKey = growProp ? growKeyMap[growProp] : undefined
+      const growRaw = growPick?.value ?? 0
 
-    // Full milestone attr table used by miao-plugin profile/panel features.
-    const ascRecords: Array<Record<string, unknown>> = []
-    for (let i = 0; i < 6; i++) {
-      ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+      const growValue =
+        growKey === 'mastery' ? growRaw : roundTo(growRaw >= 1 ? growRaw : growRaw * 100, 2)
+
+      const ascRecords: Array<Record<string, unknown>> = []
+      for (let i = 0; i < 6; i++) {
+        ascRecords.push(isRecord(ascArr[i]) ? (ascArr[i] as Record<string, unknown>) : {})
+      }
+      attr = buildGiAttrTable({
+        baseHP,
+        baseATK,
+        baseDEF,
+        hpMul,
+        atkMul,
+        defMul,
+        ascArr: ascRecords,
+        growKey,
+        growProp
+      })
+
+      baseAttr = { hp: roundTo(hp90, 2), atk: roundTo(atk90, 2), def: roundTo(def90, 2) }
+      growAttr = growKey ? { key: growKey, value: growValue } : { key: '', value: 0 }
     }
-    const attr = buildGiAttrTable({
-      baseHP,
-      baseATK,
-      baseDEF,
-      hpMul,
-      atkMul,
-      defMul,
-      ascArr: ascRecords,
-      growKey,
-      growProp
-    })
 
     // Materials (best-effort): use the highest ascension stage and a representative talent stage.
     const mats = isRecord(detail.Materials) ? (detail.Materials as Record<string, unknown>) : {}
@@ -1160,34 +1863,70 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       if (!c) continue
       const cName = c && typeof c.Name === 'string' ? c.Name : ''
       if (!cName) continue
-      consData[String(i + 1)] = { name: cName, desc: giPlainDescToLines(c.Desc) }
+      consData[String(i + 1)] = { name: cName, desc: giPlainDescToLines(preferSpecialDesc(c)) }
     }
 
-    // Passive talents. Hakush order is usually [A4, A1, exploration].
+    // Passive talents. Hakush order is usually [A1/A4..., utility], baseline prefers Unlock asc (0/1/4).
     const passiveArr = Array.isArray(detail.Passives) ? (detail.Passives as Array<unknown>) : []
     const passiveData = passiveArr
-      .map((p) => (isRecord(p) ? (p as Record<string, unknown>) : null))
+      .map((p, idx) => (isRecord(p) ? { idx, rec: p as Record<string, unknown> } : null))
       .filter(Boolean)
       .map((p) => {
-        const pName = typeof p!.Name === 'string' ? (p!.Name as string) : ''
-        return pName ? { name: pName, desc: giPlainDescToLines(p!.Desc) } : null
+        const pName = typeof p!.rec.Name === 'string' ? (p!.rec.Name as string) : ''
+        const unlock = typeof p!.rec.Unlock === 'number' ? (p!.rec.Unlock as number) : Number(p!.rec.Unlock)
+        return pName
+          ? {
+              idx: p!.idx,
+              id: toInt(p!.rec.Id),
+              name: pName,
+              desc: giPlainDescToLines(preferSpecialDesc(p!.rec)),
+              unlock: Number.isFinite(unlock) ? unlock : 999
+            }
+          : null
       })
-      .filter(Boolean) as Array<{ name: string; desc: string[] }>
+      .filter(Boolean) as Array<{ idx: number; id: number | null; name: string; desc: string[]; unlock: number }>
 
-    // Put exploration passive first when detectable.
-    const exploreIdx = passiveData.findIndex((p) => p.desc.some((line) => line.includes('探索派遣')))
-    if (exploreIdx > 0) {
-      const [explore] = passiveData.splice(exploreIdx, 1)
-      passiveData.unshift(explore)
+    passiveData.sort((a, b) => {
+      const ra = passiveUnlockRank(a.unlock)
+      const rb = passiveUnlockRank(b.unlock)
+      if (ra.group !== rb.group) return ra.group - rb.group
+      if (ra.order !== rb.order) return ra.order - rb.order
+      const aid = a.id ?? -1
+      const bid = b.id ?? -1
+      if (aid !== bid) return bid - aid
+      return a.idx - b.idx
+    })
+    const passiveOut = passiveData.map(({ name, desc }) => ({ name, desc }))
+
+    // Baseline adds the "替代冲刺" skill block into passive list (as the last item) for Mona/Ayaka.
+    const sprintSkill = s2 && typeof s2.Desc === 'string' && s2.Desc.includes('替代冲刺') ? s2 : undefined
+    if (sprintSkill) {
+      const sprintSkillId = toInt(sprintSkill.Id)
+      const sprintId = sprintSkillId ? (gsProudSkillGroupByAvatarSkillId?.get(sprintSkillId) ?? sprintSkillId) : null
+      const sprintName = typeof sprintSkill.Name === 'string' ? (sprintSkill.Name as string) : ''
+      if (sprintId && sprintName) {
+        const sprintDesc = giPlainDescToLines(preferSpecialDesc(sprintSkill))
+        const sprintTables = buildGiTablesFromPromote(normalizePromoteList(sprintSkill.Promote))
+        ;(passiveOut as Array<Record<string, unknown>>).push({
+          id: sprintId,
+          name: sprintName,
+          desc: sprintDesc,
+          tables: sprintTables
+        })
+      }
     }
 
     const costumeInfo = getCostumeInfo(charInfo)
     const costume = costumeInfo.ids.length ? costumeInfo.ids : false
 
+    const agdDesc = gsAvatarDescById?.get(Number(id))
+    const desc = agdDesc || (typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detail.Desc))
+    const cncv = gsCncvOverrideById[id] ?? (typeof va.Chinese === 'string' ? va.Chinese : '')
+
     const detailData = {
       id: Number(id),
       name,
-      abbr: name.length >= 5 ? name.slice(-2) : name,
+      abbr: gsDetailAbbr(name),
       title: typeof charInfo.Title === 'string' ? charInfo.Title : '',
       star,
       elem,
@@ -1195,19 +1934,15 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       weapon,
       birth: Array.isArray(charInfo.Birth) ? `${charInfo.Birth[0]}-${charInfo.Birth[1]}` : '',
       astro: typeof charInfo.Constellation === 'string' ? charInfo.Constellation : '',
-      desc: typeof charInfo.Detail === 'string' ? charInfo.Detail : normalizeTextInline(detail.Desc),
-      cncv: typeof va.Chinese === 'string' ? va.Chinese : '',
+      desc,
+      cncv,
       jpcv: typeof va.Japanese === 'string' ? va.Japanese : '',
       costume,
       ver: 1,
-      baseAttr: {
-        hp: roundTo(hp90, 2),
-        atk: roundTo(atk90, 2),
-        def: roundTo(def90, 2)
-      },
-      growAttr: growKey ? { key: growKey, value: growValue } : { key: '', value: 0 },
+      baseAttr,
+      growAttr,
       talentId: giTalent?.talentId || {},
-      talentCons,
+      talentCons: talentConsDetail,
       materials: {
         gem: getMatName(ascMatsArr[0]),
         boss: getMatName(ascMatsArr[1]),
@@ -1218,7 +1953,7 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       },
       ...(giTalent ? { talent: giTalent.talent, talentData: giTalent.talentData } : {}),
       cons: consData,
-      passive: passiveData,
+      passive: passiveOut,
       attr
     }
 
@@ -1352,6 +2087,9 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     projectRootAbs: opts.projectRootAbs,
     repoRootAbs: opts.repoRootAbs,
     hakush: opts.hakush,
+    agdAttr: agdAttrCtx,
+    giSkillDescOpts,
+    gsAvatarDescById,
     forceAssets: opts.forceAssets,
     forceCache: opts.forceCache,
     variantGroups,
@@ -1362,6 +2100,22 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     llm: opts.llm,
     log: opts.log
   })
+
+  const travelerIndexIds = ['20000000', '10000005', '10000007']
+  for (const tid of travelerIndexIds) {
+    const rec = index[tid]
+    if (!isRecord(rec)) continue
+    const talentId = rec.talentId
+    if (!isRecord(talentId)) continue
+    for (const [k, v] of Object.entries(talentId)) {
+      const num = Number(k)
+      if (!Number.isFinite(num) || !k.startsWith('10054')) continue
+      const alias = String(num + 10)
+      if (!(alias in talentId)) {
+        ;(talentId as Record<string, unknown>)[alias] = v
+      }
+    }
+  }
   writeJsonFile(indexPath, sortRecordByKey(index))
 
   const ASSET_CONCURRENCY = 12

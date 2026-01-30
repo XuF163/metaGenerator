@@ -30,6 +30,17 @@ export interface ToolConfig {
      * - {encodedUrlNoProto}   encodeURIComponent(urlNoProto)
      */
     proxy?: string
+    /**
+     * Optional HTTP proxy URL for all outbound HTTP(S) requests.
+     *
+     * Example (Clash default):
+     * - http://127.0.0.1:10809
+     *
+     * Notes:
+     * - This is a *transport proxy* (CONNECT for HTTPS), different from `network.proxy` URL rewriting.
+     * - If both are set, we first apply `network.proxy` (rewrite/mirror), then route via `httpProxy`.
+     */
+    httpProxy?: string
     /** Custom User-Agent header for upstream requests (default: "metaGenerator"). */
     userAgent?: string
   }
@@ -37,6 +48,13 @@ export interface ToolConfig {
     force?: boolean
     forceCache?: boolean
     forceAssets?: boolean
+    /**
+     * Whether `meta-gen gen` can read baseline meta as an overlay while generating.
+     *
+     * Default: false (pure API generation).
+     * Tip: enable only when debugging baseline-compat gaps.
+     */
+    baselineOverlay?: boolean
     /**
      * Whether `meta-gen gen` should use LLM (if configured) to generate `calc.js` for characters.
      *
@@ -47,6 +65,7 @@ export interface ToolConfig {
   }
   validate?: {
     strictExtra?: boolean
+    strictSha?: boolean
     sampleFiles?: number
     seed?: string
   }

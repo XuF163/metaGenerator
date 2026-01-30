@@ -3,7 +3,8 @@
  *
  * Design:
  * - Output is generated from structured upstream sources (currently Hakush + AnimeGameData).
- * - Baseline meta is only used for validate/compare and gap finding; it is NOT a generation input.
+ * - Baseline meta is used for validate/compare and gap finding; it is NOT a generation input by default.
+ *   (Exception: `--baseline-overlay` enables a read-only overlay for compatibility debugging.)
  * - Generation is idempotent:
  *   - default: only fills missing entries (keeps existing output files)
  *   - `--force`: wipes `meta-{game}` output dirs and regenerates everything
@@ -15,6 +16,8 @@ import { ensureCommonAssets } from '../generate/common-assets.js'
 import { ensureGsCharacterFiles } from '../generate/compat/gs-character-files.js'
 import { ensureSrCharacterFiles } from '../generate/compat/sr-character-files.js'
 import { repairGsTalentTables } from '../generate/compat/gs-talent-repair.js'
+import { generateGsArtifactArtisMarkJs } from '../generate/compat/gs-artis-mark.js'
+import { generateSrArtifactArtisMarkJs } from '../generate/compat/sr-artis-mark.js'
 import { applyHakushUpdates } from '../generate/hakush/index.js'
 import { loadToolConfig } from '../config/config.js'
 import { tryCreateLlmService } from '../llm/try-create.js'
@@ -28,12 +31,12 @@ function metaGameDir(root: string, game: string): string {
 export async function genCommand(ctx: CommandContext, options: GenOptions): Promise<void> {
   const baselineRoot = resolveRepoPath(ctx, options.baselineRoot)
   const outputRoot = resolveRepoPath(ctx, options.outputRoot)
-  const { games, types, force, forceCache, forceAssets } = options
+  const { games, types, force, forceCache, forceAssets, baselineOverlay } = options
   const toolConfig = loadToolConfig(ctx.projectRoot) ?? undefined
   ctx.log.info(`[meta-gen] gen: outputRoot=${outputRoot}`)
-  ctx.log.info(`[meta-gen] baselineRoot (validate only)=${baselineRoot}`)
+  ctx.log.info(`[meta-gen] baselineRoot=${baselineRoot}`)
   ctx.log.info(
-    `[meta-gen] games=${games.join(',')} types=${types.join(',')} force=${force} forceCache=${forceCache} forceAssets=${forceAssets}`
+    `[meta-gen] games=${games.join(',')} types=${types.join(',')} force=${force} forceCache=${forceCache} forceAssets=${forceAssets} baselineOverlay=${baselineOverlay}`
   )
 
   // NOTE:
@@ -60,12 +63,31 @@ export async function genCommand(ctx: CommandContext, options: GenOptions): Prom
   await applyHakushUpdates({
     ctx,
     outputRootAbs: outputRoot,
+    baselineRootAbs: baselineRoot,
     games,
     types,
     forceCache,
     forceAssets,
+    baselineOverlay,
     llm
   })
+
+  // Derived QoL files that depend on generated meta (no baseline dependency).
+  // Generate after updates so type execution order does not matter.
+  if (types.includes('artifact') && games.includes('gs')) {
+    try {
+      generateGsArtifactArtisMarkJs({ metaGsRootAbs: path.join(outputRoot, 'meta-gs'), log: ctx.log })
+    } catch (e) {
+      ctx.log.warn?.(`[meta-gen] (gs) artifact artis-mark.js generation failed: ${String(e)}`)
+    }
+  }
+  if (types.includes('artifact') && games.includes('sr')) {
+    try {
+      generateSrArtifactArtisMarkJs({ metaSrRootAbs: path.join(outputRoot, 'meta-sr'), log: ctx.log })
+    } catch (e) {
+      ctx.log.warn?.(`[meta-gen] (sr) artifact artis-mark.js generation failed: ${String(e)}`)
+    }
+  }
 
   // Non-upstream common assets required by runtime UI.
   await ensureCommonAssets({ outputRootAbs: outputRoot, games, types, forceAssets })
