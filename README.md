@@ -38,6 +38,9 @@ Copy-Item config/config.example.json config/config.json
 }
 ```
 
+说明：
+- `httpProxy` 会影响所有出网请求（上游数据/图片下载 + LLM API 请求）。
+
 ### LLM（可选，用于 calc.js）
 
 详见：`docs/llmapi.md`

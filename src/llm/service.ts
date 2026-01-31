@@ -9,6 +9,7 @@ import type { ChatMessage } from './openai.js'
 import { OpenAIClient } from './openai.js'
 import type { LlmConfig } from './llm-config.js'
 import { AsyncQueue } from './queue.js'
+import { getHttpProxy, getUserAgent } from '../http/network.js'
 
 export interface ChatOptions {
   temperature?: number
@@ -28,13 +29,19 @@ export class LlmService {
       chatCompletionsPath: cfg.chatCompletionsPath,
       apiKey: cfg.apiKey,
       timeoutMs: cfg.timeoutMs,
-      retries: cfg.retries
+      retries: cfg.retries,
+      httpProxy: getHttpProxy(),
+      userAgent: getUserAgent()
     })
     this.queue = new AsyncQueue(cfg.maxConcurrency)
   }
 
   get model(): string {
     return this.cfg.model
+  }
+
+  get maxConcurrency(): number {
+    return this.cfg.maxConcurrency
   }
 
   async chat(messages: ChatMessage[], opts: ChatOptions = {}): Promise<string> {

@@ -32,6 +32,7 @@ import type { GiSkillDescOptions } from './talent.js'
 import { inferGiTalentConsFromHakushDetail, inferGiTalentConsFromMetaJson } from './talent-cons.js'
 import type { LlmService } from '../../../llm/service.js'
 import { buildCalcJsWithLlmOrHeuristic } from '../../calc/llm-calc.js'
+import type { CalcSuggestInput } from '../../calc/llm-calc.js'
 import type { GiTalentCons } from './talent-cons.js'
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -39,6 +40,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 type AssetJob = { url: string; out: string; kind: string; id: string; name: string }
+type CalcJob = { name: string; calcPath: string; input: CalcSuggestInput }
 
 const rarityMap: Record<string, number | undefined> = {
   QUALITY_ORANGE_SP: 5,
@@ -84,6 +86,19 @@ function normalizeTextInline(text: unknown): string {
     .replaceAll('\n', ' ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function inferUnitHintFromTableValues(valuesRaw: unknown): string {
+  const values = Array.isArray(valuesRaw) ? valuesRaw : []
+  for (const v of values.slice(0, 3)) {
+    const t = normalizeTextInline(v)
+    if (!t) continue
+    if (/(元素精通|精通)/.test(t)) return '元素精通'
+    if (/(生命值上限|最大生命值|生命值)/.test(t)) return '生命值上限'
+    if (/防御力/.test(t)) return '防御力'
+    if (/(攻击力|攻击)/.test(t)) return '攻击力'
+  }
+  return ''
 }
 
 function giPlainDescToLines(raw: unknown): string[] {
@@ -424,9 +439,10 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
   assetOutDedup: Set<string>
   bannerFixDirs: string[]
   llm?: LlmService
+  calcJobs?: CalcJob[]
   log?: Pick<Console, 'info' | 'warn'>
 }): Promise<void> {
-  const { metaGsRootAbs, projectRootAbs, repoRootAbs, hakush, agdAttr, giSkillDescOpts, variantGroups, index, assetJobs, assetOutDedup, bannerFixDirs, llm, log } = opts
+  const { metaGsRootAbs, projectRootAbs, repoRootAbs, hakush, agdAttr, giSkillDescOpts, variantGroups, index, assetJobs, assetOutDedup, bannerFixDirs, llm, calcJobs, log } = opts
   const charRoot = path.join(metaGsRootAbs, 'character')
   const llmCacheRootAbs = path.join(projectRootAbs, '.cache', 'llm')
 
@@ -729,29 +745,59 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         ensurePlaceholderCalcJs(calcPath, `旅行者/${elem}`)
 
         if (giTalent && isPlaceholderCalc(calcPath)) {
-          const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
-          const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
-          const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+          const aTables = Object.keys(giTalent.talentData.a || {}).filter(Boolean)
+          const eTables = Object.keys(giTalent.talentData.e || {}).filter(Boolean)
+          const qTables = Object.keys(giTalent.talentData.q || {}).filter(Boolean)
           const getDesc = (k: 'a' | 'e' | 'q'): string => {
             const blk = (giTalent.talent as any)?.[k]
-            return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+            const desc = blk ? (blk as any).desc : null
+            if (typeof desc === 'string') return desc
+            if (Array.isArray(desc)) return desc.filter((x) => typeof x === 'string').join('\n')
+            return ''
           }
-          const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(llm, {
+          const getUnitMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+            const blk = (giTalent.talent as any)?.[k]
+            const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+            const out: Record<string, string> = {}
+            for (const t of tables) {
+              if (!t || typeof t !== 'object') continue
+              const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+              if (!name || name in out) continue
+              let unit = typeof (t as any).unit === 'string' ? ((t as any).unit as string) : ''
+              unit = unit.trim()
+              if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
+              out[name] = unit
+            }
+            return out
+          }
+          const input: CalcSuggestInput = {
             game: 'gs',
             name: `旅行者/${elem}`,
             elem,
             weapon,
             star,
             tables: { a: aTables, e: eTables, q: qTables },
+            tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
             talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
             buffHints: buildGsCalcBuffHints(passiveOut, consData)
-          }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
-          if (error) {
-            log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (旅行者/${elem}), using heuristic: ${error}`)
-          } else if (usedLlm) {
-            log?.info?.(`[meta-gen] (gs) LLM calc generated: 旅行者/${elem}`)
           }
-          fs.writeFileSync(calcPath, js, 'utf8')
+
+          if (llm && calcJobs) {
+            // LLM calls are slow; defer and batch with concurrency at the end.
+            calcJobs.push({ name: input.name, calcPath, input })
+          } else {
+            const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+              llm,
+              input,
+              { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+            )
+            if (error) {
+              log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (旅行者/${elem}), using heuristic: ${error}`)
+            } else if (usedLlm) {
+              log?.info?.(`[meta-gen] (gs) LLM calc generated: 旅行者/${elem}`)
+            }
+            fs.writeFileSync(calcPath, js, 'utf8')
+          }
         }
 
         // Download element-dependent assets (card/banner + cons/passive icons) used by UI.
@@ -1205,29 +1251,59 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
     ensurePlaceholderCalcJs(calcPath, name)
 
     if (giTalent && isPlaceholderCalc(calcPath)) {
-      const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
-      const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
-      const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+      const aTables = Object.keys(giTalent.talentData.a || {}).filter(Boolean)
+      const eTables = Object.keys(giTalent.talentData.e || {}).filter(Boolean)
+      const qTables = Object.keys(giTalent.talentData.q || {}).filter(Boolean)
       const getDesc = (k: 'a' | 'e' | 'q'): string => {
         const blk = (giTalent.talent as any)?.[k]
-        return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+        const desc = blk ? (blk as any).desc : null
+        if (typeof desc === 'string') return desc
+        if (Array.isArray(desc)) return desc.filter((x) => typeof x === 'string').join('\n')
+        return ''
       }
-      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(llm, {
+      const getUnitMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+        const blk = (giTalent.talent as any)?.[k]
+        const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+        const out: Record<string, string> = {}
+        for (const t of tables) {
+          if (!t || typeof t !== 'object') continue
+          const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+          if (!name || name in out) continue
+          let unit = typeof (t as any).unit === 'string' ? ((t as any).unit as string) : ''
+          unit = unit.trim()
+          if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
+          out[name] = unit
+        }
+        return out
+      }
+      const input: CalcSuggestInput = {
         game: 'gs',
         name,
         elem,
         weapon,
         star,
         tables: { a: aTables, e: eTables, q: qTables },
+        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
         talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
         buffHints: buildGsCalcBuffHints(passiveOut, consData)
-      }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
-      if (error) {
-        log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
-      } else if (usedLlm) {
-        log?.info?.(`[meta-gen] (gs) LLM calc generated: ${name}`)
       }
-      fs.writeFileSync(calcPath, js, 'utf8')
+
+      if (llm && calcJobs) {
+        // LLM calls are slow; defer and batch with concurrency at the end.
+        calcJobs.push({ name, calcPath, input })
+      } else {
+        const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+          llm,
+          input,
+          { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+        )
+        if (error) {
+          log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
+        } else if (usedLlm) {
+          log?.info?.(`[meta-gen] (gs) LLM calc generated: ${name}`)
+        }
+        fs.writeFileSync(calcPath, js, 'utf8')
+      }
     }
 
     // Download core images (best-effort).
@@ -1413,6 +1489,7 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
   }
 
   let added = 0
+  const calcJobs: CalcJob[] = []
   const assetJobs: AssetJob[] = []
   const assetOutDedup = new Set<string>()
   const bannerFixDirs: string[] = []
@@ -2017,32 +2094,60 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     // - When LLM is configured, it will try LLM first then fall back to heuristic.
     // - When LLM is disabled/unavailable, we still fall back to heuristic for better usability.
     if (giTalent && isPlaceholderCalc(calcPath)) {
-      const aTables = Object.keys(giTalent.talentData.a || {}).filter((k) => !k.endsWith('2'))
-      const eTables = Object.keys(giTalent.talentData.e || {}).filter((k) => !k.endsWith('2'))
-      const qTables = Object.keys(giTalent.talentData.q || {}).filter((k) => !k.endsWith('2'))
+      const aTables = Object.keys(giTalent.talentData.a || {}).filter(Boolean)
+      const eTables = Object.keys(giTalent.talentData.e || {}).filter(Boolean)
+      const qTables = Object.keys(giTalent.talentData.q || {}).filter(Boolean)
       const getDesc = (k: 'a' | 'e' | 'q'): string => {
         const blk = (giTalent.talent as any)?.[k]
-        return blk && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+        const desc = blk ? (blk as any).desc : null
+        if (typeof desc === 'string') return desc
+        if (Array.isArray(desc)) return desc.filter((x) => typeof x === 'string').join('\n')
+        return ''
+      }
+      const getUnitMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+        const blk = (giTalent.talent as any)?.[k]
+        const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+        const out: Record<string, string> = {}
+        for (const t of tables) {
+          if (!t || typeof t !== 'object') continue
+          const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+          if (!name || name in out) continue
+          let unit = typeof (t as any).unit === 'string' ? ((t as any).unit as string) : ''
+          unit = unit.trim()
+          if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
+          out[name] = unit
+        }
+        return out
       }
 
-      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(opts.llm, {
+      const input: CalcSuggestInput = {
         game: 'gs',
         name,
         elem,
         weapon,
         star,
         tables: { a: aTables, e: eTables, q: qTables },
+        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
         talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
         buffHints: buildGsCalcBuffHints(passiveOut, consData)
-      }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
-
-      if (error) {
-        opts.log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
-      } else if (usedLlm) {
-        opts.log?.info?.(`[meta-gen] (gs) LLM calc generated: ${name}`)
       }
 
-      fs.writeFileSync(calcPath, js, 'utf8')
+      if (opts.llm) {
+        // LLM calls are slow; defer and batch with concurrency at the end.
+        calcJobs.push({ name, calcPath, input })
+      } else {
+        const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+          opts.llm,
+          input,
+          { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+        )
+        if (error) {
+          opts.log?.warn?.(`[meta-gen] (gs) calc plan failed (${name}), using heuristic: ${error}`)
+        } else if (usedLlm) {
+          opts.log?.info?.(`[meta-gen] (gs) calc generated: ${name}`)
+        }
+        fs.writeFileSync(calcPath, js, 'utf8')
+      }
     }
 
     // Download core images used by miao-plugin.
@@ -2156,6 +2261,7 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     assetOutDedup,
     bannerFixDirs,
     llm: opts.llm,
+    calcJobs,
     log: opts.log
   })
 
@@ -2174,6 +2280,35 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
       }
     }
   }
+
+  // Batch-generate calc.js via LLM with concurrency (fast path for `gen --force`).
+  if (opts.llm && calcJobs.length > 0) {
+    const CALC_CONCURRENCY = Math.max(1, opts.llm.maxConcurrency)
+    let calcDone = 0
+    await runPromisePool(calcJobs, CALC_CONCURRENCY, async (job) => {
+      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+        opts.llm,
+        job.input,
+        { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+      )
+      if (error) {
+        opts.log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${job.name}), using heuristic: ${error}`)
+      } else if (usedLlm) {
+        opts.log?.info?.(`[meta-gen] (gs) LLM calc generated: ${job.name}`)
+      }
+      try {
+        fs.writeFileSync(job.calcPath, js, 'utf8')
+      } catch (e) {
+        opts.log?.warn?.(`[meta-gen] (gs) failed to write calc.js (${job.name}): ${String(e)}`)
+      }
+
+      calcDone++
+      if (calcDone === 1 || calcDone % 50 === 0) {
+        opts.log?.info?.(`[meta-gen] (gs) LLM calc progress: ${calcDone}/${calcJobs.length}`)
+      }
+    })
+  }
+
   writeJsonFile(indexPath, sortRecordByKey(index))
 
   const ASSET_CONCURRENCY = 12

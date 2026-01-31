@@ -7,6 +7,8 @@
  *   so it can work with compatible providers (OpenRouter, one-api, etc.).
  */
 
+import { fetch as undiciFetch, ProxyAgent } from 'undici'
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -35,6 +37,17 @@ export interface OpenAIClientOptions {
   apiKey: string
   timeoutMs: number
   retries: number
+  /**
+   * Optional HTTP proxy (transport-level, CONNECT for HTTPS).
+   *
+   * NOTE: This is intentionally separate from "URL rewrite/mirror" style proxies.
+   */
+  httpProxy?: string
+  /**
+   * Optional User-Agent header for outgoing requests.
+   * If omitted, the global fetch default is used.
+   */
+  userAgent?: string
 }
 
 function joinUrl(baseUrl: string, pathOrUrl: string): string {
@@ -48,6 +61,15 @@ function joinUrl(baseUrl: string, pathOrUrl: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+function withUserAgent(init: RequestInit, userAgent?: string): RequestInit {
+  if (!userAgent) return init
+  const headers = new Headers(init.headers || {})
+  if (!headers.has('User-Agent')) {
+    headers.set('User-Agent', userAgent)
+  }
+  return { ...init, headers }
 }
 
 function parseRetryAfterMs(res: Response): number | null {
@@ -76,21 +98,50 @@ function backoffMs(attempt: number): number {
   return Math.min(120_000, base + jitter)
 }
 
+let cachedHttpProxy: string | undefined
+let cachedProxyAgent: ProxyAgent | undefined
+
+function normalizeHttpProxy(p: string): string {
+  const t = p.trim()
+  if (!t) return ''
+  if (/^https?:\/\//i.test(t)) return t
+  // Allow "127.0.0.1:10809" style.
+  return `http://${t}`
+}
+
+function getProxyAgent(httpProxyRaw: string | undefined): ProxyAgent | undefined {
+  const p = httpProxyRaw ? normalizeHttpProxy(httpProxyRaw) : undefined
+  if (!p) return undefined
+  if (cachedProxyAgent && cachedHttpProxy === p) return cachedProxyAgent
+  cachedHttpProxy = p
+  cachedProxyAgent = new ProxyAgent(p)
+  return cachedProxyAgent
+}
+
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
   retries: number,
-  timeoutMs: number
+  timeoutMs: number,
+  opts: { httpProxy?: string; userAgent?: string } = {}
 ): Promise<Response> {
+  const proxyAgent = getProxyAgent(opts.httpProxy)
   let lastErr: unknown
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal })
+      const initWithUa = withUserAgent(init, opts.userAgent)
+      const res: Response = proxyAgent
+        ? ((await (undiciFetch as unknown as (url: string, init?: any) => Promise<any>)(url, {
+            ...initWithUa,
+            signal: controller.signal,
+            dispatcher: proxyAgent
+          })) as unknown as Response)
+        : await fetch(url, { ...initWithUa, signal: controller.signal })
       if (res.ok) return res
-      // Retry on 429/5xx
-      if ([429, 500, 502, 503, 504].includes(res.status) && attempt < retries) {
+      // Retry on 429/5xx (and occasional transient 403 from CDNs/proxies).
+      if ([403, 429, 500, 502, 503, 504].includes(res.status) && attempt < retries) {
         const retryAfter = parseRetryAfterMs(res)
         await sleep(retryAfter ?? backoffMs(attempt))
         continue
@@ -116,6 +167,8 @@ export class OpenAIClient {
   private readonly apiKey: string
   private readonly timeoutMs: number
   private readonly retries: number
+  private readonly httpProxy?: string
+  private readonly userAgent?: string
 
   constructor(opts: OpenAIClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '')
@@ -123,6 +176,8 @@ export class OpenAIClient {
     this.apiKey = opts.apiKey
     this.timeoutMs = opts.timeoutMs
     this.retries = opts.retries
+    this.httpProxy = opts.httpProxy
+    this.userAgent = opts.userAgent
   }
 
   /**
@@ -141,7 +196,8 @@ export class OpenAIClient {
         body: JSON.stringify(body)
       },
       this.retries,
-      this.timeoutMs
+      this.timeoutMs,
+      { httpProxy: this.httpProxy, userAgent: this.userAgent }
     )
 
     const text = await res.text()

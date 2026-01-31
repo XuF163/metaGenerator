@@ -19,6 +19,36 @@ node dist/cli.js calc --games gs,sr
 node dist/cli.js validate --games gs,sr --types all --full
 ```
 
+## 回归校验（可自动化）
+
+```powershell
+# 检查：所有角色 calc.js 可被 Node ESM 正常 import（避免 SyntaxError / ReferenceError 等导入期错误）
+node circaltest/regression.mjs
+```
+
+## 实际面板差异回归（证据链）
+
+目标：用 **同 UID、同角色** 的真实面板数据（Enka）在两套 meta 下分别计算伤害输出，并生成可追溯的对比证据。
+
+说明：
+- 全流程只在 `circaltest/` 下运行：会创建 `circaltest/.sandbox/`（隔离的 miao-plugin 环境）与 `circaltest/evidence/`（证据输出），**不会触碰你的生产环境**。
+- 如需代理：优先读取 `--proxy`，否则读取环境变量 `HTTP_PROXY`。
+
+```powershell
+# 基本用法（GS）
+node circaltest/panel-regression.mjs --uid 147962990
+
+# 使用代理（按需：本地 10809）
+node circaltest/panel-regression.mjs --uid 147962990 --proxy http://127.0.0.1:10809
+
+# 产物：circaltest/evidence/<timestamp>/
+# - enka/raw/<uid>.json           # 原始 Enka JSON
+# - baseline/gs/<uid>.json        # 基线 meta 下的伤害输出
+# - generated/gs/<uid>.json       # 生成 meta 下的伤害输出
+# - diff/gs/<uid>.md              # 对比报告（按角色列出 avg/ratio/abs）
+# - diff/gs/<uid>.json            # 结构化 diff
+```
+
 ## 目录约定
 
 - 输出：`temp/metaGenerator/.output/meta-{gs|sr}`
@@ -36,6 +66,6 @@ node dist/cli.js validate --games gs,sr --types all --full
 
 ## 最新基线对标（文件级）
 
-- 报告：`reports/2026-01-30T17-25-31-074Z-validate.{md,json}`
+- 报告：`reports/2026-01-31T08-24-24-299Z-validate.{md,json}`
 - 结果：compared=6637 / missing=0 / diff=0 / warn=5883 / extra=1387
-- 不足汇总（滚动更新）：`docs/对标差异-不足清单-artifact-material-2026-01-27.md`
+- 不足汇总（滚动更新）：`docs/对标差异-不足清单-artifact-material-2026-01-31.md`

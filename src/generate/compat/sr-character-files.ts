@@ -33,6 +33,26 @@ function ensureCalcAutoJs(charDirAbs: string): void {
   )
 }
 
+function ensureRootAliasExports(charRootAbs: string): void {
+  // `scaffold/meta-sr/character/index.js` imports `{ alias, abbr }` from `./alias.js`.
+  // Older scaffold snapshots only exported `alias`, causing runtime import failures.
+  const aliasPath = path.join(charRootAbs, 'alias.js')
+  if (!fs.existsSync(aliasPath)) return
+  let raw = ''
+  try {
+    raw = fs.readFileSync(aliasPath, 'utf8')
+  } catch {
+    return
+  }
+  if (raw.includes('export const abbr')) return
+  try {
+    const out = raw.trimEnd() + '\n\n// Required by `character/index.js`.\nexport const abbr = {}\n'
+    fs.writeFileSync(aliasPath, out, 'utf8')
+  } catch {
+    // Ignore repair failures.
+  }
+}
+
 export interface EnsureSrCharacterFilesOptions {
   /** Absolute path to `.../meta-sr` */
   metaSrRootAbs: string
@@ -41,6 +61,8 @@ export interface EnsureSrCharacterFilesOptions {
 export function ensureSrCharacterFiles(opts: EnsureSrCharacterFilesOptions): void {
   const charRoot = path.join(opts.metaSrRootAbs, 'character')
   if (!fs.existsSync(charRoot)) return
+
+  ensureRootAliasExports(charRoot)
 
   const entries = fs.readdirSync(charRoot, { withFileTypes: true })
   for (const ent of entries) {

@@ -6,3 +6,6 @@
  */
 export const alias = {}
 
+// Required by `character/index.js` (it will populate missing entries at runtime).
+export const abbr = {}
+

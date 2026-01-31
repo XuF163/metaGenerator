@@ -36,6 +36,7 @@ import { srBaseAttrRoundCompat } from '../../compat/sr-baseAttr-round.js'
 import { srTreeCpct7PercentByRatio, srTreeDataValueMode, srTreeFixedPercentByRatio, srTreeValueMode } from '../../compat/sr-tree-value.js'
 import type { LlmService } from '../../../llm/service.js'
 import { buildCalcJsWithLlmOrHeuristic } from '../../calc/llm-calc.js'
+import type { CalcSuggestInput } from '../../calc/llm-calc.js'
 
 const srEnhancedCompat: Record<string, { talentId: Record<string, string> }> = {
   '1005': {
@@ -300,6 +301,19 @@ function normalizeTextInline(text: unknown): string {
     .replace(/\s+([。！？；，、])/g, '$1')
     .replaceAll('?', '•')
     .trim()
+}
+
+function inferUnitHintFromTableValues(valuesRaw: unknown): string {
+  const values = Array.isArray(valuesRaw) ? valuesRaw : []
+  for (const v of values.slice(0, 3)) {
+    const t = normalizeTextInline(v)
+    if (!t) continue
+    if (/(元素精通|精通|mastery|elemental mastery|\bem\b)/i.test(t)) return '元素精通'
+    if (/(生命值上限|最大生命值|生命值|\bhp\b)/i.test(t)) return '生命值上限'
+    if (/(防御力|\bdef\b)/i.test(t)) return '防御力'
+    if (/(攻击力|攻击|\batk\b)/i.test(t)) return '攻击力'
+  }
+  return ''
 }
 
 function normalizeSrRichText(text: unknown, opts?: { stripUnderline?: boolean }): string {
@@ -1524,6 +1538,7 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
   }
 
   let added = 0
+  const calcJobs: Array<{ name: string; calcPath: string; input: CalcSuggestInput }> = []
   const assetJobs: Array<{ url: string; out: string; kind: string; id: string; name: string }> = []
   const assetOutDedup = new Set<string>()
   const postCopyDirs: string[] = []
@@ -1923,27 +1938,63 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
 
       const getDesc = (k: 'a' | 'e' | 'q' | 't'): string => {
         const blk = (talent as Record<string, unknown>)[k]
-        return isRecord(blk) && typeof blk.desc === 'string' ? (blk.desc as string) : ''
+        if (!isRecord(blk)) return ''
+        const desc = (blk as Record<string, unknown>).desc
+        if (typeof desc === 'string') return desc
+        if (Array.isArray(desc)) return desc.filter((x) => typeof x === 'string').join('\n')
+        return ''
       }
 
-      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(opts.llm, {
+      const getUnitMap = (k: 'a' | 'e' | 'q' | 't'): Record<string, string> => {
+        const blk = (talent as Record<string, unknown>)[k]
+        if (!isRecord(blk)) return {}
+        const tablesRaw = (blk as Record<string, unknown>).tables
+        const out: Record<string, string> = {}
+        const pushTable = (t: unknown): void => {
+          if (!isRecord(t)) return
+          const name = typeof t.name === 'string' ? t.name.trim() : ''
+          if (!name || name in out) return
+          let unit = typeof t.unit === 'string' ? t.unit : ''
+          unit = unit.trim()
+          if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
+          out[name] = unit
+        }
+        if (Array.isArray(tablesRaw)) {
+          for (const t of tablesRaw) pushTable(t)
+        } else if (isRecord(tablesRaw)) {
+          for (const t of Object.values(tablesRaw)) pushTable(t)
+        }
+        return out
+      }
+
+      const input: CalcSuggestInput = {
         game: 'sr',
         name,
         elem,
         weapon,
         star,
         tables: { a: getTables('a'), e: getTables('e'), q: getTables('q'), t: getTables('t') },
+        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q'), t: getUnitMap('t') },
         talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q'), t: getDesc('t') },
         buffHints: buildSrCalcBuffHints(talent, cons, treeData)
-      }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
-
-      if (error) {
-        opts.log?.warn?.(`[meta-gen] (sr) LLM calc plan failed (${name}), using heuristic: ${error}`)
-      } else if (usedLlm) {
-        opts.log?.info?.(`[meta-gen] (sr) LLM calc generated: ${name}`)
       }
 
-      fs.writeFileSync(calcPath, js, 'utf8')
+      if (opts.llm) {
+        // LLM calls are slow; defer and batch with concurrency at the end.
+        calcJobs.push({ name, calcPath, input })
+      } else {
+        const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+          opts.llm,
+          input,
+          { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+        )
+        if (error) {
+          opts.log?.warn?.(`[meta-gen] (sr) calc plan failed (${name}), using heuristic: ${error}`)
+        } else if (usedLlm) {
+          opts.log?.info?.(`[meta-gen] (sr) calc generated: ${name}`)
+        }
+        fs.writeFileSync(calcPath, js, 'utf8')
+      }
     }
 
     // Download images (best-effort), following miao-plugin expectations (see CharImg.getImgsSr()).
@@ -2044,6 +2095,34 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     const tc = rec.talentCons
     if (!isRecord(tc)) continue
     Object.assign(tc as Record<string, unknown>, tcCompat)
+  }
+
+  // Batch-generate calc.js via LLM with concurrency (fast path for `gen --force`).
+  if (opts.llm && calcJobs.length > 0) {
+    const CALC_CONCURRENCY = Math.max(1, opts.llm.maxConcurrency)
+    let calcDone = 0
+    await runPromisePool(calcJobs, CALC_CONCURRENCY, async (job) => {
+      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+        opts.llm,
+        job.input,
+        { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+      )
+      if (error) {
+        opts.log?.warn?.(`[meta-gen] (sr) LLM calc plan failed (${job.name}), using heuristic: ${error}`)
+      } else if (usedLlm) {
+        opts.log?.info?.(`[meta-gen] (sr) LLM calc generated: ${job.name}`)
+      }
+      try {
+        fs.writeFileSync(job.calcPath, js, 'utf8')
+      } catch (e) {
+        opts.log?.warn?.(`[meta-gen] (sr) failed to write calc.js (${job.name}): ${String(e)}`)
+      }
+
+      calcDone++
+      if (calcDone === 1 || calcDone % 50 === 0) {
+        opts.log?.info?.(`[meta-gen] (sr) LLM calc progress: ${calcDone}/${calcJobs.length}`)
+      }
+    })
   }
 
   writeJsonFile(indexPath, sortRecordByKey(index))

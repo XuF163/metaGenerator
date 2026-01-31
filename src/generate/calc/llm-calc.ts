@@ -22,6 +22,139 @@ type TalentKey = TalentKeyGs | TalentKeySr
 // Requirement: generated calc.js should have a consistent signature.
 const DEFAULT_CREATED_BY = 'awesome-gpt5.2-xhigh'
 
+function jsString(v: string): string {
+  // JSON.stringify does NOT escape U+2028/U+2029, which can break JS parsing when embedded in source.
+  return JSON.stringify(v).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+}
+
+function validateCalcJsText(js: string): void {
+  // Validate that the generated calc.js:
+  // - is syntactically valid
+  // - does not reference undefined vars at module top-level (e.g. `params.xxx`)
+  //
+  // We intentionally avoid importing from disk to keep this fast and deterministic.
+  // `calc.js` uses only `export const ...` so we can strip ESM exports for evaluation.
+  const body = js.replace(/^\s*export\s+const\s+/gm, 'const ')
+  try {
+    const fn = new Function(body)
+    fn()
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    throw new Error(`[meta-gen] Generated calc.js is invalid: ${msg}`)
+  }
+}
+
+function validateCalcJsRuntime(js: string): void {
+  // Best-effort runtime validation:
+  // - catches ReferenceError inside detail/buff functions (e.g. using `mastery` instead of `attr.mastery`)
+  // - avoids importing from disk; evaluates the module body in a local function scope
+  const body = js.replace(/^\s*export\s+const\s+/gm, 'const ')
+
+  let mod: any
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(`${body}\nreturn { details, buffs }`)
+    mod = fn()
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    throw new Error(`[meta-gen] Generated calc.js runtime extract failed: ${msg}`)
+  }
+
+  const mkDeep0 = (): any => {
+    const baseFn = function () {
+      return 0
+    }
+    let proxy: any
+    const handler: ProxyHandler<any> = {
+      get(_t, prop) {
+        if (prop === Symbol.toPrimitive) return () => 0
+        if (prop === 'valueOf') return () => 0
+        if (prop === 'toString') return () => '0'
+        if (prop === 'toJSON') return () => 0
+        return proxy
+      },
+      apply() {
+        return 0
+      }
+    }
+    proxy = new Proxy(baseFn, handler)
+    return proxy
+  }
+
+  const N = mkDeep0()
+  const ctx = {
+    talent: N,
+    attr: N,
+    calc: (v: unknown) => Number(v) || 0,
+    params: N,
+    cons: 0,
+    weapon: N,
+    trees: N
+  }
+
+  const dmgFn: any = function () {
+    return { dmg: 0, avg: 0 }
+  }
+  dmgFn.basic = function () {
+    return { dmg: 0, avg: 0 }
+  }
+  dmgFn.dynamic = function () {
+    return { dmg: 0, avg: 0 }
+  }
+  dmgFn.reaction = function () {
+    return { dmg: 0, avg: 0 }
+  }
+  dmgFn.swirl = function () {
+    return { dmg: 0, avg: 0 }
+  }
+  dmgFn.heal = function () {
+    return { avg: 0 }
+  }
+  dmgFn.shield = function () {
+    return { avg: 0 }
+  }
+  dmgFn.elation = function () {
+    return { dmg: 0, avg: 0 }
+  }
+
+  const details = Array.isArray(mod?.details) ? mod.details : []
+  for (const d of details) {
+    if (!d || typeof d !== 'object') continue
+    if (typeof (d as any).dmg !== 'function') continue
+    try {
+      ;(d as any).dmg(ctx, dmgFn)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      throw new Error(`[meta-gen] Generated calc.js invalid detail.dmg(): ${msg}`)
+    }
+  }
+
+  const buffs = Array.isArray(mod?.buffs) ? mod.buffs : []
+  for (const b of buffs) {
+    if (!b || typeof b !== 'object') continue
+    try {
+      if (typeof (b as any).check === 'function') {
+        ;(b as any).check(ctx)
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      throw new Error(`[meta-gen] Generated calc.js invalid buff.check(): ${msg}`)
+    }
+    const data = (b as any).data
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      for (const v of Object.values(data)) {
+        if (typeof v !== 'function') continue
+        try {
+          v(ctx)
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          throw new Error(`[meta-gen] Generated calc.js invalid buff.data(): ${msg}`)
+        }
+      }
+    }
+  }
+}
+
 export interface CalcSuggestInput {
   game: 'gs' | 'sr'
   name: string
@@ -30,6 +163,11 @@ export interface CalcSuggestInput {
   star?: number
   // Candidate talent table names (must match keys available at runtime).
   tables: Partial<Record<TalentKey, string[]>>
+  /**
+   * Optional table unit hints for each talent table name.
+   * Used to pick correct scaling stat (hp/def) for `dmg.basic(...)` rendering.
+   */
+  tableUnits?: Partial<Record<TalentKey, Record<string, string>>>
   // Optional skill description text (helps LLM/heuristics pick correct damage tables).
   talentDesc?: Partial<Record<TalentKey, string>>
   /**
@@ -39,10 +177,29 @@ export interface CalcSuggestInput {
   buffHints?: string[]
 }
 
+export type CalcDetailKind = 'dmg' | 'heal' | 'shield' | 'reaction'
+export type CalcScaleStat = 'atk' | 'hp' | 'def' | 'mastery'
+
 export interface CalcSuggestDetail {
   title: string
-  talent: TalentKey
-  table: string
+  /**
+   * Detail kind (defaults to "dmg" when omitted).
+   * - dmg: normal talent multiplier damage
+   * - heal: healing amount (avg only)
+   * - shield: shield absorption (avg only)
+   * - reaction: transformative reaction (swirl/bloom/...) using dmgFn.reaction(...)
+   */
+  kind?: CalcDetailKind
+  /**
+   * Which talent block to read from (`talent.a/e/q/t[...]`).
+   * Required for kind=dmg/heal/shield.
+   */
+  talent?: TalentKey
+  /**
+   * Talent table name. Must exist at runtime.
+   * Required for kind=dmg/heal/shield.
+   */
+  table?: string
   /**
    * The second argument passed to dmg() in calc.js.
    * - For GS: typically a/e/q/a2/a3...
@@ -54,6 +211,15 @@ export interface CalcSuggestDetail {
    * Keep empty for normal elemental skills.
    */
   ele?: string
+  /**
+   * Scaling stat for kind=heal/shield when the table is a percentage (or [pct,flat]).
+   * If omitted, generator will infer from tableUnits / talentDesc.
+   */
+  stat?: CalcScaleStat
+  /**
+   * Reaction id for kind=reaction (passed to dmgFn.reaction("<id>")).
+   */
+  reaction?: string
 }
 
 export interface CalcSuggestBuff {
@@ -93,13 +259,34 @@ function normalizeTableList(list: string[] | undefined): string[] {
   return uniq(list.map((s) => String(s || '').trim()).filter(Boolean))
 }
 
-function clampDetails(details: CalcSuggestDetail[], max = 20): CalcSuggestDetail[] {
+function clampDetails(details: Array<unknown>, max = 20): CalcSuggestDetail[] {
   const out: CalcSuggestDetail[] = []
-  for (const d of details) {
-    if (!d || typeof d !== 'object') continue
+  for (const dRaw of details) {
+    if (!dRaw || typeof dRaw !== 'object') continue
     if (out.length >= max) break
-    if (!d.title || !d.talent || !d.table) continue
-    out.push(d)
+
+    const d = dRaw as Record<string, unknown>
+    const title = typeof d.title === 'string' ? d.title.trim() : ''
+    if (!title) continue
+
+    const kind = typeof d.kind === 'string' ? d.kind.trim() : undefined
+    const talent = typeof d.talent === 'string' ? d.talent.trim() : undefined
+    const table = typeof d.table === 'string' ? d.table.trim() : undefined
+    const key = typeof d.key === 'string' ? d.key.trim() : undefined
+    const ele = typeof d.ele === 'string' ? d.ele.trim() : undefined
+    const stat = typeof d.stat === 'string' ? d.stat.trim() : undefined
+    const reaction = typeof d.reaction === 'string' ? d.reaction.trim() : undefined
+
+    out.push({
+      title,
+      kind: kind as any,
+      talent: talent as any,
+      table,
+      key,
+      ele,
+      stat: stat as any,
+      reaction
+    })
   }
   return out
 }
@@ -214,14 +401,19 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '',
     '要求：',
     `- 只允许使用 talent 表：${allowedTalents.join(',')}`,
-    '- details 建议 6~12 条（最多 20）。尽量覆盖普攻/战技/终结技/天赋等核心伤害项，以及常见变体（点按/长按/多段/追加/反击等）。',
+    '- details 建议 6~12 条（最多 20）。尽量覆盖普攻/战技/终结技/天赋等核心伤害项，以及常见变体（点按/长按/多段/追加/反击等），并补齐常见治疗/护盾/反应（如果该角色具备）。',
+    '- details[i].kind 可选：dmg / heal / shield / reaction；不写默认为 dmg。',
     '- 优先选择“可计算伤害”的表：通常表名包含「伤害」或类似字样；尽量不要选「冷却时间」「能量恢复」「削韧」等非伤害表。',
-    '- 每条 detail 的 table 必须来自我给出的表名列表，不能编造。',
+    '- kind=dmg/heal/shield：必须给出 talent + table；并且 table 必须来自我给出的表名列表，不能编造。',
+    '- kind=heal/shield：请给出 stat（atk/hp/def/mastery）表示百分比部分基于哪个面板属性计算。',
+    '- GS 提示：很多治疗/护盾会同时存在 "治疗量" 和 "治疗量2"（或 "护盾吸收量" / "护盾吸收量2"）。优先选择带 2 的表（通常是 [百分比, 固定值]），不带 2 的同名表往往只是展示用的“百分比+固定值”，不能直接乘面板。',
+    '- kind=reaction：只需给出 reaction（例如 swirl/crystallize/bloom/hyperBloom/burning/lunarCharged），不需要 talent/table。不要用 reaction 表达蒸发/融化/激化/蔓激化：这些请用 kind=dmg + ele="vaporize/melt/aggravate/spread"。',
     '- mainAttr 只输出逗号分隔的属性 key（例如 atk,cpct,cdmg,mastery,recharge,hp,def,heal）。',
     '- buffs 用于对标基线的增益/减益（天赋/行迹/命座/秘技等），输出一个数组（可为空）。',
     '- buffs[i].data 的值：数字=常量；字符串=JS 表达式（不是函数），可用变量 talent, attr, calc, params, cons, weapon, trees。',
     '- buffs[i].data 的 key 请尽量使用基线常见命名（避免自造）：',
     `  - GS 常见：atkPct,atkPlus,hpPct,hpPlus,defPct,defPlus,cpct,cdmg,mastery,recharge,heal,dmg,phy,aDmg,eDmg,qDmg,kx,enemyDef`,
+    `  - GS 元素伤害加成统一用 dmg（不要用 pyro/hydro/... 等元素名）`,
     `  - SR 常见：atkPct,atkPlus,hpPct,hpPlus,defPct,defPlus,cpct,cdmg,dmg,aDmg,eDmg,qDmg,tDmg,speedPct,speedPlus,effPct,kx,enemyDef`,
     '- buffs 中如果需要引用天赋数值：只能使用 talent.a/e/q/t["<表名>"]，并且 <表名> 必须来自下方“可用表名”列表；禁止使用 talent.q2 / talent.talent / 乱写字段。',
     '- 不要发明 params 字段名（例如 targetHp）。如果条件依赖敌方状态/血量等运行时不可用信息，基线通常也不写 condition：直接给出常量 buff 或用 cons/tree 限制即可。',
@@ -243,7 +435,9 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '  "mainAttr": "atk,cpct,cdmg",',
     '  "defDmgKey": "e",',
     '  "details": [',
-    '    { "title": "E伤害", "talent": "e", "table": "技能伤害", "key": "e" }',
+    '    { "title": "E伤害", "kind": "dmg", "talent": "e", "table": "技能伤害", "key": "e" },',
+    '    { "title": "Q治疗", "kind": "heal", "talent": "q", "table": "治疗量", "stat": "hp", "key": "q" },',
+    '    { "title": "扩散反应伤害", "kind": "reaction", "reaction": "swirl" }',
     '  ],',
     '  "buffs": [',
     '    { "title": "示例：1命提高暴击率[cpct]%", "cons": 1, "data": { "cpct": 12 } }',
@@ -274,21 +468,89 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
     throw new Error(`[meta-gen] invalid LLM plan: mainAttr is empty`)
   }
 
-  const detailsRaw = Array.isArray(plan.details) ? plan.details : []
-  const details = clampDetails(detailsRaw, 20).filter((d) => {
-    if (!okTalents.has(d.talent)) return false
-    const allowed = tables[d.talent] || []
-    if (!allowed.includes(d.table)) return false
-    return true
-  })
-  if (details.length === 0) {
-    throw new Error(`[meta-gen] invalid LLM plan: no valid details`)
+  const normalizeKind = (v: unknown): CalcDetailKind => {
+    const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
+    if (t === 'dmg' || t === 'heal' || t === 'shield' || t === 'reaction') return t
+    return 'dmg'
   }
 
-  const defDmgKey = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : undefined
+  const normalizeStat = (v: unknown): CalcScaleStat | undefined => {
+    const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
+    if (!t) return undefined
+    if (t === 'em' || t === 'elementalmastery') return 'mastery'
+    if (t === 'atk' || t === 'hp' || t === 'def' || t === 'mastery') return t
+    return undefined
+  }
+
+  const gsReactionCanon: Record<string, string> = {
+    swirl: 'swirl',
+    crystallize: 'crystallize',
+    bloom: 'bloom',
+    hyperbloom: 'hyperBloom',
+    burning: 'burning',
+    lunarcharged: 'lunarCharged'
+  }
+  const okReactions =
+    input.game === 'gs'
+      ? new Set(Object.values(gsReactionCanon))
+      : new Set<string>()
+
+  const detailsRaw = Array.isArray(plan.details) ? plan.details : []
+  const detailsIn = clampDetails(detailsRaw, 20)
+  const details: CalcSuggestDetail[] = []
+
+  for (const d of detailsIn) {
+    const kind = normalizeKind(d.kind)
+    const title = d.title
+
+    if (kind === 'reaction') {
+      const reaction = typeof d.reaction === 'string' ? d.reaction.trim() : ''
+      if (!reaction) continue
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(reaction)) continue
+      const canon = input.game === 'gs' ? gsReactionCanon[reaction.toLowerCase()] || reaction : reaction
+      if (okReactions.size && !okReactions.has(canon)) continue
+      details.push({ title, kind, reaction: canon })
+      continue
+    }
+
+    const talent = typeof d.talent === 'string' ? (d.talent as TalentKey) : undefined
+    const table = typeof d.table === 'string' ? d.table : undefined
+    if (!talent || !okTalents.has(talent)) continue
+    const allowed = tables[talent] || []
+    if (!table) continue
+    let tableFinal = table
+    // GS heal/shield tables often have a `<name>2` variant that keeps [pct, flat] for runtime calc.
+    if ((kind === 'heal' || kind === 'shield') && !tableFinal.endsWith('2')) {
+      const t2 = `${tableFinal}2`
+      if (allowed.includes(t2)) tableFinal = t2
+    }
+    if (!allowed.includes(tableFinal)) continue
+
+    const out: CalcSuggestDetail = { title, kind, talent, table: tableFinal }
+    const key = typeof d.key === 'string' ? d.key.trim() : ''
+    if (key) out.key = key
+    const ele = typeof d.ele === 'string' ? d.ele.trim() : ''
+    if (ele) out.ele = ele
+    const stat = normalizeStat(d.stat)
+    if (stat) out.stat = stat
+    details.push(out)
+  }
+
+  if (details.length === 0) throw new Error(`[meta-gen] invalid LLM plan: no valid details`)
+
+  // Keep defDmgKey only when it matches one of the rendered detail dmgKey keys.
+  const defDmgKeyRaw = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : ''
+  const validDmgKeys = new Set(
+    details
+      .map((d) => (typeof d.key === 'string' && d.key.trim() ? d.key.trim() : typeof d.talent === 'string' ? d.talent : ''))
+      .filter(Boolean)
+  )
+  const defDmgKey = defDmgKeyRaw && validDmgKeys.has(defDmgKeyRaw) ? defDmgKeyRaw : undefined
 
   const buffsOut: CalcSuggestBuff[] = []
   const buffsRaw = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as Array<unknown>) : []
+  const gsElemKeys = new Set(['anemo', 'geo', 'electro', 'dendro', 'hydro', 'pyro', 'cryo'])
+  const isBuffDataKey = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s)
   for (const bRaw of clampBuffs(buffsRaw, 30)) {
     if (!bRaw || typeof bRaw !== 'object') continue
     const b = bRaw as Record<string, unknown>
@@ -310,14 +572,20 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       for (const [k, v] of Object.entries(dataRaw as Record<string, unknown>)) {
         const kk = String(k || '').trim()
         if (!kk) continue
+        let key = kk
+        // Baseline uses dmg/phy for GS elemental/physical bonuses. Some models may output element names.
+        if (input.game === 'gs' && gsElemKeys.has(key)) key = 'dmg'
+        if (input.game === 'gs' && (key === 'physical' || key === 'phys')) key = 'phy'
+        if (!isBuffDataKey(key)) continue
         if (n >= 50) break
+        if (key in out) continue
         if (typeof v === 'number' && Number.isFinite(v)) {
-          out[kk] = v
+          out[key] = v
           n++
         } else if (typeof v === 'string') {
           const vv = v.trim()
           if (!vv) continue
-          out[kk] = vv
+          out[key] = vv
           n++
         }
       }
@@ -367,7 +635,7 @@ export async function suggestCalcPlan(
           llm,
           messages,
           { temperature },
-          { ...cache, purpose: `calc-plan.v2.${i}` },
+          { ...cache, purpose: `calc-plan.v3.${i}` },
           (t) => {
             try {
               const json = parseJsonFromLlmText(t)
@@ -411,6 +679,24 @@ export async function suggestCalcPlan(
 }
 
 export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, createdBy: string): string {
+  const inferDmgBaseFromUnit = (unitRaw: unknown): 'hp' | 'def' | null => {
+    const unit = normalizePromptText(unitRaw)
+    if (!unit) return null
+    if (/(生命上限|生命值上限|最大生命值|生命值)/.test(unit)) return 'hp'
+    if (/防御力/.test(unit)) return 'def'
+    return null
+  }
+
+  const inferScaleStatFromUnit = (unitRaw: unknown): CalcScaleStat | null => {
+    const unit = normalizePromptText(unitRaw)
+    if (!unit) return null
+    if (/(元素精通|精通|mastery|elemental mastery|\bem\b)/i.test(unit)) return 'mastery'
+    if (/(生命上限|生命值上限|最大生命值|生命值|\bhp\b)/i.test(unit)) return 'hp'
+    if (/(防御力|\bdef\b)/i.test(unit)) return 'def'
+    if (/(攻击力|攻击|\batk\b)/i.test(unit)) return 'atk'
+    return null
+  }
+
   const inferDmgBase = (descRaw: unknown): 'atk' | 'hp' | 'def' => {
     const desc = normalizePromptText(descRaw)
     if (!desc) return 'atk'
@@ -418,6 +704,16 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     if (!/伤害/.test(desc)) return 'atk'
     if (/(生命上限|生命值上限|最大生命值|生命值)/.test(desc)) return 'hp'
     if (/防御力/.test(desc)) return 'def'
+    return 'atk'
+  }
+
+  const inferScaleStatFromDesc = (descRaw: unknown): CalcScaleStat => {
+    const desc = normalizePromptText(descRaw)
+    if (!desc) return 'atk'
+    if (/(元素精通|精通)/.test(desc)) return 'mastery'
+    if (/(生命上限|生命值上限|最大生命值|生命值)/.test(desc)) return 'hp'
+    if (/防御力/.test(desc)) return 'def'
+    if (/(攻击力|攻击)/.test(desc)) return 'atk'
     return 'atk'
   }
 
@@ -431,22 +727,60 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
   detailsLines.push('export const details = [')
 
   plan.details.forEach((d, idx) => {
-    const title = JSON.stringify(d.title)
-    const talent = d.talent
-    const table = JSON.stringify(d.table)
+    const kind: CalcDetailKind = typeof d.kind === 'string' && d.kind ? d.kind : 'dmg'
+    const title = jsString(d.title)
 
-    const key = JSON.stringify(d.key || talent)
-    const ele = typeof d.ele === 'string' && d.ele.trim() ? JSON.stringify(d.ele.trim()) : ''
+    if (kind === 'reaction') {
+      const reaction = typeof d.reaction === 'string' && d.reaction.trim() ? d.reaction.trim() : 'swirl'
+      detailsLines.push('  {')
+      detailsLines.push(`    title: ${title},`)
+      detailsLines.push(`    dmg: ({}, { reaction }) => reaction(${jsString(reaction)})`)
+      detailsLines.push(idx === plan.details.length - 1 ? '  }' : '  },')
+      return
+    }
+
+    const talent = d.talent as TalentKey
+    const tableName = d.table as string
+    const table = jsString(tableName)
+
+    const key = jsString(d.key || talent)
+    const ele = typeof d.ele === 'string' && d.ele.trim() ? jsString(d.ele.trim()) : ''
 
     // Heuristic default: GS 普攻按物理计算（大多数角色）。
     const eleArg = ele ? `, ${ele}` : input.game === 'gs' && talent === 'a' ? `, "phy"` : ''
 
-    const base = inferDmgBase((input.talentDesc as any)?.[talent])
-    const useBasic = base !== 'atk' && /伤害/.test(d.table)
+    // Prefer unit-derived scaling (per-table).
+    // If we have a unit hint for this table but it does not indicate hp/def, assume atk.
+    // Only fall back to description-derived scaling when no unit hint is available.
+    const unitMap = input.tableUnits?.[talent]
+    const hasUnitHint = !!unitMap && Object.prototype.hasOwnProperty.call(unitMap, tableName)
+    const unit = unitMap ? unitMap[tableName] : undefined
+    const unitBase = inferDmgBaseFromUnit(unit)
+    const base = unitBase || (hasUnitHint ? 'atk' : inferDmgBase((input.talentDesc as any)?.[talent]))
+    const useBasic = base !== 'atk' && /伤害/.test(tableName)
+
+    if (kind === 'heal' || kind === 'shield') {
+      const method = kind === 'heal' ? 'heal' : 'shield'
+      const stat = (d.stat ||
+        inferScaleStatFromUnit(unit) ||
+        inferScaleStatFromDesc((input.talentDesc as any)?.[talent])) as CalcScaleStat
+
+      detailsLines.push('  {')
+      detailsLines.push(`    title: ${title},`)
+      detailsLines.push(`    dmgKey: ${jsString(d.key || talent)},`)
+      detailsLines.push(`    dmg: ({ attr, talent, calc }, { ${method} }) => {`)
+      detailsLines.push(`      const t = talent.${talent}[${table}]`)
+      detailsLines.push(`      const base = calc(attr.${stat})`)
+      detailsLines.push(`      if (Array.isArray(t)) return ${method}(base * toRatio(t[0]) + (Number(t[1]) || 0))`)
+      detailsLines.push(`      return ${method}(base * toRatio(t))`)
+      detailsLines.push('    }')
+      detailsLines.push(idx === plan.details.length - 1 ? '  }' : '  },')
+      return
+    }
 
     detailsLines.push('  {')
     detailsLines.push(`    title: ${title},`)
-    detailsLines.push(`    dmgKey: ${JSON.stringify(d.key || talent)},`)
+    detailsLines.push(`    dmgKey: ${jsString(d.key || talent)},`)
     detailsLines.push(
       useBasic
         ? `    dmg: ({ talent, attr, calc }, dmg) => dmg.basic(calc(attr.${base}) * toRatio(talent.${talent}[${table}]), ${key}${eleArg})`
@@ -457,14 +791,21 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 
   detailsLines.push(']')
 
-  const defDmgKey = (plan.defDmgKey && plan.defDmgKey.trim()) || (plan.details[0]?.key || plan.details[0]?.talent || 'e')
-  const defDmgIdx = Math.max(
-    0,
-    plan.details.findIndex((d) => (d.key || d.talent) === defDmgKey)
-  )
+  const detailKey = (d: CalcSuggestDetail | undefined): string => {
+    if (!d) return ''
+    if (typeof d.key === 'string' && d.key.trim()) return d.key.trim()
+    if (typeof d.talent === 'string' && d.talent) return d.talent
+    return ''
+  }
+  const firstKeyIdx = plan.details.findIndex((d) => !!detailKey(d))
+  const fallbackIdx = firstKeyIdx >= 0 ? firstKeyIdx : 0
+  const defDmgKey =
+    (plan.defDmgKey && plan.defDmgKey.trim()) || detailKey(plan.details[fallbackIdx]) || 'e'
+  const defDmgIdxRaw = plan.details.findIndex((d) => detailKey(d) === defDmgKey)
+  const defDmgIdx = defDmgIdxRaw >= 0 ? defDmgIdxRaw : fallbackIdx
 
   const isIdent = (k: string): boolean => /^[$A-Z_][0-9A-Z_$]*$/i.test(k)
-  const renderProp = (k: string): string => (isIdent(k) ? k : JSON.stringify(k))
+  const renderProp = (k: string): string => (isIdent(k) ? k : jsString(k))
   const isFnExpr = (s: string): boolean => /=>/.test(s) || /^function\b/.test(s)
   const wrapExpr = (expr: string): string =>
     `({ talent, attr, calc, params, cons, weapon, trees }) => (${expr})`
@@ -492,7 +833,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     buffsLines.push('export const buffs = [')
     buffs.forEach((b, idx) => {
       buffsLines.push('  {')
-      buffsLines.push(`    title: ${JSON.stringify(b.title)},`)
+      buffsLines.push(`    title: ${jsString(b.title)},`)
       if (typeof b.sort === 'number' && Number.isFinite(b.sort)) {
         buffsLines.push(`    sort: ${Math.trunc(b.sort)},`)
       }
@@ -538,12 +879,12 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     detailsLines.join('\n'),
     '',
     `export const defDmgIdx = ${defDmgIdx}`,
-    `export const defDmgKey = ${JSON.stringify(defDmgKey)}`,
-    `export const mainAttr = ${JSON.stringify(plan.mainAttr)}`,
+    `export const defDmgKey = ${jsString(defDmgKey)}`,
+    `export const mainAttr = ${jsString(plan.mainAttr)}`,
     '',
     buffsLines.join('\n'),
     '',
-    `export const createdBy = ${JSON.stringify(createdBy)}`,
+    `export const createdBy = ${jsString(createdBy)}`,
     ''
   ].join('\n')
 }
@@ -555,18 +896,38 @@ export async function buildCalcJsWithLlmOrHeuristic(
 ): Promise<{ js: string; usedLlm: boolean; error?: string }> {
   if (!llm) {
     const plan = heuristicPlan(input)
-    return { js: renderCalcJs(input, plan, DEFAULT_CREATED_BY), usedLlm: false }
+    const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+    validateCalcJsText(js)
+    validateCalcJsRuntime(js)
+    return { js, usedLlm: false }
   }
 
-  try {
-    const plan = await suggestCalcPlan(llm, input, cache)
-    return { js: renderCalcJs(input, plan, DEFAULT_CREATED_BY), usedLlm: true }
-  } catch (e) {
-    const plan = heuristicPlan(input)
-    return {
-      js: renderCalcJs(input, plan, DEFAULT_CREATED_BY),
-      usedLlm: false,
-      error: e instanceof Error ? e.message : String(e)
+  // Stronger retry: even if the JSON plan is valid, it may still render into invalid JS
+  // (e.g. unbalanced expressions). We validate the final JS and retry a few times.
+  const MAX_TRIES = 3
+  let lastErr: string | undefined
+  for (let i = 0; i < MAX_TRIES; i++) {
+    try {
+      const cacheTry = cache ? { ...cache, force: i > 0 ? true : cache.force } : undefined
+      const plan = await suggestCalcPlan(llm, input, cacheTry)
+      const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+      validateCalcJsText(js)
+      validateCalcJsRuntime(js)
+      return { js, usedLlm: true }
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e)
     }
   }
+
+  const plan = heuristicPlan(input)
+  const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+  // Heuristic output should always be valid; if not, still return it (caller logs error).
+  try {
+    validateCalcJsText(js)
+    validateCalcJsRuntime(js)
+  } catch (e) {
+    // Keep lastErr as the primary reason; avoid overriding with a secondary validation msg.
+    if (!lastErr) lastErr = e instanceof Error ? e.message : String(e)
+  }
+  return { js, usedLlm: false, error: lastErr || `[meta-gen] LLM calc plan failed` }
 }

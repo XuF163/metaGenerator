@@ -8,3 +8,7 @@ config/config.json
 
 .ace-tool/
 temp/
+
+# circaltest artifacts (sandbox clone + evidence outputs)
+circaltest/.sandbox/
+circaltest/evidence/

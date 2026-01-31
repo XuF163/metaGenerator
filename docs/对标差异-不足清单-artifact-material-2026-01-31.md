@@ -10,9 +10,10 @@
 
 - **基线（仅用于对照）**：`temp/metaBaselineRef/meta-{gs|sr}`（也可替换为 `plugins/miao-plugin/resources/meta-{gs|sr}`）
 - **生成产物**：`temp/metaGenerator/.output/meta-{gs|sr}`
+- **注意：先编译再跑 dist**：`npm run build`（否则 `node dist/cli.js ...` 可能仍是旧实现，出现“LLM 只写 details 不写 buffs”等错觉）
 - **对照命令（全量）**：
   - `node dist/cli.js validate --games gs,sr --types all --full --baseline-root temp/metaBaselineRef --output-root temp/metaGenerator/.output`
-- **最新报告**：`reports/2026-01-30T17-25-31-074Z-validate.{md,json}`
+- **最新报告**：`reports/2026-01-31T08-24-24-299Z-validate.{md,json}`
 
 ### 最新对标摘要（文件级）
 
@@ -53,6 +54,16 @@
 
 - 现状：角色 `calc.js` 已支持通过 LLM 生成 `details + buffs`，并尽量对齐基线“极限”中 `buffs` 的结构形态（`title/sort/cons/tree/check/data`）。
 - 差距：复杂条件/参数化（`check/params`）、特殊机制/反应/队伍联动等仍可能与基线不一致；且 validate 不执行 JS，无法直接判定“算得是否一致”。
+- 已补齐最低限度的“运行时可加载”回归：
+  - `node circaltest/regression.mjs`：并发 `import` 全量 `meta-{gs|sr}/character/**/calc.js`，避免 miao-plugin 启动时报 `ReferenceError/SyntaxError`；同时校验 SR `character/alias.js` 是否导出 `abbr`。
+  - LLM 输出写盘前会做 JS 自检（语法 + 顶层引用），失败自动重试，最终回退 heuristic，尽量保证“可加载”。
+- 已补齐“运行时结果对照”的面板回归（证据链）：
+  - `node circaltest/panel-regression.mjs --uid <UID>`：拉取 Enka 面板 JSON，在 **基线 meta** 与 **生成 meta** 两套环境中分别计算并落盘，输出 `diff/*.md + diff/*.json`。
+  - 最新证据示例（滚动）：`circaltest/evidence/*/diff/gs/147962990.md`（同 UID、同角色对照）。
+
+仍需迭代点（运行时差异层面）：
+- `details` 标题/粒度不一定与基线 1:1 对齐（基线可能输出“某技能总伤害/循环伤害”，生成侧可能输出“单段/每跳/分段”），导致 diff 中出现 baseline 行无法匹配或 ratio 看起来偏离。
+- 复杂机制/条件（命座/被动触发窗/参数化 `params`/队伍联动/特殊反应）仍可能差异较大；目前策略是不复用基线逻辑，只能通过“提示词 + 启发式规则 + 运行时回归”逐步收敛。
 
 ### 4) “缺失即日志，不造数据”的策略导致信息完备度受限
 
@@ -63,4 +74,10 @@
 
 - JSON superset 问题已清零：当前全量对标 `diff=0`（artifact/material/character/weapon）。
 - 体验脚本覆盖度不再明显落后：例如 `alias.js`、`artis-mark.js`、`abbr.js` 行数已达到或超过基线（但仍存在 sha 差异，需关注语义一致性）。
+- LLM calc 生成吞吐已提升：GS/SR 角色 calc.js 生成改为批量并发（受 `llm.maxConcurrency` 控制），生成阶段明显提速。
+- 常见 LLM 产物导入错误已兜底：对 `Unexpected token` / `Invalid token` / 顶层 `params is not defined` 等，会触发重试与回退。
+- SR 角色根索引导入错误已修：`meta-sr/character/index.js` 依赖 `alias.js` 导出 `abbr`，已在 scaffold+compat 修复（避免 `does not provide an export named 'abbr'`）。
+- GS/SR 角色 `calc.js` 的 `details` 已支持生成更多类型：`dmg/heal/shield/reaction`；并补齐了两类常见“极端错误”的根因：
+  - 伤害倍率的 HP/DEF 误判（通过 `tableUnits` + 描述兜底推断，避免满级技能伤害只有几百）。
+  - 治疗/护盾选择了展示用的“百分比+固定值”表导致数值离谱（对 heal/shield 自动优先使用同名 `*2` 表，通常为 `[pct, flat]` 结构）。
 

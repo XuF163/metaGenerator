@@ -41,6 +41,16 @@ PowerShell：
 $env:META_LLM_API_KEY="YOUR_API_KEY"
 ```
 
+如需走本地 HTTP 代理（例如 Clash 10809），请配置：
+
+```json
+{
+  "network": { "httpProxy": "http://127.0.0.1:10809" }
+}
+```
+
+> `network.httpProxy` 会影响所有出网请求（包括 LLM API 请求）。
+
 ---
 
 ## 2) LLM 在本项目中的用途
