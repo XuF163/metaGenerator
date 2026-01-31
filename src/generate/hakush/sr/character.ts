@@ -431,6 +431,56 @@ function ensurePlaceholderCalcJs(calcPath: string, name: string): void {
   fs.writeFileSync(calcPath, content, 'utf8')
 }
 
+function buildSrCalcBuffHints(talent: unknown, cons: unknown, treeData: unknown): string[] {
+  const hints: string[] = []
+
+  // Technique (秘技): talent.z
+  if (isRecord(talent)) {
+    const z = (talent as Record<string, unknown>).z
+    if (isRecord(z)) {
+      const name = typeof z.name === 'string' ? (z.name as string).trim() : ''
+      const desc = typeof z.desc === 'string' ? (z.desc as string).trim() : ''
+      if (name && desc) hints.push(`秘技：${name}：${desc}`)
+    }
+  }
+
+  // Eidolons (魂)
+  if (isRecord(cons)) {
+    const keys = Object.keys(cons)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b)
+    for (const n of keys) {
+      const c = (cons as Record<string, unknown>)[String(n)]
+      if (!isRecord(c)) continue
+      const name = typeof c.name === 'string' ? (c.name as string).trim() : ''
+      const desc = typeof c.desc === 'string' ? (c.desc as string).trim() : ''
+      if (!name || !desc) continue
+      hints.push(`${n}魂：${name}：${desc}`)
+    }
+  }
+
+  // Major traces (行迹): treeData root skill nodes (idx=1..)
+  if (isRecord(treeData)) {
+    const nodes: Array<{ idx: number; name: string; desc: string }> = []
+    for (const v of Object.values(treeData)) {
+      if (!isRecord(v)) continue
+      if (v.type !== 'skill' || v.root !== true) continue
+      const idx = typeof v.idx === 'number' && Number.isFinite(v.idx) ? Math.trunc(v.idx) : 0
+      const name = typeof v.name === 'string' ? (v.name as string).trim() : ''
+      const desc = typeof v.desc === 'string' ? (v.desc as string).trim() : ''
+      if (!idx || !name || !desc) continue
+      nodes.push({ idx, name, desc })
+    }
+    nodes.sort((a, b) => a.idx - b.idx)
+    for (const n of nodes) {
+      hints.push(`行迹${n.idx}：${n.name}：${n.desc}`)
+    }
+  }
+
+  return hints
+}
+
 function isPlaceholderCalc(filePath: string): boolean {
   try {
     const raw = fs.readFileSync(filePath, 'utf8')
@@ -1883,7 +1933,8 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
         weapon,
         star,
         tables: { a: getTables('a'), e: getTables('e'), q: getTables('q'), t: getTables('t') },
-        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q'), t: getDesc('t') }
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q'), t: getDesc('t') },
+        buffHints: buildSrCalcBuffHints(talent, cons, treeData)
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
 
       if (error) {

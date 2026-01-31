@@ -92,3 +92,72 @@ export async function chatWithDiskCache(
   return text
 }
 
+/**
+ * Same as chatWithDiskCache, but only returns cached/new text when it passes validation.
+ * Invalid cached responses are ignored, and invalid new responses are NOT written to disk.
+ *
+ * This avoids getting stuck with a bad cached response when the model outputs non-JSON / invalid JSON.
+ */
+export async function chatWithDiskCacheValidated(
+  llm: LlmService,
+  messages: ChatMessage[],
+  chatOpts: ChatOptions,
+  cache: LlmDiskCacheOptions,
+  validateText: (text: string) => boolean
+): Promise<string> {
+  const payload = {
+    model: llm.model,
+    messages,
+    temperature: chatOpts.temperature ?? null,
+    max_tokens: chatOpts.maxTokens ?? null
+  }
+  const hash = sha256(stableStringify(payload))
+  const filePath = cachePath(cache, hash)
+
+  if (!cache.force && fs.existsSync(filePath)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+      if (raw && typeof raw === 'object' && typeof (raw as any).text === 'string') {
+        const text = (raw as any).text as string
+        try {
+          if (validateText(text)) return text
+        } catch {
+          // Invalid cached: ignore.
+        }
+      }
+    } catch {
+      // Corrupted cache: fall through to re-fetch.
+    }
+  }
+
+  const text = await llm.chat(messages, chatOpts)
+  let ok = false
+  try {
+    ok = validateText(text)
+  } catch {
+    ok = false
+  }
+
+  if (ok) {
+    try {
+      ensureDir(path.dirname(filePath))
+      fs.writeFileSync(
+        filePath,
+        JSON.stringify(
+          {
+            createdAt: new Date().toISOString(),
+            model: llm.model,
+            text
+          },
+          null,
+          2
+        ) + '\n',
+        'utf8'
+      )
+    } catch {
+      // Ignore cache write failures.
+    }
+  }
+
+  return text
+}

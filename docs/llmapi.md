@@ -5,15 +5,15 @@
 重要约束：
 - **禁止**把任何 API Key 写入仓库（包括文档、示例、截图）。
 - API Key 支持两种注入方式（优先推荐第 1 种）：
-  1) 写入 `temp/metaGenerator/config/config.json` 的 `llm.apiKey`（该文件已被 `.gitignore` 忽略）
-  2) 通过环境变量注入（使用 `llm.apiKeyEnv` 指定 env var 名）
+  1) 通过环境变量注入（使用 `llm.apiKeyEnv` 指定 env var 名）
+  2) 写入 `config/config.json` 的 `llm.apiKey`（该文件已被 `.gitignore` 忽略，仅用于本地）
 
 ---
 
 ## 1) 配置方式
 
 1. 复制示例配置：
-   - `temp/metaGenerator/config/config.example.json` → `temp/metaGenerator/config/config.json`
+   - `config/config.example.json` → `config/config.json`
 2. 按需填写 `llm` 段：
 
 ```json
@@ -22,7 +22,6 @@
     "enabled": true,
     "baseUrl": "https://api.openai.com",
     "chatCompletionsPath": "/v1/chat/completions",
-    "apiKey": "YOUR_API_KEY",
     "apiKeyEnv": "META_LLM_API_KEY",
     "model": "gpt-4o-mini",
     "timeoutMs": 30000,
@@ -34,14 +33,29 @@
 
 3. 两种 key 写法（二选一）：
 
-- 方式 A：直接在 `config/config.json` 填 `llm.apiKey`（推荐：文件 gitignored）  
-  - 注意：不要把该文件提交到任何仓库/截图/日志中
-- 方式 B：使用环境变量（示例）：
+- 方式 A：使用环境变量（推荐）
+- 方式 B：直接在 `config/config.json` 填 `llm.apiKey`（仅本地；注意不要提交/截图/发日志）
 
 PowerShell：
 ```powershell
 $env:META_LLM_API_KEY="YOUR_API_KEY"
 ```
+
+---
+
+## 2) LLM 在本项目中的用途
+
+目前 LLM 主要用于**生成/升级角色 `calc.js`**（伤害计算的 `details`，以及尽量贴近基线结构的 `buffs`）。
+
+典型用法：
+
+```powershell
+node dist/cli.js calc --games gs,sr
+```
+
+与缓存有关的参数：
+- `.cache/llm/`：LLM 响应磁盘缓存
+- `--force-cache`：绕过 `.cache/llm/` 强制重新请求（弱模型/调 prompt 时常用）
 
 ---
 
@@ -80,7 +94,7 @@ BigModel（智谱）示例参数：
 ```
 
 > 兼容提示：若你误把 key 粘贴到了 `apiKeyEnv` 字段，本项目会将“非 env 变量名形态”的 `apiKeyEnv` 当作 key 使用；
-> 但仍建议改为填写 `apiKey`，避免语义混淆。
+> 但仍建议改为填写 `apiKey`（或改为 env），避免语义混淆。
 
 curl（仅演示形态，Key 用占位符）：
 

@@ -192,6 +192,46 @@ function ensurePlaceholderCalcJs(calcPath: string, name: string): void {
   fs.writeFileSync(calcPath, content, 'utf8')
 }
 
+function buildGsCalcBuffHints(passiveOut: unknown, consData: unknown): string[] {
+  const hints: string[] = []
+  const isCombatLike = (s: string): boolean =>
+    /(伤害|攻击|防御|生命|暴击|元素|精通|充能|治疗|护盾|抗性|穿透|提高|提升|降低|增加|减少|\d|%)/.test(s)
+  const isNonCombat = (s: string): boolean =>
+    /(探索派遣|派遣任务|烹饪|合成|制作|锻造|加工|采集|钓鱼)/.test(s)
+
+  if (Array.isArray(passiveOut)) {
+    for (const p of passiveOut) {
+      if (!isRecord(p)) continue
+      const name = typeof p.name === 'string' ? (p.name as string).trim() : ''
+      const descArr = Array.isArray(p.desc) ? (p.desc as Array<unknown>) : []
+      const desc = descArr.filter((x) => typeof x === 'string').join(' ').trim()
+      if (!name || !desc) continue
+      if (isNonCombat(desc)) continue
+      if (!isCombatLike(desc)) continue
+      hints.push(`被动：${name}：${desc}`)
+    }
+  }
+
+  if (isRecord(consData)) {
+    const keys = Object.keys(consData)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b)
+    for (const n of keys) {
+      const c = (consData as Record<string, unknown>)[String(n)]
+      if (!isRecord(c)) continue
+      const name = typeof c.name === 'string' ? (c.name as string).trim() : ''
+      const descArr = Array.isArray(c.desc) ? (c.desc as Array<unknown>) : []
+      const desc = descArr.filter((x) => typeof x === 'string').join(' ').trim()
+      if (!name || !desc) continue
+      if (!isCombatLike(desc)) continue
+      hints.push(`${n}命：${name}：${desc}`)
+    }
+  }
+
+  return hints
+}
+
 function isPlaceholderCalc(filePath: string): boolean {
   try {
     const raw = fs.readFileSync(filePath, 'utf8')
@@ -703,7 +743,8 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
             weapon,
             star,
             tables: { a: aTables, e: eTables, q: qTables },
-            talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
+            talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
+            buffHints: buildGsCalcBuffHints(passiveOut, consData)
           }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
           if (error) {
             log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (旅行者/${elem}), using heuristic: ${error}`)
@@ -1178,7 +1219,8 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         weapon,
         star,
         tables: { a: aTables, e: eTables, q: qTables },
-        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
+        buffHints: buildGsCalcBuffHints(passiveOut, consData)
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
       if (error) {
         log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
@@ -1990,7 +2032,8 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
         weapon,
         star,
         tables: { a: aTables, e: eTables, q: qTables },
-        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') }
+        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
+        buffHints: buildGsCalcBuffHints(passiveOut, consData)
       }, { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache })
 
       if (error) {

@@ -4,14 +4,14 @@
 
 > 重要原则
 > - **生成阶段不读取/不拷贝基线 meta**（`plugins/miao-plugin/resources/meta-*`）做兜底；基线仅用于 `validate` 对照。
-> - **不生成占位图**：图片/资源缺失只记录到 `temp/metaGenerator/logs/`。
-> - 所有上游请求都有本地缓存：`temp/metaGenerator/.cache/`，用于可复现与减少重复请求。
+> - **不生成占位图**：图片/资源缺失只记录到 `logs/`。
+> - 所有上游请求都有本地缓存：`.cache/`，用于可复现与减少重复请求。
 
 ---
 
 ## 1) 产物总览：meta 目录结构（与 miao-plugin 对齐）
 
-默认输出根目录：
+默认输出根目录（可通过 `config/config.json` 或 CLI 参数覆盖）：
 - `temp/metaGenerator/.output/`
 
 在输出根下生成：
@@ -28,7 +28,7 @@
 - `info/`（版本/池子等固定脚本）
 - `public/`（SR 公共图标等）
 
-> “骨架文件”（`index.js/alias.js/extra.js/...`）来自 `temp/metaGenerator/scaffold/meta-{gs|sr}`，用于保证 meta 可被运行时加载。
+> “骨架文件”（`index.js/alias.js/extra.js/...`）来自 `scaffold/meta-{gs|sr}`，用于保证 meta 可被运行时加载。
 
 ---
 
@@ -221,12 +221,12 @@
 ## 5) 缓存、日志与验收文件（与 API 的关系）
 
 ### 5.1 缓存目录
-- `temp/metaGenerator/.cache/hakush/`：Hakush JSON 缓存
-- `temp/metaGenerator/.cache/animeGameData/`：AnimeGameData JSON 缓存
-- `temp/metaGenerator/.cache/turnBasedGameData/`：turnbasedgamedata JSON 缓存
-- `temp/metaGenerator/.cache/hoyoWiki/`：HoYoWiki API 缓存
+- `.cache/hakush/`：Hakush JSON 缓存
+- `.cache/animeGameData/`：AnimeGameData JSON 缓存
+- `.cache/turnBasedGameData/`：turnbasedgamedata JSON 缓存
+- `.cache/hoyoWiki/`：HoYoWiki API 缓存
 
 ### 5.2 日志与报告
-- `temp/metaGenerator/logs/*-gen.log`：生成过程日志；缺失资源会写 `asset-error ...`
-- `temp/metaGenerator/reports/*-validate.{json,md}`：与基线对照报告（用于发现差异/缺口）
+- `logs/*-gen.log`：生成过程日志；缺失资源会写 `asset-error ...`
+- `reports/*-validate.{json,md}`：与基线对照报告（用于发现差异/缺口）
 

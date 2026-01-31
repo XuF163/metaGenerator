@@ -13,7 +13,7 @@ import type { LlmService } from '../../llm/service.js'
 import type { ChatMessage } from '../../llm/openai.js'
 import { parseJsonFromLlmText } from '../../llm/json.js'
 import type { LlmDiskCacheOptions } from '../../llm/disk-cache.js'
-import { chatWithDiskCache } from '../../llm/disk-cache.js'
+import { chatWithDiskCacheValidated } from '../../llm/disk-cache.js'
 
 type TalentKeyGs = 'a' | 'e' | 'q'
 type TalentKeySr = 'a' | 'e' | 'q' | 't'
@@ -32,6 +32,11 @@ export interface CalcSuggestInput {
   tables: Partial<Record<TalentKey, string[]>>
   // Optional skill description text (helps LLM/heuristics pick correct damage tables).
   talentDesc?: Partial<Record<TalentKey, string>>
+  /**
+   * Optional extra text hints for buffs generation.
+   * Keep each entry as a single line (passives/cons/traces/technique).
+   */
+  buffHints?: string[]
 }
 
 export interface CalcSuggestDetail {
@@ -51,10 +56,32 @@ export interface CalcSuggestDetail {
   ele?: string
 }
 
+export interface CalcSuggestBuff {
+  title: string
+  /** Sort order (higher first in UI). */
+  sort?: number
+  /** Constellation / Eidolon requirement (1..6). */
+  cons?: number
+  /** SR major trace index (1..3/4) when applicable. */
+  tree?: number
+  /**
+   * Optional condition expression (JS expression, NOT a function).
+   * Rendered as: ({ talent, attr, calc, params, cons, weapon, trees }) => (<expr>)
+   */
+  check?: string
+  /**
+   * Buff data mapping:
+   * - number: direct value
+   * - string: JS expression (NOT a function), rendered into an arrow fn returning number
+   */
+  data?: Record<string, number | string>
+}
+
 export interface CalcSuggestResult {
   mainAttr: string
   defDmgKey?: string
   details: CalcSuggestDetail[]
+  buffs?: CalcSuggestBuff[]
 }
 
 function uniq(arr: string[]): string[] {
@@ -73,6 +100,17 @@ function clampDetails(details: CalcSuggestDetail[], max = 20): CalcSuggestDetail
     if (out.length >= max) break
     if (!d.title || !d.talent || !d.table) continue
     out.push(d)
+  }
+  return out
+}
+
+function clampBuffs(buffs: Array<unknown>, max = 30): Array<unknown> {
+  const out: Array<unknown> = []
+  for (const b of buffs) {
+    if (!b || typeof b !== 'object') continue
+    if (out.length >= max) break
+    if (!(b as any).title) continue
+    out.push(b)
   }
   return out
 }
@@ -123,7 +161,8 @@ function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
     return {
       mainAttr: 'atk,cpct,cdmg',
       defDmgKey: e ? 'e' : q ? 'q' : 'a',
-      details
+      details,
+      buffs: []
     }
   }
 
@@ -139,7 +178,8 @@ function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
   return {
     mainAttr: 'atk,cpct,cdmg',
     defDmgKey: e ? 'e' : q ? 'q' : a ? 'a' : 'e',
-    details
+    details,
+    buffs: []
   }
 }
 
@@ -159,6 +199,14 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     descLines.push(`- ${k}: ${shortenText(t, 260)}`)
   }
 
+  const buffHintLines: string[] = []
+  const buffHints = Array.isArray(input.buffHints) ? input.buffHints : []
+  for (const h of buffHints) {
+    const t = normalizePromptText(h)
+    if (!t) continue
+    buffHintLines.push(`- ${shortenText(t, 260)}`)
+  }
+
   const user = [
     `为 miao-plugin 生成 ${input.game === 'gs' ? '原神(GS)' : '星铁(SR)'} 角色 calc.js 的配置计划（尽量对标基线 calc.js 的“详细程度”）。`,
     '',
@@ -170,12 +218,20 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '- 优先选择“可计算伤害”的表：通常表名包含「伤害」或类似字样；尽量不要选「冷却时间」「能量恢复」「削韧」等非伤害表。',
     '- 每条 detail 的 table 必须来自我给出的表名列表，不能编造。',
     '- mainAttr 只输出逗号分隔的属性 key（例如 atk,cpct,cdmg,mastery,recharge,hp,def,heal）。',
+    '- buffs 用于对标基线的增益/减益（天赋/行迹/命座/秘技等），输出一个数组（可为空）。',
+    '- buffs[i].data 的值：数字=常量；字符串=JS 表达式（不是函数），可用变量 talent, attr, calc, params, cons, weapon, trees。',
+    '- buffs[i].data 的 key 请尽量使用基线常见命名（避免自造）：',
+    `  - GS 常见：atkPct,atkPlus,hpPct,hpPlus,defPct,defPlus,cpct,cdmg,mastery,recharge,heal,dmg,phy,aDmg,eDmg,qDmg,kx,enemyDef`,
+    `  - SR 常见：atkPct,atkPlus,hpPct,hpPlus,defPct,defPlus,cpct,cdmg,dmg,aDmg,eDmg,qDmg,tDmg,speedPct,speedPlus,effPct,kx,enemyDef`,
+    '- buffs 中如果需要引用天赋数值：只能使用 talent.a/e/q/t["<表名>"]，并且 <表名> 必须来自下方“可用表名”列表；禁止使用 talent.q2 / talent.talent / 乱写字段。',
+    '- 不要发明 params 字段名（例如 targetHp）。如果条件依赖敌方状态/血量等运行时不可用信息，基线通常也不写 condition：直接给出常量 buff 或用 cons/tree 限制即可。',
     '',
     `角色：${input.name} elem=${input.elem}${input.weapon ? ` weapon=${input.weapon}` : ''}${typeof input.star === 'number' ? ` star=${input.star}` : ''}`,
     '',
     ...(descLines.length
       ? ['技能描述摘要（用于判断哪些表是伤害倍率/选择标题，不要复述）：', ...descLines, '']
       : []),
+    ...(buffHintLines.length ? ['Buff 线索（用于生成 buffs，不要复述）：', ...buffHintLines, ''] : []),
     '可用表名（严格从这里选）：',
     `- a: ${JSON.stringify(aTables)}`,
     `- e: ${JSON.stringify(eTables)}`,
@@ -188,6 +244,9 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '  "defDmgKey": "e",',
     '  "details": [',
     '    { "title": "E伤害", "talent": "e", "table": "技能伤害", "key": "e" }',
+    '  ],',
+    '  "buffs": [',
+    '    { "title": "示例：1命提高暴击率[cpct]%", "cons": 1, "data": { "cpct": 12 } }',
     '  ]',
     '}'
   ].join('\n')
@@ -228,7 +287,53 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
 
   const defDmgKey = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : undefined
 
-  return { mainAttr, defDmgKey, details }
+  const buffsOut: CalcSuggestBuff[] = []
+  const buffsRaw = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as Array<unknown>) : []
+  for (const bRaw of clampBuffs(buffsRaw, 30)) {
+    if (!bRaw || typeof bRaw !== 'object') continue
+    const b = bRaw as Record<string, unknown>
+    const title = typeof b.title === 'string' ? b.title.trim() : ''
+    if (!title) continue
+
+    const sort = typeof b.sort === 'number' && Number.isFinite(b.sort) ? Math.trunc(b.sort) : undefined
+    const consRaw = typeof b.cons === 'number' && Number.isFinite(b.cons) ? Math.trunc(b.cons) : undefined
+    const cons = consRaw && consRaw >= 1 && consRaw <= 6 ? consRaw : undefined
+    const treeRaw = typeof b.tree === 'number' && Number.isFinite(b.tree) ? Math.trunc(b.tree) : undefined
+    const tree = treeRaw && treeRaw >= 1 && treeRaw <= 10 ? treeRaw : undefined
+    const check = typeof b.check === 'string' ? b.check.trim() : undefined
+
+    let data: Record<string, number | string> | undefined
+    const dataRaw = b.data
+    if (dataRaw && typeof dataRaw === 'object' && !Array.isArray(dataRaw)) {
+      const out: Record<string, number | string> = {}
+      let n = 0
+      for (const [k, v] of Object.entries(dataRaw as Record<string, unknown>)) {
+        const kk = String(k || '').trim()
+        if (!kk) continue
+        if (n >= 50) break
+        if (typeof v === 'number' && Number.isFinite(v)) {
+          out[kk] = v
+          n++
+        } else if (typeof v === 'string') {
+          const vv = v.trim()
+          if (!vv) continue
+          out[kk] = vv
+          n++
+        }
+      }
+      if (Object.keys(out).length) data = out
+    }
+
+    const out: CalcSuggestBuff = { title }
+    if (typeof sort === 'number') out.sort = sort
+    if (typeof cons === 'number') out.cons = cons
+    if (typeof tree === 'number') out.tree = tree
+    if (check) out.check = check
+    if (data) out.data = data
+    buffsOut.push(out)
+  }
+
+  return { mainAttr, defDmgKey, details, buffs: buffsOut }
 }
 
 export async function suggestCalcPlan(
@@ -236,22 +341,73 @@ export async function suggestCalcPlan(
   input: CalcSuggestInput,
   cache?: Omit<LlmDiskCacheOptions, 'purpose'>
 ): Promise<CalcSuggestResult> {
-  const messages = buildMessages(input)
-  const text = cache
-    ? await chatWithDiskCache(llm, messages, { temperature: 0.2 }, { ...cache, purpose: 'calc-plan' })
-    : await llm.chat(messages, { temperature: 0.2 })
-  const json = parseJsonFromLlmText(text)
-  if (!json || typeof json !== 'object') {
-    throw new Error(`[meta-gen] LLM output is not an object`)
+  const messagesBase = buildMessages(input)
+  const attempts: Array<{ temperature: number; messages: ChatMessage[] }> = [
+    { temperature: 0.2, messages: messagesBase },
+    {
+      temperature: 0,
+      messages: messagesBase.concat({
+        role: 'user',
+        content:
+          '上一次输出可能不是严格 JSON。请重新输出：\n' +
+          '- 只能输出一个 JSON 对象\n' +
+          '- 所有 key 必须使用双引号\n' +
+          '- 禁止尾随逗号\n' +
+          '- 禁止输出任何 JSON 之外的文字'
+      })
+    }
+  ]
+
+  let lastErr: string | undefined
+  for (let i = 0; i < attempts.length; i++) {
+    const { temperature, messages } = attempts[i]!
+
+    const text = cache
+      ? await chatWithDiskCacheValidated(
+          llm,
+          messages,
+          { temperature },
+          { ...cache, purpose: `calc-plan.v2.${i}` },
+          (t) => {
+            try {
+              const json = parseJsonFromLlmText(t)
+              if (!json || typeof json !== 'object') return false
+              const plan = json as Partial<CalcSuggestResult>
+              const parsed: CalcSuggestResult = {
+                mainAttr: typeof plan.mainAttr === 'string' ? plan.mainAttr : '',
+                defDmgKey: typeof plan.defDmgKey === 'string' ? plan.defDmgKey : undefined,
+                details: Array.isArray(plan.details) ? (plan.details as any) : [],
+                buffs: Array.isArray((plan as any).buffs) ? ((plan as any).buffs as any) : []
+              }
+              validatePlan(input, parsed)
+              return true
+            } catch {
+              return false
+            }
+          }
+        )
+      : await llm.chat(messages, { temperature })
+
+    try {
+      const json = parseJsonFromLlmText(text)
+      if (!json || typeof json !== 'object') {
+        throw new Error(`[meta-gen] LLM output is not an object`)
+      }
+
+      const plan = json as Partial<CalcSuggestResult>
+      const parsed: CalcSuggestResult = {
+        mainAttr: typeof plan.mainAttr === 'string' ? plan.mainAttr : '',
+        defDmgKey: typeof plan.defDmgKey === 'string' ? plan.defDmgKey : undefined,
+        details: Array.isArray(plan.details) ? (plan.details as any) : [],
+        buffs: Array.isArray((plan as any).buffs) ? ((plan as any).buffs as any) : []
+      }
+      return validatePlan(input, parsed)
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e)
+    }
   }
 
-  const plan = json as Partial<CalcSuggestResult>
-  const parsed: CalcSuggestResult = {
-    mainAttr: typeof plan.mainAttr === 'string' ? plan.mainAttr : '',
-    defDmgKey: typeof plan.defDmgKey === 'string' ? plan.defDmgKey : undefined,
-    details: Array.isArray(plan.details) ? (plan.details as any) : []
-  }
-  return validatePlan(input, parsed)
+  throw new Error(lastErr || `[meta-gen] LLM calc plan failed`)
 }
 
 export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, createdBy: string): string {
@@ -307,6 +463,76 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     plan.details.findIndex((d) => (d.key || d.talent) === defDmgKey)
   )
 
+  const isIdent = (k: string): boolean => /^[$A-Z_][0-9A-Z_$]*$/i.test(k)
+  const renderProp = (k: string): string => (isIdent(k) ? k : JSON.stringify(k))
+  const isFnExpr = (s: string): boolean => /=>/.test(s) || /^function\b/.test(s)
+  const wrapExpr = (expr: string): string =>
+    `({ talent, attr, calc, params, cons, weapon, trees }) => (${expr})`
+
+  const renderBuffValue = (v: unknown): string | undefined => {
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+    if (typeof v !== 'string') return undefined
+    const t = v.trim()
+    if (!t) return undefined
+    return isFnExpr(t) ? t : wrapExpr(t)
+  }
+
+  const renderBuffCheck = (v: unknown): string | undefined => {
+    if (typeof v !== 'string') return undefined
+    const t = v.trim()
+    if (!t) return undefined
+    return isFnExpr(t) ? t : wrapExpr(t)
+  }
+
+  const buffs = Array.isArray(plan.buffs) ? (plan.buffs as CalcSuggestBuff[]) : []
+  const buffsLines: string[] = []
+  if (buffs.length === 0) {
+    buffsLines.push('export const buffs = []')
+  } else {
+    buffsLines.push('export const buffs = [')
+    buffs.forEach((b, idx) => {
+      buffsLines.push('  {')
+      buffsLines.push(`    title: ${JSON.stringify(b.title)},`)
+      if (typeof b.sort === 'number' && Number.isFinite(b.sort)) {
+        buffsLines.push(`    sort: ${Math.trunc(b.sort)},`)
+      }
+      if (typeof b.cons === 'number' && Number.isFinite(b.cons)) {
+        buffsLines.push(`    cons: ${Math.trunc(b.cons)},`)
+      }
+      if (typeof b.tree === 'number' && Number.isFinite(b.tree)) {
+        buffsLines.push(`    tree: ${Math.trunc(b.tree)},`)
+      }
+
+      const check = renderBuffCheck((b as any).check)
+      if (check) {
+        buffsLines.push(`    check: ${check},`)
+      }
+
+      const dataRaw = (b as any).data
+      if (dataRaw && typeof dataRaw === 'object' && !Array.isArray(dataRaw)) {
+        const entries: Array<[string, string]> = []
+        for (const [k, v] of Object.entries(dataRaw as Record<string, unknown>)) {
+          const kk = String(k || '').trim()
+          if (!kk) continue
+          const vv = renderBuffValue(v)
+          if (!vv) continue
+          entries.push([kk, vv])
+        }
+        if (entries.length) {
+          buffsLines.push('    data: {')
+          entries.forEach(([k, v], j) => {
+            const comma = j === entries.length - 1 ? '' : ','
+            buffsLines.push(`      ${renderProp(k)}: ${v}${comma}`)
+          })
+          buffsLines.push('    }')
+        }
+      }
+
+      buffsLines.push(idx === buffs.length - 1 ? '  }' : '  },')
+    })
+    buffsLines.push(']')
+  }
+
   return [
     `// Auto-generated by ${createdBy}.`,
     detailsLines.join('\n'),
@@ -315,7 +541,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     `export const defDmgKey = ${JSON.stringify(defDmgKey)}`,
     `export const mainAttr = ${JSON.stringify(plan.mainAttr)}`,
     '',
-    'export const buffs = []',
+    buffsLines.join('\n'),
     '',
     `export const createdBy = ${JSON.stringify(createdBy)}`,
     ''

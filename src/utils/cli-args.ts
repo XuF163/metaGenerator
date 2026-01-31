@@ -51,7 +51,7 @@ function parseTypes(value: string | undefined): MetaType[] {
 
 function getHelpText(): string {
   return [
-    'meta-gen (temp/metaGenerator)',
+    'meta-gen (metaGenerator)',
     '',
     'Usage:',
     '  meta-gen gen [options]',
@@ -64,8 +64,8 @@ function getHelpText(): string {
     '  --output-root <path>     output root (default: temp/metaGenerator/.output)',
     '  --games <gs|sr|all|csv>  default: all',
     '  --types <type|all|csv>   artifact,character,material,weapon (default: all)',
-    '  --force                  gen: wipe output meta-{game} before generating',
-    '  --force-cache            gen: refresh cached upstream JSON (Hakush)',
+    '  --force                  gen: wipe output meta-{game} before generating; calc: upgrade empty auto-generated calc.js',
+    '  --force-cache            gen: refresh cached upstream JSON (Hakush); calc: bypass LLM disk cache',
     '  --force-assets           gen: re-download assets (images) if they exist',
     '  --baseline-overlay       gen: overlay baseline meta while generating (debug; default: false)',
     '  --sample-files <n>       validate: random sample file count (default from config or 800)',

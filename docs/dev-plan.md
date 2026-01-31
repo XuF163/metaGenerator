@@ -1,6 +1,7 @@
 # metaGenerator（TS）开发计划
 
-> 背景材料：`temp/metaGenerator/docs/background.md`  
+> 注：本文为早期开发计划草案，部分章节可能已实现或已过时；路径以当前仓库结构为准。  
+> 背景材料：`docs/background.md`  
 > 产物对标：`plugins/miao-plugin/resources/meta-gs`、`plugins/miao-plugin/resources/meta-sr`  
 > 实现参考：`plugins/liangshi-calc`（尤其是 `plugins/liangshi-calc/apps/new.js` 的更新思路与落盘路径）
 
@@ -8,7 +9,7 @@
 
 ### 0.1 目标（要做到什么）
 
-1) 在 `temp/metaGenerator` 下实现一个 **TypeScript** 编写的 meta 资源生成器（以下简称 *metaGenerator*）。
+1) 在本仓库实现一个 **TypeScript** 编写的 meta 资源生成器（以下简称 *metaGenerator*）。
 2) 能生成/更新喵喵面板所需的 meta 资源，目录结构与文件形态 **对标**：
    - `plugins/miao-plugin/resources/meta-gs`
    - `plugins/miao-plugin/resources/meta-sr`
@@ -132,7 +133,7 @@
 
 当前实现（已落地）：
 
-- metaGenerator 会先把**内置脚手架快照**同步到输出目录（`temp/metaGenerator/scaffold/meta-{gs|sr}` → `temp/metaGenerator/.output/meta-{gs|sr}`）
+- metaGenerator 会先把**内置脚手架快照**同步到输出目录（`scaffold/meta-{gs|sr}` → `temp/metaGenerator/.output/meta-{gs|sr}`）
   - 会覆盖低频“骨架文件”（`index.js/alias.js/extra.js/...`，以及 SR 的 `public/icons` 等）
   - **永远不会从 baseline 目录拷贝任何文件作为生成兜底**
   - **永远跳过任何 `data.json`**（`data.json` 必须由解析管线从数据源生成）
@@ -147,7 +148,7 @@
 - **会自动更新的部分**：圣遗物套装/部位名/套装效果/图片等属于高频数据，落在 `artifact/data.json` 与 `artifact/imgs/**`，由 Hakush/AnimeGameData 等数据源解析生成；只要数据源更新并触发生成（见下条），就会更新。
 - **需要人工维护的部分**：`artifact/alias.js`（别名/缩写）、`artifact/artis-mark.js`（评分权重）、`artifact/extra.js`（词条映射/ID 映射）属于“规则/体验层骨架”，通常低频变动；若游戏机制层发生变化（例如新增主词条类型/槽位规则变化），需要更新脚手架快照并随工具版本发布。
 - **缓存提醒**：metaGenerator 默认启用磁盘缓存以保证可复现；新版本数据要“自动跟随更新”，需要：
-  - 运行 `meta-gen gen --force-cache`（或在 `temp/metaGenerator/config/config.json` 中设置 `gen.forceCache=true` 让每次生成自动刷新缓存），然后再生成即可。
+  - 运行 `meta-gen gen --force-cache`（或在 `config/config.json` 中设置 `gen.forceCache=true` 让每次生成自动刷新缓存），然后再生成即可。
 
 ---
 
@@ -211,7 +212,7 @@
 
 ### 3.1 工程形态（建议）
 
-- `temp/metaGenerator` 作为独立工具工程（ESM + TS），提供：
+- 本项目作为独立工具工程（ESM + TS），提供：
   - CLI：本地一键生成/更新
   - 可选：提供“库模式”供 bot 指令/定时任务调用
 - 目标语言统一 TS：
@@ -283,7 +284,7 @@
 
 建议缓存到：
 
-- `temp/metaGenerator/.cache/<source>/<game>/...`
+- `.cache/<source>/<game>/...`
 
 策略：
 
@@ -397,8 +398,8 @@
 
 ### 7.2 配置文件（建议）
 
-- 位置：`temp/metaGenerator/config/config.yaml`（用户私有，git 忽略）
-- 模板：`temp/metaGenerator/config/config.example.yaml`
+- 位置：`config/config.json`（用户私有，git 忽略）
+- 模板：`config/config.example.json`
 - 通过 env 覆盖敏感项：`META_LLM_API_KEY` 等
 
 关键配置项：
@@ -463,7 +464,7 @@
 2) **git 覆盖生成物**：local 模式 + 文件所有权分离
 3) **LLM 幻觉/不一致**：强制 JSON + schema 校验 + 与参数表对齐 + 失败回退
 4) **文本/编码/富文本差异**：统一 UTF-8；对 `<br>`/HTML 做规范化；保留原始文本快照便于 diff
-5) **图片缺失/格式不一致**：下载重试 + 不创建占位图（仅记录 `temp/metaGenerator/logs/`）+ 报告缺失清单
+5) **图片缺失/格式不一致**：下载重试 + 不创建占位图（仅记录 `logs/`）+ 报告缺失清单
 6) **全量生成耗时**：增量策略 + 并发控制 + 分游戏/分类型拆分
 
 ---

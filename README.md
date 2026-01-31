@@ -3,19 +3,46 @@
 支持自托管的miao-plugin meta 资源生成工具    
 
 > [!CAUTION]
-> 本项目尚处于开发阶段,无法保证与你所用分支字段完全对齐    
+> 本项目仍处于快速迭代阶段，无法保证与你所用分支/基线的字段 100% 对齐。
 
 ## 安装
 
 在仓库根目录执行：
 
 ```powershell
-cd temp/metaGenerator
 npm i
 npm run build
 ```
 
-### 1) 生成
+## 配置（可选）
+
+复制示例配置（`config/config.json` 已被 `.gitignore` 忽略，仅用于本地）：
+
+```powershell
+Copy-Item config/config.example.json config/config.json
+```
+
+常用目录（默认）：
+- 输出：`temp/metaGenerator/.output/`
+- 缓存：`.cache/`
+- 日志：`logs/`
+- 对标报告：`reports/`
+
+### 代理（可选）
+
+如需走本地 HTTP 代理（例如 Clash 10809）：
+
+```json
+{
+  "network": { "httpProxy": "http://127.0.0.1:10809" }
+}
+```
+
+### LLM（可选，用于 calc.js）
+
+详见：`docs/llmapi.md`
+
+## 生成 meta
 
 ```powershell
 node dist/cli.js gen
@@ -31,6 +58,25 @@ node dist/cli.js gen --force-cache
 
 
 ```
+
+## 生成/升级角色 calc.js（LLM 可选）
+
+```powershell
+node dist/cli.js calc --games gs,sr
+```
+
+说明：
+- 启用 LLM：设置 `config/config.json` 的 `llm.enabled=true`，并配置 `llm.model` + key（推荐 env；见 `docs/llmapi.md`）。
+- `--force`：会升级“自动生成但 `buffs=[]`”的 calc.js（用于补齐 buffs）。
+- `--force-cache`：绕过 `.cache/llm`，强制重新请求 LLM。
+
+## 对标验证（baseline parity）
+
+```powershell
+node dist/cli.js validate --games gs,sr --types all --full
+```
+
+- `baselineRoot`：指向基线 meta 根目录（例如 `plugins/miao-plugin/resources` 或本地 clone 的 `temp/metaBaselineRef`）。
 
 ## 致谢
 metaGenerator 的开发参考、引用、借鉴了以下项目，在此致谢：

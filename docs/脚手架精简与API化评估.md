@@ -1,6 +1,6 @@
 # 脚手架（scaffold）还能怎么简化/改为 API 生成？（GS + SR）
 
-本文面向 `temp/metaGenerator/scaffold`，目标是：**让脚手架只承担“可运行骨架”职责**，把“高频变动/可推导的数据”尽量交给 `meta-gen gen` 从数据源 **现场生成**（必要时可用 LLM 辅助解析），从而降低维护成本并提高版本自适应能力。
+本文面向 `scaffold/`，目标是：**让脚手架只承担“可运行骨架”职责**，把“高频变动/可推导的数据”尽量交给 `meta-gen gen` 从数据源 **现场生成**（必要时可用 LLM 辅助解析），从而降低维护成本并提高版本自适应能力。
 
 > 约束重申：**严禁**用基线 meta（`plugins/miao-plugin/resources/meta-*` 或 `resources/fuck_qsyhh/...`）做生成兜底；基线仅用于 `validate` 对比查漏。
 
