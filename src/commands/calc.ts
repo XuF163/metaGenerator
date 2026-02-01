@@ -280,39 +280,92 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
     const weapon = typeof metaRaw.weapon === 'string' ? (metaRaw.weapon as string) : ''
     const star = typeof metaRaw.star === 'number' && Number.isFinite(metaRaw.star) ? (metaRaw.star as number) : 0
 
-    const tables = game === 'gs' ? getGsTables(metaRaw) : game === 'sr' ? getSrTables(metaRaw) : null
-    if (!tables) return
+	    const tables = game === 'gs' ? getGsTables(metaRaw) : game === 'sr' ? getSrTables(metaRaw) : null
+	    if (!tables) return
 
-    const talentDesc: Partial<Record<'a' | 'e' | 'q' | 't', string>> = {}
-    const tableUnits: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
-    const talentRaw = isRecord(metaRaw.talent) ? (metaRaw.talent as Record<string, unknown>) : null
-    if (talentRaw) {
-      for (const k of ['a', 'e', 'q', 't'] as const) {
-        const blk = talentRaw[k]
-        if (!isRecord(blk)) continue
+	    const talentDesc: Partial<Record<'a' | 'e' | 'q' | 't', string>> = {}
+	    const tableUnits: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
+	    const tableSamples: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, unknown>>> = {}
+	    const tableTextSamples: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
+	    const tableTextByName: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
+	    const talentRaw = isRecord(metaRaw.talent) ? (metaRaw.talent as Record<string, unknown>) : null
+	    if (talentRaw) {
+	      for (const k of ['a', 'e', 'q', 't'] as const) {
+	        const blk = talentRaw[k]
+	        if (!isRecord(blk)) continue
         const desc = (blk as Record<string, unknown>).desc
         if (typeof desc === 'string') talentDesc[k] = desc
         else if (Array.isArray(desc)) talentDesc[k] = desc.filter((x) => typeof x === 'string').join('\n')
 
-        const tablesRaw = (blk as Record<string, unknown>).tables
-        const out: Record<string, string> = {}
-        const pushTable = (t: unknown): void => {
-          if (!isRecord(t)) return
-          const name = typeof t.name === 'string' ? t.name.trim() : ''
-          if (!name || name in out) return
-          let unit = typeof t.unit === 'string' ? t.unit : ''
-          unit = unit.trim()
-          if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
-          out[name] = unit
-        }
-        if (Array.isArray(tablesRaw)) {
-          for (const t of tablesRaw) pushTable(t)
-        } else if (isRecord(tablesRaw)) {
-          for (const t of Object.values(tablesRaw)) pushTable(t)
-        }
-        if (Object.keys(out).length) tableUnits[k] = out
-      }
-    }
+	        const tablesRaw = (blk as Record<string, unknown>).tables
+	        const outUnits: Record<string, string> = {}
+	        const outText: Record<string, string> = {}
+	        const pushTable = (t: unknown): void => {
+	          if (!isRecord(t)) return
+	          const name = typeof t.name === 'string' ? t.name.trim() : ''
+	          if (!name || name in outUnits) return
+	          let unit = typeof t.unit === 'string' ? t.unit : ''
+	          unit = unit.trim()
+	          if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
+	          outUnits[name] = unit
+
+	          const values = (t as any).values
+	          if (Array.isArray(values) && values.length) {
+	            const v0 = values[0]
+	            const sampleText = normalizeTextInline(v0)
+	            if (sampleText) outText[name] = sampleText
+	          }
+	        }
+	        if (Array.isArray(tablesRaw)) {
+	          for (const t of tablesRaw) pushTable(t)
+	        } else if (isRecord(tablesRaw)) {
+	          for (const t of Object.values(tablesRaw)) pushTable(t)
+	        }
+	        if (Object.keys(outUnits).length) tableUnits[k] = outUnits
+	        if (Object.keys(outText).length) tableTextByName[k] = outText
+	      }
+	    }
+
+    // Provide sample values (only for non-scalar tables) to help the LLM distinguish array-typed tables.
+	    const talentDataRaw = isRecord(metaRaw.talentData) ? (metaRaw.talentData as Record<string, unknown>) : null
+	    if (talentDataRaw) {
+	      for (const k of ['a', 'e', 'q', 't'] as const) {
+	        const blk = talentDataRaw[k]
+	        if (!isRecord(blk)) continue
+	        const out: Record<string, unknown> = {}
+	        const outText: Record<string, string> = {}
+	        for (const [name, values] of Object.entries(blk)) {
+	          if (typeof name !== 'string' || !name.trim()) continue
+	          if (!Array.isArray(values) || values.length === 0) continue
+	          const sample = values[0]
+	          if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
+	            out[name] = sample
+
+	            const textMap = tableTextByName[k]
+	            if (textMap) {
+	              const baseName = name.endsWith('2') ? name.slice(0, -1) : name
+	              const txt = textMap[name] || textMap[baseName] || ''
+	              if (txt) outText[name] = txt
+	            }
+	          }
+	        }
+
+	        // Also provide text samples for scalar tables that carry extra semantics (multi-hit `*2`, mixed parts `+`),
+	        // so the LLM can avoid picking wrong `...2` variants.
+	        const textMapAll = tableTextByName[k]
+	        if (textMapAll) {
+	          for (const [name, txt] of Object.entries(textMapAll)) {
+	            if (!name || typeof txt !== 'string') continue
+	            const t = txt.trim()
+	            if (!t) continue
+	            if (!/[*+]/.test(t)) continue
+	            if (!(name in outText)) outText[name] = t
+	          }
+	        }
+	        if (Object.keys(out).length) tableSamples[k] = out
+	        if (Object.keys(outText).length) tableTextSamples[k] = outText
+	      }
+	    }
 
     const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
       llm,
@@ -322,11 +375,13 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
         elem,
         weapon,
         star,
-        tables,
-        tableUnits,
-        talentDesc,
-        buffHints: buildBuffHints(game, metaRaw)
-      },
+	        tables,
+	        tableUnits,
+	        tableSamples,
+	        tableTextSamples,
+	        talentDesc,
+	        buffHints: buildBuffHints(game, metaRaw)
+	      },
       { cacheRootAbs: llmCacheRootAbs, force: options.forceCache }
     )
 

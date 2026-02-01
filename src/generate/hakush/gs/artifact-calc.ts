@@ -15,6 +15,8 @@ type Buff = {
   title: string
   isStatic?: boolean
   elem?: string
+  sort?: number
+  check?: unknown
   data: Record<string, unknown>
 }
 
@@ -49,7 +51,7 @@ function mkStatic(title: string, key: string, value: number, extra?: Pick<Buff, 
   }
 }
 
-function mkBuff(title: string, data: Record<string, unknown>, extra?: Pick<Buff, 'elem'>): Buff {
+function mkBuff(title: string, data: Record<string, unknown>, extra?: Partial<Pick<Buff, 'elem' | 'sort' | 'check'>>): Buff {
   return {
     title,
     ...(extra ?? {}),
@@ -71,13 +73,71 @@ function parseElementCn(s: string): ElementCn | null {
  * Parse a single bonus text into a buff object.
  * Returns null if we cannot deterministically map it into miao-plugin keys.
  */
-export function parseGsArtifactBonus(textRaw: string, need: number): Buff | null {
+export function parseGsArtifactBonus(setName: string, textRaw: string, need: number): Buff | null {
   const text = normalize(textRaw)
   if (!text) return null
 
+  // ----- Explicit compat patches (align with baseline runtime assumptions) -----
+  if (need === 4) {
+    if (setName === '逐影猎人') {
+      // Baseline assumes full stacks (3*12%).
+      return mkBuff(textRaw, { cpct: 36 })
+    }
+    if (setName === '黑曜秘典') {
+      // Baseline expects Nightsoul state to be enabled by defParams for Natlan characters.
+      return mkBuff(
+        textRaw,
+        { cpct: 40 },
+        {
+          check: ({ params }: any) => params?.Nightsoul === true
+        }
+      )
+    }
+    if (setName === '黄金剧团') {
+      // Baseline implements the official +25% on-field / +50% off-field extra skill bonus.
+      return mkBuff(textRaw, {
+        eDmg: ({ params }: any) => (params?.off_field === false ? 25 : 50)
+      })
+    }
+    if (setName === '烬城勇者绘卷') {
+      // 12% (normal) + extra 28% when Nightsoul => 40%.
+      return mkBuff(textRaw, {
+        dmg: ({ params }: any) => (params?.Nightsoul === true ? 40 : 12)
+      })
+    }
+    if (setName === '纺月的夜歌') {
+      return mkBuff(textRaw, {
+        mastery: ({ params }: any) => Math.min((Number(params?.Moonsign || 0) || 0) * 60, 120),
+        lunarCharged: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10,
+        lunarBloom: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10,
+        lunarCrystallize: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10
+      })
+    }
+    if (setName === '穹境示现之夜') {
+      return mkBuff(textRaw, {
+        cpct: ({ params }: any) => Math.min((Number(params?.Moonsign || 0) || 0) * 15, 30),
+        lunarCharged: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10,
+        lunarBloom: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10,
+        lunarCrystallize: ({ params }: any) => (Number(params?.['月辉明光'] || 1) || 1) * 10
+      })
+    }
+    if (setName === '晨星与月的晓歌') {
+      return mkBuff(textRaw, {
+        lunarCharged: ({ params }: any) => (Number(params?.Moonsign || 0) >= 3 ? 60 : 20),
+        lunarBloom: ({ params }: any) => (Number(params?.Moonsign || 0) >= 3 ? 60 : 20),
+        lunarCrystallize: ({ params }: any) => (Number(params?.Moonsign || 0) >= 3 ? 60 : 20)
+      })
+    }
+  }
+
+  // ----- Stacking crit patterns -----
+  // e.g. "暴击率提高12%，...至多叠加3次"
+  let m = text.match(/暴击率(?:提高|提升)(\d+(?:\.\d+)?)%.*?至多叠加(\d+)次/)
+  if (m) return mkBuff(textRaw, { cpct: num(m[1]) * num(m[2]) })
+
   // ----- Crit patterns (skill-specific) -----
   // NOTE: must come before generic "暴击率提高" to avoid mis-classifying charged crit bonuses.
-  let m = text.match(/重击的暴击率(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  m = text.match(/重击的暴击率(?:提高|提升)(\d+(?:\.\d+)?)%/)
   if (m) return mkBuff(textRaw, { a2Cpct: num(m[1]) })
 
   m = text.match(/(?:普通攻击|普攻)的暴击率(?:提高|提升)(\d+(?:\.\d+)?)%/)
@@ -86,8 +146,38 @@ export function parseGsArtifactBonus(textRaw: string, need: number): Buff | null
   m = text.match(/元素爆发的暴击率(?:提高|提升)(\d+(?:\.\d+)?)%/)
   if (m) return mkBuff(textRaw, { qCpct: num(m[1]) })
 
+  // Generic crit rate bonus (4-piece often).
+  if (need > 2) {
+    m = text.match(/暴击率(?:提高|提升)(\d+(?:\.\d+)?)%/)
+    if (m) {
+      const extra: Partial<Pick<Buff, 'check'>> = {}
+      if (text.includes('夜魂')) {
+        extra.check = ({ params }: any) => params?.Nightsoul === true
+      }
+      return mkBuff(textRaw, { cpct: num(m[1]) }, extra)
+    }
+  }
+
   // ----- Simple dmg/crit bonuses (shown in buff list) -----
   // Normal/charged/skill/burst dmg bonus
+  m = text.match(/普通攻击和元素爆发造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { aDmg: num(m[1]), qDmg: num(m[1]) })
+
+  m = text.match(/普通攻击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%.*?元素爆发造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { aDmg: num(m[1]), qDmg: num(m[2]) })
+
+  m = text.match(/普通攻击、重击、下落攻击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { aDmg: num(m[1]), a2Dmg: num(m[1]), a3Dmg: num(m[1]) })
+
+  m = text.match(/(?:普通攻击|普攻)与下落攻击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { aDmg: num(m[1]), a3Dmg: num(m[1]) })
+
+  m = text.match(/重击与下落攻击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { a2Dmg: num(m[1]), a3Dmg: num(m[1]) })
+
+  m = text.match(/下落攻击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { a3Dmg: num(m[1]) })
+
   m = text.match(/(?:普通攻击|普攻)与重击造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
   if (m) return mkBuff(textRaw, { aDmg: num(m[1]), a2Dmg: num(m[1]) })
 
@@ -102,6 +192,10 @@ export function parseGsArtifactBonus(textRaw: string, need: number): Buff | null
 
   m = text.match(/元素爆发造成的伤害(?:提高|提升)(\d+(?:\.\d+)?)%/)
   if (m) return mkBuff(textRaw, { qDmg: num(m[1]) })
+
+  // Generic element dmg bonus (no element specified).
+  m = text.match(/元素伤害加成(?:提高|提升)(\d+(?:\.\d+)?)%/)
+  if (m) return mkBuff(textRaw, { dmg: num(m[1]) })
 
   // Generic "damage +X%" (ambiguous, but baseline uses `dmg` for some sets)
   m = text.match(/造成的伤害(?:增加|提高|提升)(\d+(?:\.\d+)?)%/)
@@ -156,11 +250,23 @@ function renderBuff(buff: Buff): string {
   const lines: string[] = []
   lines.push('{')
   lines.push(`  title: ${JSON.stringify(buff.title)},`)
+  if (typeof buff.sort === 'number' && Number.isFinite(buff.sort)) lines.push(`  sort: ${Math.trunc(buff.sort)},`)
+  if (buff.check) lines.push(`  check: ${renderJsValue(buff.check)},`)
   if (buff.isStatic) lines.push('  isStatic: true,')
   if (buff.elem) lines.push(`  elem: ${JSON.stringify(buff.elem)},`)
   lines.push(`  data: ${renderDataObject(buff.data, 2)}`)
   lines.push('}')
   return lines.join('\n')
+}
+
+function renderJsValue(v: unknown): string {
+  if (typeof v === 'string') return JSON.stringify(v)
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '0'
+  if (typeof v === 'boolean') return v ? 'true' : 'false'
+  if (v === null) return 'null'
+  if (typeof v === 'function') return String(v)
+  // Fallback: stringify (keeps file loadable).
+  return JSON.stringify(v)
 }
 
 function renderDataObject(data: Record<string, unknown>, indentLevel: number): string {
@@ -171,7 +277,7 @@ function renderDataObject(data: Record<string, unknown>, indentLevel: number): s
 
   const lines: string[] = ['{']
   for (const [k, v] of entries) {
-    lines.push(`${innerIndent}${k}: ${typeof v === 'string' ? JSON.stringify(v) : String(v)},`)
+    lines.push(`${innerIndent}${k}: ${renderJsValue(v)},`)
   }
   lines.push(`${indent}}`)
   return lines.join('\n')
@@ -187,7 +293,7 @@ export function buildGsArtifactCalcJs(sets: ArtifactSetSkills[]): string {
       if (!Number.isFinite(need) || need <= 0) continue
       if (typeof v !== 'string' || !v.trim()) continue
 
-      const buff = parseGsArtifactBonus(v, need)
+      const buff = parseGsArtifactBonus(s.setName, v, need)
       if (!buff) continue
       parsed[need] = buff
     }

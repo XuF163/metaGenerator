@@ -744,10 +744,10 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const calcPath = path.join(elemDir, 'calc.js')
         ensurePlaceholderCalcJs(calcPath, `旅行者/${elem}`)
 
-        if (giTalent && isPlaceholderCalc(calcPath)) {
-          const aTables = Object.keys(giTalent.talentData.a || {}).filter(Boolean)
-          const eTables = Object.keys(giTalent.talentData.e || {}).filter(Boolean)
-          const qTables = Object.keys(giTalent.talentData.q || {}).filter(Boolean)
+	    if (giTalent && isPlaceholderCalc(calcPath)) {
+	      const aTables = Object.keys(giTalent.talentData.a || {}).filter(Boolean)
+	      const eTables = Object.keys(giTalent.talentData.e || {}).filter(Boolean)
+	      const qTables = Object.keys(giTalent.talentData.q || {}).filter(Boolean)
           const getDesc = (k: 'a' | 'e' | 'q'): string => {
             const blk = (giTalent.talent as any)?.[k]
             const desc = blk ? (blk as any).desc : null
@@ -755,10 +755,10 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
             if (Array.isArray(desc)) return desc.filter((x) => typeof x === 'string').join('\n')
             return ''
           }
-          const getUnitMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
-            const blk = (giTalent.talent as any)?.[k]
-            const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
-            const out: Record<string, string> = {}
+		      const getUnitMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+	            const blk = (giTalent.talent as any)?.[k]
+	            const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+	            const out: Record<string, string> = {}
             for (const t of tables) {
               if (!t || typeof t !== 'object') continue
               const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
@@ -768,19 +768,73 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
               if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
               out[name] = unit
             }
-            return out
-          }
-          const input: CalcSuggestInput = {
-            game: 'gs',
-            name: `旅行者/${elem}`,
-            elem,
-            weapon,
-            star,
-            tables: { a: aTables, e: eTables, q: qTables },
-            tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
-            talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
-            buffHints: buildGsCalcBuffHints(passiveOut, consData)
-          }
+	            return out
+	          }
+
+	          const tableSamples: Partial<Record<'a' | 'e' | 'q', Record<string, unknown>>> = {}
+	          const tableTextSamples: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+	          const tableTextByName: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+
+	          const buildSamples = (k: 'a' | 'e' | 'q'): Record<string, unknown> => {
+	            const blk = (giTalent.talentData as any)?.[k]
+	            if (!blk || typeof blk !== 'object') return {}
+	            const out: Record<string, unknown> = {}
+	            for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
+	              if (typeof name !== 'string' || !name.trim()) continue
+	              if (!Array.isArray(values) || values.length === 0) continue
+	              const sample = (values as any[])[0]
+	              if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
+	                out[name] = sample
+	              }
+	            }
+	            return out
+	          }
+	          const buildTextMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+	            const blk = (giTalent.talent as any)?.[k]
+	            const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+	            const out: Record<string, string> = {}
+	            for (const t of tables) {
+	              if (!t || typeof t !== 'object') continue
+	              const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+	              if (!name || name in out) continue
+	              const values = (t as any).values
+	              if (Array.isArray(values) && values.length) {
+	                const sampleText = normalizeTextInline(values[0])
+	                if (sampleText) out[name] = sampleText
+	              }
+	            }
+	            return out
+	          }
+
+	          tableTextByName.a = buildTextMap('a')
+	          tableTextByName.e = buildTextMap('e')
+	          tableTextByName.q = buildTextMap('q')
+	          for (const k of ['a', 'e', 'q'] as const) {
+	            const s = buildSamples(k)
+	            if (Object.keys(s).length) tableSamples[k] = s
+	            const textMap = tableTextByName[k]
+	            if (!textMap || typeof textMap !== 'object') continue
+	            const outT: Record<string, string> = {}
+	            for (const name of Object.keys(s)) {
+	              const baseName = name.endsWith('2') ? name.slice(0, -1) : name
+	              const txt = textMap[name] || textMap[baseName] || ''
+	              if (txt) outT[name] = txt
+	            }
+	            if (Object.keys(outT).length) tableTextSamples[k] = outT
+	          }
+	          const input: CalcSuggestInput = {
+	            game: 'gs',
+	            name: `旅行者/${elem}`,
+	            elem,
+	            weapon,
+	            star,
+	            tables: { a: aTables, e: eTables, q: qTables },
+	            tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
+	            tableSamples,
+	            tableTextSamples,
+	            talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
+	            buffHints: buildGsCalcBuffHints(passiveOut, consData)
+	          }
 
           if (llm && calcJobs) {
             // LLM calls are slow; defer and batch with concurrency at the end.
@@ -1276,6 +1330,58 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         }
         return out
       }
+
+      const tableSamples: Partial<Record<'a' | 'e' | 'q', Record<string, unknown>>> = {}
+      const tableTextSamples: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+      const tableTextByName: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+
+      const buildSamples = (k: 'a' | 'e' | 'q'): Record<string, unknown> => {
+        const blk = (giTalent.talentData as any)?.[k]
+        if (!blk || typeof blk !== 'object') return {}
+        const out: Record<string, unknown> = {}
+        for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
+          if (typeof name !== 'string' || !name.trim()) continue
+          if (!Array.isArray(values) || values.length === 0) continue
+          const sample = (values as any[])[0]
+          if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
+            out[name] = sample
+          }
+        }
+        return out
+      }
+      const buildTextMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+        const blk = (giTalent.talent as any)?.[k]
+        const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+        const out: Record<string, string> = {}
+        for (const t of tables) {
+          if (!t || typeof t !== 'object') continue
+          const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+          if (!name || name in out) continue
+          const values = (t as any).values
+          if (Array.isArray(values) && values.length) {
+            const sampleText = normalizeTextInline(values[0])
+            if (sampleText) out[name] = sampleText
+          }
+        }
+        return out
+      }
+
+      tableTextByName.a = buildTextMap('a')
+      tableTextByName.e = buildTextMap('e')
+      tableTextByName.q = buildTextMap('q')
+      for (const k of ['a', 'e', 'q'] as const) {
+        const s = buildSamples(k)
+        if (Object.keys(s).length) tableSamples[k] = s
+        const textMap = tableTextByName[k]
+        if (!textMap || typeof textMap !== 'object') continue
+        const outT: Record<string, string> = {}
+        for (const name of Object.keys(s)) {
+          const baseName = name.endsWith('2') ? name.slice(0, -1) : name
+          const txt = textMap[name] || textMap[baseName] || ''
+          if (txt) outT[name] = txt
+        }
+        if (Object.keys(outT).length) tableTextSamples[k] = outT
+      }
       const input: CalcSuggestInput = {
         game: 'gs',
         name,
@@ -1284,6 +1390,8 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         star,
         tables: { a: aTables, e: eTables, q: qTables },
         tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
+        tableSamples,
+        tableTextSamples,
         talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
         buffHints: buildGsCalcBuffHints(passiveOut, consData)
       }
@@ -2117,20 +2225,76 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
           if (!unit) unit = inferUnitHintFromTableValues((t as any).values)
           out[name] = unit
         }
-        return out
-      }
+	        return out
+	      }
 
-      const input: CalcSuggestInput = {
-        game: 'gs',
-        name,
-        elem,
-        weapon,
-        star,
-        tables: { a: aTables, e: eTables, q: qTables },
-        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
-        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
-        buffHints: buildGsCalcBuffHints(passiveOut, consData)
-      }
+	      // Provide LLM with samples for structured tables (arrays/objects) and a human-readable hint
+	      // (derived from the corresponding non-2 table values) to interpret array components.
+	      const tableSamples: Partial<Record<'a' | 'e' | 'q', Record<string, unknown>>> = {}
+	      const tableTextSamples: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+	      const tableTextByName: Partial<Record<'a' | 'e' | 'q', Record<string, string>>> = {}
+
+	      const buildSamples = (k: 'a' | 'e' | 'q'): Record<string, unknown> => {
+	        const blk = (giTalent.talentData as any)?.[k]
+	        if (!blk || typeof blk !== 'object') return {}
+	        const out: Record<string, unknown> = {}
+	        for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
+	          if (typeof name !== 'string' || !name.trim()) continue
+	          if (!Array.isArray(values) || values.length === 0) continue
+	          const sample = (values as any[])[0]
+	          if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
+	            out[name] = sample
+	          }
+	        }
+	        return out
+	      }
+	      const buildTextMap = (k: 'a' | 'e' | 'q'): Record<string, string> => {
+	        const blk = (giTalent.talent as any)?.[k]
+	        const tables = blk && Array.isArray((blk as any).tables) ? ((blk as any).tables as Array<unknown>) : []
+	        const out: Record<string, string> = {}
+	        for (const t of tables) {
+	          if (!t || typeof t !== 'object') continue
+	          const name = typeof (t as any).name === 'string' ? ((t as any).name as string).trim() : ''
+	          if (!name || name in out) continue
+	          const values = (t as any).values
+	          if (Array.isArray(values) && values.length) {
+	            const sampleText = normalizeTextInline(values[0])
+	            if (sampleText) out[name] = sampleText
+	          }
+	        }
+	        return out
+	      }
+
+	      tableTextByName.a = buildTextMap('a')
+	      tableTextByName.e = buildTextMap('e')
+	      tableTextByName.q = buildTextMap('q')
+	      for (const k of ['a', 'e', 'q'] as const) {
+	        const s = buildSamples(k)
+	        if (Object.keys(s).length) tableSamples[k] = s
+	        const textMap = tableTextByName[k]
+	        if (!textMap || typeof textMap !== 'object') continue
+	        const outT: Record<string, string> = {}
+	        for (const name of Object.keys(s)) {
+	          const baseName = name.endsWith('2') ? name.slice(0, -1) : name
+	          const txt = textMap[name] || textMap[baseName] || ''
+	          if (txt) outT[name] = txt
+	        }
+	        if (Object.keys(outT).length) tableTextSamples[k] = outT
+	      }
+
+	      const input: CalcSuggestInput = {
+	        game: 'gs',
+	        name,
+	        elem,
+	        weapon,
+	        star,
+	        tables: { a: aTables, e: eTables, q: qTables },
+	        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q') },
+	        tableSamples,
+	        tableTextSamples,
+	        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q') },
+	        buffHints: buildGsCalcBuffHints(passiveOut, consData)
+	      }
 
       if (opts.llm) {
         // LLM calls are slow; defer and batch with concurrency at the end.
