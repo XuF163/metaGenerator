@@ -30,7 +30,7 @@ Copy-Item config/config.example.json config/config.json
 
 ### 代理（可选）
 
-如需走本地 HTTP 代理（例如 Clash 10809）：
+如需走本地 HTTP 代理：
 
 ```json
 {
