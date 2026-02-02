@@ -136,8 +136,14 @@ function buildBuffHints(game: Game, meta: Record<string, unknown>): string[] {
   if (game === 'gs') {
     const isCombatLike = (s: string): boolean =>
       /(伤害|攻击|防御|生命|暴击|元素|精通|充能|治疗|护盾|抗性|穿透|提高|提升|降低|增加|减少|\d|%)/.test(s)
-    const isNonCombat = (s: string): boolean =>
-      /(探索派遣|派遣任务|烹饪|合成|制作|锻造|加工|采集|钓鱼)/.test(s)
+    const isNonCombat = (s: string): boolean => {
+      // Avoid dropping combat passives that happen to mention skill names like "低温烹饪".
+      if (/(探索派遣|派遣任务|采集|钓鱼)/.test(s)) return true
+      // Typical truly non-combat passives: "完美烹饪/合成/锻造/制作/加工...时..."
+      if (/(完美|额外).{0,8}(烹饪|合成|制作|锻造|加工)/.test(s)) return true
+      if (/(烹饪|合成|制作|锻造|加工).{0,8}(时|后)/.test(s) && !isCombatLike(s)) return true
+      return false
+    }
 
     const passiveRaw = Array.isArray(meta.passive) ? (meta.passive as Array<unknown>) : []
     for (const p of passiveRaw) {

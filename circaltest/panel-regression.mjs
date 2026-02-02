@@ -97,7 +97,7 @@ function diffRuns(baseline, generated) {
     let t = String(s || "").trim()
     if (!t) return ""
     // Remove common separators/punctuations.
-    t = t.replace(/\s+/g, "").replace(/[·•・\-_—–()（）【】\[\]]/g, "")
+    t = t.replace(/\s+/g, "").replace(/[·•・?？、，,。．：:；;!！…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, "")
 
     // Normalize common skill prefixes (baseline vs generated titles).
     t = t
@@ -111,6 +111,12 @@ function diffRuns(baseline, generated) {
 
     // Strip generic words to improve matching.
     t = t.replace(/技能/g, "").replace(/伤害/g, "")
+
+    // Normalize common heal wording (baseline vs generated).
+    t = t.replace(/持续治疗/g, "每跳治疗")
+
+    // Some baseline rows use "短E后..." while generated rows may use "E后..." (or vice versa).
+    t = t.replace(/短E后/g, "E后")
 
     // De-dup repeated markers introduced by normalization (e.g. "Q爆发..." -> "QQ...").
     t = t.replace(/E{2,}/g, "E").replace(/Q{2,}/g, "Q").replace(/A{2,}/g, "A")
@@ -155,6 +161,12 @@ function diffRuns(baseline, generated) {
         if (!gn) continue
         if (gn === bn) return it
         if (gn.includes(bn) || bn.includes(gn)) {
+          // Avoid over-matching long baseline titles to generic generated titles like "A一段".
+          // This keeps the diff honest: if the generated meta doesn't have the specific row,
+          // we prefer showing it as missing rather than matching an unrelated short row.
+          const long = bn.length >= gn.length ? bn : gn
+          const short = bn.length >= gn.length ? gn : bn
+          if (short.length <= 3 && long.length >= 8) continue
           const dist = Math.abs(gn.length - bn.length)
           if (!best || dist < best.dist) best = { ...it, dist }
         }
