@@ -9,6 +9,12 @@ config/config.json
 .ace-tool/
 temp/
 
+# Local miao-plugin checkout / baseline (do NOT commit)
+plugins/
+
+# Real-user local datasets (do NOT commit)
+testData/
+
 # circaltest artifacts (sandbox clone + evidence outputs)
 circaltest/.sandbox/
 circaltest/evidence/

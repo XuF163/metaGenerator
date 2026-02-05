@@ -39,6 +39,13 @@ function toAbs(repoRoot, p) {
   return path.isAbsolute(p) ? p : path.resolve(repoRoot, p)
 }
 
+function tryInferUidFromPath(p) {
+  const base = path.basename(String(p || ""), path.extname(String(p || "")))
+  // Most datasets are stored as "<uid>.json". Keep it lenient: digits only.
+  if (/^\d{6,}$/.test(base)) return base
+  return ""
+}
+
 async function fetchJsonWithRetry(url, { proxy, userAgent, retries = 3, timeoutMs = 30_000 }) {
   const dispatcher = proxy ? new ProxyAgent(proxy) : undefined
   let lastErr = null
@@ -104,7 +111,6 @@ function diffRuns(baseline, generated) {
       .replace(/元素战技/g, "E")
       .replace(/战技/g, "E")
       .replace(/元素爆发/g, "Q")
-      .replace(/爆发/g, "Q")
       .replace(/终结技/g, "Q")
       .replace(/普通攻击/g, "A")
       .replace(/普攻/g, "A")
@@ -114,12 +120,21 @@ function diffRuns(baseline, generated) {
 
     // Normalize common heal wording (baseline vs generated).
     t = t.replace(/持续治疗/g, "每跳治疗")
+    // Some generated rows use "领域发动治疗" to mean the burst-cast heal (baseline: "爆发治疗").
+    t = t.replace(/领域发动治疗/g, "爆发治疗")
 
     // Some baseline rows use "短E后..." while generated rows may use "E后..." (or vice versa).
     t = t.replace(/短E后/g, "E后")
 
     // De-dup repeated markers introduced by normalization (e.g. "Q爆发..." -> "QQ...").
     t = t.replace(/E{2,}/g, "E").replace(/Q{2,}/g, "Q").replace(/A{2,}/g, "A")
+    return t
+  }
+  const normTitleLoose = (s) => {
+    const t = normTitle(s)
+    // Some baseline titles prefix a skill marker ("Q梦想一刀..."), while generated titles may omit it.
+    // Strip a single leading marker only when the remaining title is still informative.
+    if (t.length > 1 && /^[EQA]/.test(t)) return t.slice(1)
     return t
   }
 
@@ -148,39 +163,78 @@ function diffRuns(baseline, generated) {
     const entries = []
     let worst = { ratio: 1, abs: 0, title: "" }
 
-    // Match rows by normalized titles first (baseline-oriented), then append any generated-only rows.
-    const gList = gRet.map((r, idx) => ({ r, idx, norm: normTitle(r?.title) }))
-    const usedG = new Set()
-
-    const pickBestG = (bn) => {
-      if (!bn) return null
-      let best = null
-      for (const it of gList) {
-        if (usedG.has(it.idx)) continue
-        const gn = it.norm
-        if (!gn) continue
-        if (gn === bn) return it
-        if (gn.includes(bn) || bn.includes(gn)) {
-          // Avoid over-matching long baseline titles to generic generated titles like "A一段".
-          // This keeps the diff honest: if the generated meta doesn't have the specific row,
-          // we prefer showing it as missing rather than matching an unrelated short row.
-          const long = bn.length >= gn.length ? bn : gn
-          const short = bn.length >= gn.length ? gn : bn
-          if (short.length <= 3 && long.length >= 8) continue
-          const dist = Math.abs(gn.length - bn.length)
-          if (!best || dist < best.dist) best = { ...it, dist }
-        }
-      }
-      return best
+    // Evidence-first matching:
+    // - Strict: only match when normalized titles are exactly equal.
+    // - Loose (fallback): strip a single leading skill marker (E/Q/A) to match baseline "Qxxx" vs generated "xxx",
+    //   but ONLY when the loose key is unique on both sides (prevents misleading pairings).
+    const gBucketsStrict = new Map()
+    for (const gr0 of gRet) {
+      const gr = gr0 || null
+      const gn = normTitle(gr?.title)
+      if (!gn) continue
+      const list = gBucketsStrict.get(gn) || []
+      list.push(gr)
+      gBucketsStrict.set(gn, list)
     }
 
-    let outIdx = 0
-    for (const br0 of bRet) {
-      const br = br0 || null
+    const matchStrict = new Map() // baseline idx -> generated entry
+    for (let i = 0; i < bRet.length; i++) {
+      const br = bRet[i] || null
       const bn = normTitle(br?.title)
-      const match = pickBestG(bn)
-      const gr = match ? match.r : null
-      if (match) usedG.add(match.idx)
+      const bucket = bn ? gBucketsStrict.get(bn) || [] : []
+      const gr = bucket.length ? bucket.shift() : null
+      if (bn) gBucketsStrict.set(bn, bucket)
+      if (gr) matchStrict.set(i, gr)
+    }
+
+    const gUnmatched = []
+    for (const list of gBucketsStrict.values()) {
+      for (const gr0 of list) gUnmatched.push(gr0 || null)
+    }
+
+    const bUnmatchedIdx = []
+    for (let i = 0; i < bRet.length; i++) {
+      if (!matchStrict.has(i)) bUnmatchedIdx.push(i)
+    }
+
+    const bLooseCount = new Map()
+    for (const bi of bUnmatchedIdx) {
+      const br = bRet[bi] || null
+      const k = normTitleLoose(br?.title)
+      if (!k) continue
+      bLooseCount.set(k, (bLooseCount.get(k) || 0) + 1)
+    }
+    const gLooseCount = new Map()
+    const gLooseBucket = new Map()
+    for (const gr of gUnmatched) {
+      const k = normTitleLoose(gr?.title)
+      if (!k) continue
+      gLooseCount.set(k, (gLooseCount.get(k) || 0) + 1)
+      const list = gLooseBucket.get(k) || []
+      list.push(gr)
+      gLooseBucket.set(k, list)
+    }
+
+    const matchLoose = new Map() // baseline idx -> generated entry
+    for (const bi of bUnmatchedIdx) {
+      const br = bRet[bi] || null
+      const k = normTitleLoose(br?.title)
+      if (!k) continue
+      if ((bLooseCount.get(k) || 0) !== 1) continue
+      if ((gLooseCount.get(k) || 0) !== 1) continue
+      const list = gLooseBucket.get(k) || []
+      const gr = list.length ? list[0] : null
+      if (!gr) continue
+      matchLoose.set(bi, gr)
+      gLooseBucket.delete(k)
+    }
+
+    const gUsedLoose = new Set(matchLoose.values())
+
+    let outIdx = 0
+    for (let i = 0; i < bRet.length; i++) {
+      const br = bRet[i] || null
+      const gr = matchStrict.get(i) || matchLoose.get(i) || null
 
       const title = (br?.title || gr?.title || "").trim()
       const bAvg = typeof br?.avg === "number" ? br.avg : null
@@ -203,6 +257,7 @@ function diffRuns(baseline, generated) {
       entries.push({
         idx: outIdx++,
         title,
+        match: matchStrict.has(i) ? "strict" : matchLoose.has(i) ? "loose" : "missing",
         baseline: { avg: bAvg, dmg: bDmg },
         generated: { avg: gAvg, dmg: gDmg },
         ratio,
@@ -210,15 +265,17 @@ function diffRuns(baseline, generated) {
       })
     }
 
-    for (const it of gList) {
-      if (usedG.has(it.idx)) continue
-      const gr = it.r || null
+    for (const gr0 of gUnmatched) {
+      const gr = gr0 || null
+      if (!gr) continue
+      if (gUsedLoose.has(gr)) continue
       const title = (gr?.title || "").trim()
       const gAvg = typeof gr?.avg === "number" ? gr.avg : null
       const gDmg = typeof gr?.dmg === "number" ? gr.dmg : null
       entries.push({
         idx: outIdx++,
         title,
+        match: "generated-only",
         baseline: { avg: null, dmg: null },
         generated: { avg: gAvg, dmg: gDmg },
         ratio: null,
@@ -306,12 +363,9 @@ async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
   const args = parseArgs(process.argv)
 
-  const uid = String(args.uid || process.env.CIRCALTEST_UID || "").trim()
-  if (!uid) throw new Error("Usage: node circaltest/panel-regression.mjs --uid <UID>")
-
   const game = String(args.game || "gs").trim()
-  if (game !== "gs") {
-    throw new Error(`[circaltest] panel-regression currently supports --game gs only (got: ${game})`)
+  if (game !== "gs" && game !== "sr") {
+    throw new Error(`[circaltest] panel-regression supports --game gs|sr (got: ${game})`)
   }
 
   const enemyLv = Number(args.enemyLv || 103)
@@ -321,15 +375,44 @@ async function main() {
   const userAgent = String(args.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").trim()
 
   const evidenceRoot = path.join(repoRoot, "circaltest", "evidence", nowStamp())
-  const enkaDir = path.join(evidenceRoot, "enka", "raw")
-  ensureDir(enkaDir)
 
-  const enkaUrl = String(args.enkaUrl || `https://enka.network/api/uid/${uid}`)
-  const raw = await fetchJsonWithRetry(enkaUrl, { proxy: proxy || null, userAgent, retries: 4, timeoutMs: 30_000 })
-  raw.uid = uid
+  const testdataRoot = toAbs(repoRoot, args.testdataRoot || "testData")
+  const useTestdata = !!args.useTestdata || !!args.testdata
 
-  const rawJsonPath = path.join(enkaDir, `${uid}.json`)
-  fs.writeFileSync(rawJsonPath, JSON.stringify(raw, null, 2))
+  const fileArg = String(args.file || args.raw || "").trim()
+  const filePathAbs = fileArg ? toAbs(repoRoot, fileArg) : ""
+
+  let uid = String(args.uid || process.env.CIRCALTEST_UID || "").trim()
+  let rawJsonPath = ""
+
+  if (filePathAbs) {
+    if (!fs.existsSync(filePathAbs)) throw new Error(`[circaltest] raw file not found: ${filePathAbs}`)
+    rawJsonPath = filePathAbs
+    uid = uid || tryInferUidFromPath(filePathAbs)
+  } else if (useTestdata) {
+    if (!uid) throw new Error("Usage: node circaltest/panel-regression.mjs --useTestdata --uid <UID> [--game gs|sr]")
+    rawJsonPath = path.join(testdataRoot, game, `${uid}.json`)
+    if (!fs.existsSync(rawJsonPath)) throw new Error(`[circaltest] testData missing: ${rawJsonPath}`)
+  } else {
+    // Fetch mode (GS only).
+    if (!uid) throw new Error("Usage: node circaltest/panel-regression.mjs --uid <UID>")
+    if (game !== "gs") {
+      throw new Error(`[circaltest] fetch mode only supports --game gs; use --file or --useTestdata for sr`)
+    }
+    const enkaDir = path.join(evidenceRoot, "enka", "raw")
+    ensureDir(enkaDir)
+
+    const enkaUrl = String(args.enkaUrl || `https://enka.network/api/uid/${uid}`)
+    const raw = await fetchJsonWithRetry(enkaUrl, { proxy: proxy || null, userAgent, retries: 4, timeoutMs: 30_000 })
+    raw.uid = uid
+
+    rawJsonPath = path.join(enkaDir, `${uid}.json`)
+    fs.writeFileSync(rawJsonPath, JSON.stringify(raw, null, 2))
+  }
+
+  if (!uid) {
+    throw new Error(`[circaltest] failed to infer uid (pass --uid explicitly): raw=${rawJsonPath}`)
+  }
 
   const baselineMetaRoot = toAbs(repoRoot, args.baselineMetaRoot || `temp/metaBaselineRef/meta-${game}`)
   const generatedMetaRoot = toAbs(repoRoot, args.generatedMetaRoot || `temp/metaGenerator/.output/meta-${game}`)

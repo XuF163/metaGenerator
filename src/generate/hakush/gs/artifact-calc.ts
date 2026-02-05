@@ -79,6 +79,44 @@ export function parseGsArtifactBonus(setName: string, textRaw: string, need: num
 
   // ----- Explicit compat patches (align with baseline runtime assumptions) -----
   if (need === 4) {
+    if (setName === '绝缘之旗印') {
+      // "基于元素充能效率的25%，提高元素爆发造成的伤害。至多...75%"
+      return mkBuff(
+        textRaw,
+        {
+          qDmg: ({ attr, calc }: any) => Math.min(75, calc(attr.recharge) * 0.25)
+        },
+        { sort: 4 }
+      )
+    }
+    if (setName === '华馆梦醒形骸记') {
+      // Baseline assumes full stacks.
+      return mkBuff(textRaw, {
+        defPct: 24,
+        dmg: ({ element }: any) => (element === '岩' ? 24 : 0)
+      })
+    }
+    if (setName === '水仙之梦') {
+      // Baseline assumes full stacks (3 layers).
+      return mkBuff(textRaw, {
+        atkPct: 25,
+        dmg: ({ element }: any) => (element === '水' ? 15 : 0)
+      })
+    }
+    if (setName === '深林的记忆') {
+      // Dendro resistance shred (conditionally applied to dendro dmg).
+      return mkBuff(
+        textRaw,
+        { kx: 30 },
+        {
+          check: ({ element }: any) => element === '草'
+        }
+      )
+    }
+    if (setName === '翠绿之影') {
+      // Swirl damage +60% and corresponding RES shred (miao-plugin key: fykx).
+      return mkBuff(textRaw, { swirl: 60, fykx: 40 })
+    }
     if (setName === '逐影猎人') {
       // Baseline assumes full stacks (3*12%).
       return mkBuff(textRaw, { cpct: 36 })

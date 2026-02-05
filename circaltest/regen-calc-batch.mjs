@@ -1,10 +1,12 @@
 import fs from "node:fs"
 import path from "node:path"
+import crypto from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 import { loadToolConfig } from "../dist/config/config.js"
 import { tryCreateLlmService } from "../dist/llm/try-create.js"
 import { buildCalcJsWithLlmOrHeuristic } from "../dist/generate/calc/llm-calc.js"
+import { runPromisePool } from "../dist/utils/promise-pool.js"
 
 function parseArgs(argv) {
   const out = {}
@@ -35,8 +37,19 @@ function parseBool(v, defaultValue) {
   return defaultValue
 }
 
+function parseNum(v, defaultValue) {
+  if (v === undefined) return defaultValue
+  const n = Number(v)
+  return Number.isFinite(n) ? n : defaultValue
+}
+
 function isRecord(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v)
+}
+
+function sha256File(filePathAbs) {
+  const buf = fs.readFileSync(filePathAbs)
+  return crypto.createHash("sha256").update(buf).digest("hex")
 }
 
 function normalizeTextInline(text) {
@@ -201,57 +214,79 @@ function buildTableTextSamples(tableSamples, tableTextByName) {
   return out
 }
 
+function splitNames(raw) {
+  const s = typeof raw === "string" ? raw : ""
+  if (!s.trim()) return []
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
+
+function pickNamesFromDiff(diffJsonPathAbs, { top, minDev }) {
+  const raw = JSON.parse(fs.readFileSync(diffJsonPathAbs, "utf8"))
+  const diffs = Array.isArray(raw?.diffs) ? raw.diffs : []
+  const rows = []
+  for (const d of diffs) {
+    const name = typeof d?.name === "string" ? d.name : ""
+    const ratio = Number(d?.worst?.ratio)
+    if (!name) continue
+    if (!Number.isFinite(ratio) || ratio <= 0) continue
+    const dev = ratio >= 1 ? ratio : 1 / ratio
+    if (dev < minDev) continue
+    rows.push({ name, ratio, dev, abs: Number(d?.worst?.abs || 0), title: String(d?.worst?.title || "") })
+  }
+  rows.sort((a, b) => b.dev - a.dev)
+  return rows.slice(0, top).map((r) => r.name)
+}
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, "..")
 
 const args = parseArgs(process.argv)
-const game = String(args.game || "gs")
-const name = String(args.name || args.char || "")
-const outputRoot = String(args.outputRoot || args["output-root"] || "temp/metaGenerator/.output")
+const game = String(args.game || "gs").trim()
+const outputRoot = String(args.outputRoot || args["output-root"] || "temp/metaGenerator/.output").trim()
 const forceCache = parseBool(args.forceCache ?? args["force-cache"], true)
+const concurrencyArg = parseNum(args.concurrency, 0)
+const minDev = parseNum(args.minDev ?? args["min-dev"], 1.25)
+const top = Math.max(1, Math.trunc(parseNum(args.top, 12)))
 
 if (game !== "gs" && game !== "sr") {
-  console.error(`[regen-calc] invalid --game: ${game}`)
+  console.error(`[regen-calc-batch] invalid --game: ${game}`)
   process.exitCode = 1
   process.exit(1)
 }
-if (!name) {
-  console.error(`[regen-calc] missing --name <character folder name>`)
+if (game !== "gs") {
+  console.error(`[regen-calc-batch] currently only supports --game gs`)
+  process.exitCode = 1
+  process.exit(1)
+}
+
+const fromDiff = String(args.fromDiff || args["from-diff"] || "").trim()
+const fromDiffAbs = fromDiff ? (path.isAbsolute(fromDiff) ? fromDiff : path.resolve(projectRoot, fromDiff)) : ""
+
+let names = splitNames(args.names || args.name || "")
+if (names.length === 0 && fromDiffAbs) {
+  if (!fs.existsSync(fromDiffAbs)) {
+    console.error(`[regen-calc-batch] diff json not found: ${fromDiffAbs}`)
+    process.exitCode = 1
+    process.exit(1)
+  }
+  names = pickNamesFromDiff(fromDiffAbs, { top, minDev })
+}
+
+if (names.length === 0) {
+  console.error(
+    "[regen-calc-batch] Usage:\n" +
+      "  node circaltest/regen-calc-batch.mjs --names \"莱依拉,夏沃蕾\" [--concurrency 4]\n" +
+      "  node circaltest/regen-calc-batch.mjs --fromDiff <diff.json> [--minDev 1.25] [--top 12] [--concurrency 4]"
+  )
   process.exitCode = 1
   process.exit(1)
 }
 
 const outputRootAbs = path.isAbsolute(outputRoot) ? outputRoot : path.resolve(projectRoot, outputRoot)
-const charDir = path.join(outputRootAbs, `meta-${game}`, "character", name)
-const dataPath = path.join(charDir, "data.json")
-if (!fs.existsSync(dataPath)) {
-  console.error(`[regen-calc] data.json not found: ${dataPath}`)
-  process.exitCode = 1
-  process.exit(1)
-}
-
-const metaRaw = JSON.parse(fs.readFileSync(dataPath, "utf8"))
-if (!isRecord(metaRaw)) {
-  console.error(`[regen-calc] invalid meta JSON: ${dataPath}`)
-  process.exitCode = 1
-  process.exit(1)
-}
-
-const elem = typeof metaRaw.elem === "string" ? metaRaw.elem : ""
-const weapon = typeof metaRaw.weapon === "string" ? metaRaw.weapon : ""
-const star = typeof metaRaw.star === "number" && Number.isFinite(metaRaw.star) ? metaRaw.star : 0
-const tables = game === "gs" ? getGsTables(metaRaw) : null
-if (!tables) {
-  console.error(`[regen-calc] failed to infer talent tables for: ${game} ${name}`)
-  process.exitCode = 1
-  process.exit(1)
-}
-
-const { talentDesc, tableUnits, tableTextByName } = buildGsDescAndUnits(metaRaw)
-const buffHints = game === "gs" ? buildBuffHintsGs(metaRaw) : []
-const tableSamples = buildTableSamples(metaRaw)
-const tableTextSamples = buildTableTextSamples(tableSamples, tableTextByName)
 
 const ctx = {
   projectRoot,
@@ -265,25 +300,96 @@ const toolConfig = loadToolConfig(projectRoot) ?? undefined
 const llm = tryCreateLlmService(ctx, toolConfig, { purpose: "calc", required: true })
 const llmCacheRootAbs = path.join(projectRoot, ".cache", "llm")
 
-const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
-  llm,
-  {
-    game,
-    name,
-    elem,
-    weapon,
-    star,
-    tables,
-    tableUnits,
-    tableSamples,
-    tableTextSamples,
-    talentDesc,
-    buffHints
-  },
-  { cacheRootAbs: llmCacheRootAbs, force: forceCache }
+const concurrency =
+  concurrencyArg > 0
+    ? Math.max(1, Math.trunc(concurrencyArg))
+    : Math.max(1, Math.trunc(toolConfig?.llm?.maxConcurrency || 1))
+
+console.log(
+  `[regen-calc-batch] start: game=${game} names=${names.length} concurrency=${concurrency} forceCache=${forceCache}`
 )
 
-const outPath = path.join(charDir, "calc.js")
-fs.writeFileSync(outPath, js, "utf8")
-console.log(`[regen-calc] wrote: ${outPath}`)
-console.log(`[regen-calc] usedLlm=${usedLlm} error=${error || ""}`)
+let done = 0
+let ok = 0
+let failed = 0
+const failures = []
+
+await runPromisePool(
+  names,
+  concurrency,
+  async (name) => {
+    const charDir = path.join(outputRootAbs, `meta-${game}`, "character", name)
+    const dataPath = path.join(charDir, "data.json")
+    if (!fs.existsSync(dataPath)) throw new Error(`[regen-calc-batch] data.json not found: ${dataPath}`)
+
+    const metaRaw = JSON.parse(fs.readFileSync(dataPath, "utf8"))
+    if (!isRecord(metaRaw)) throw new Error(`[regen-calc-batch] invalid meta JSON: ${dataPath}`)
+
+    const elem = typeof metaRaw.elem === "string" ? metaRaw.elem : ""
+    const weapon = typeof metaRaw.weapon === "string" ? metaRaw.weapon : ""
+    const star = typeof metaRaw.star === "number" && Number.isFinite(metaRaw.star) ? metaRaw.star : 0
+    const tables = getGsTables(metaRaw)
+    if (!tables) throw new Error(`[regen-calc-batch] failed to infer talent tables: ${name}`)
+
+    const { talentDesc, tableUnits, tableTextByName } = buildGsDescAndUnits(metaRaw)
+    const buffHints = buildBuffHintsGs(metaRaw)
+    const tableSamples = buildTableSamples(metaRaw)
+    const tableTextSamples = buildTableTextSamples(tableSamples, tableTextByName)
+
+    const outPath = path.join(charDir, "calc.js")
+    const beforeSha = fs.existsSync(outPath) ? sha256File(outPath) : ""
+
+    const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+      llm,
+      {
+        game,
+        name,
+        elem,
+        weapon,
+        star,
+        tables,
+        tableUnits,
+        tableSamples,
+        tableTextSamples,
+        talentDesc,
+        buffHints
+      },
+      { cacheRootAbs: llmCacheRootAbs, force: forceCache }
+    )
+
+    fs.writeFileSync(outPath, js, "utf8")
+    const afterSha = sha256File(outPath)
+
+    done++
+    if (usedLlm) ok++
+    else failed++
+    if (!usedLlm) failures.push({ name, error: error || "LLM not used" })
+
+    const head = `[regen-calc-batch] ${done}/${names.length} ${name}`
+    const extra = [
+      usedLlm ? "llm=Y" : "llm=N",
+      beforeSha && afterSha && beforeSha !== afterSha ? "sha=changed" : "sha=same",
+      error ? `warn=${String(error).slice(0, 140)}` : ""
+    ]
+      .filter(Boolean)
+      .join(" ")
+    console.log(`${head} ${extra}`)
+  },
+  {
+    onError: (e, name) => {
+      done++
+      failed++
+      failures.push({ name, error: e instanceof Error ? e.message : String(e) })
+      console.log(`[regen-calc-batch] ${done}/${names.length} ${name} llm=N error=${String(e).slice(0, 220)}`)
+    }
+  }
+)
+
+console.log(`[regen-calc-batch] done: ok=${ok} failed=${failed}`)
+if (failures.length) {
+  console.log(`[regen-calc-batch] failures:`)
+  for (const f of failures) {
+    console.log(`- ${f.name}: ${f.error}`)
+  }
+}
+

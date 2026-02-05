@@ -212,7 +212,10 @@ function buildGsCalcBuffHints(passiveOut: unknown, consData: unknown): string[] 
   const isCombatLike = (s: string): boolean =>
     /(伤害|攻击|防御|生命|暴击|元素|精通|充能|治疗|护盾|抗性|穿透|提高|提升|降低|增加|减少|\d|%)/.test(s)
   const isNonCombat = (s: string): boolean =>
-    /(探索派遣|派遣任务|烹饪|合成|制作|锻造|加工|采集|钓鱼)/.test(s)
+    // Avoid filtering combat-related passives that happen to include cooking keywords in skill names
+    // (e.g. 爱可菲「低温烹饪」). Only treat them as non-combat when they are explicitly "when cooking/crafting…".
+    /(探索派遣|派遣任务|钓鱼)/.test(s) ||
+    /(完美烹饪|烹饪.{0,12}时|合成.{0,12}时|制作.{0,12}时|锻造.{0,12}时|加工.{0,12}时|采集.{0,12}时)/.test(s)
 
   if (Array.isArray(passiveOut)) {
     for (const p of passiveOut) {

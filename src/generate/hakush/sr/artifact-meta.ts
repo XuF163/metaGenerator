@@ -289,7 +289,7 @@ function buildSrArtifactMetaJs(opts: {
   lines.push('')
   lines.push('export { attrMap }')
   lines.push('')
-  return lines.join('\\n')
+  return lines.join('\n')
 }
 
 export interface GenerateSrArtifactMetaOptions {

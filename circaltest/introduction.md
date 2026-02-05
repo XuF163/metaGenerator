@@ -38,6 +38,9 @@ node circaltest/regression.mjs
 # 基本用法（GS）
 node circaltest/panel-regression.mjs --uid 147962990
 
+# 使用本地 testData（避免实时拉取；推荐用于可复现实验）
+node circaltest/panel-regression.mjs --useTestdata --uid 147962990 --game gs
+
 # 使用代理（按需：本地 10809）
 node circaltest/panel-regression.mjs --uid 147962990 --proxy http://127.0.0.1:10809
 
@@ -47,6 +50,15 @@ node circaltest/panel-regression.mjs --uid 147962990 --proxy http://127.0.0.1:10
 # - generated/gs/<uid>.json       # 生成 meta 下的伤害输出
 # - diff/gs/<uid>.md              # 对比报告（按角色列出 avg/ratio/abs）
 # - diff/gs/<uid>.json            # 结构化 diff
+```
+
+## calc.js 批量迭代（LLM）
+
+当面板回归发现某些角色偏差较大时，可根据 diff.json 自动挑选 Top N 角色批量重生成 `calc.js`：
+
+```powershell
+# 从某次 panel-regression 的 diff.json 中挑选偏差最大角色批量重生成（仅 GS）
+node circaltest/regen-calc-batch.mjs --fromDiff circaltest/evidence/<timestamp>/diff/gs/<uid>.json --minDev 1.4 --top 10 --concurrency 6
 ```
 
 ## 目录约定
