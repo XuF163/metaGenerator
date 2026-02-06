@@ -100,20 +100,45 @@ function runWorker({ repoRoot, tag, game, enemyLv, metaRoot, rawJsonPath, outFil
 }
 
 function diffRuns(baseline, generated) {
+  const game = String(baseline?.game || generated?.game || "gs").trim() || "gs"
   const normTitle = (s) => {
     let t = String(s || "").trim()
     if (!t) return ""
-    // Remove common separators/punctuations.
-    t = t.replace(/\s+/g, "").replace(/[·•・?？、，,。．：:；;!！…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, "")
+    // Remove whitespace + common separators/punctuations.
+    t = t.replace(/\s+/g, "")
+    t = t.replace(/[·•･・…?？、，,。．：:；;!！"'“”‘’()（）【】\[\]{}《》〈〉<>「」『』]/g, "")
+    t = t.replace(/[=+~`^|\\]/g, "")
+    t = t.replace(/[-_—–]/g, "")
 
-    // Normalize common skill prefixes (baseline vs generated titles).
-    t = t
-      .replace(/元素战技/g, "E")
-      .replace(/战技/g, "E")
-      .replace(/元素爆发/g, "Q")
-      .replace(/终结技/g, "Q")
-      .replace(/普通攻击/g, "A")
-      .replace(/普攻/g, "A")
+    if (game === "sr") {
+      // Normalize SR skill prefixes.
+      t = t
+        .replace(/普通攻击/g, "A")
+        .replace(/普攻/g, "A")
+        .replace(/战技/g, "E")
+        .replace(/终结技/g, "Q")
+        .replace(/天赋/g, "T")
+        .replace(/秘技/g, "Z")
+
+      // Unify constellation wording (命/魂).
+      t = t.replace(/(\d+)命/g, "$1魂")
+
+      // Unify heal/shield wording.
+      t = t.replace(/治疗量/g, "治疗").replace(/护盾量/g, "护盾")
+    } else {
+      // Normalize GS skill prefixes.
+      t = t
+        .replace(/元素战技/g, "E")
+        .replace(/战技/g, "E")
+        .replace(/元素爆发/g, "Q")
+        .replace(/终结技/g, "Q")
+        .replace(/普通攻击/g, "A")
+        .replace(/普攻/g, "A")
+    }
+
+    // Normalize press wording (E点按 vs 点按E).
+    t = t.replace(/短按/g, "点按")
+    t = t.replace(/^(点按|长按|短按)([EQATZ])/g, "$2$1")
 
     // Strip generic words to improve matching.
     t = t.replace(/技能/g, "").replace(/伤害/g, "")
@@ -127,14 +152,20 @@ function diffRuns(baseline, generated) {
     t = t.replace(/短E后/g, "E后")
 
     // De-dup repeated markers introduced by normalization (e.g. "Q爆发..." -> "QQ...").
-    t = t.replace(/E{2,}/g, "E").replace(/Q{2,}/g, "Q").replace(/A{2,}/g, "A")
+    t = t
+      .replace(/E{2,}/g, "E")
+      .replace(/Q{2,}/g, "Q")
+      .replace(/A{2,}/g, "A")
+      .replace(/T{2,}/g, "T")
+      .replace(/Z{2,}/g, "Z")
     return t
   }
   const normTitleLoose = (s) => {
-    const t = normTitle(s)
-    // Some baseline titles prefix a skill marker ("Q梦想一刀..."), while generated titles may omit it.
+    let t = normTitle(s)
     // Strip a single leading marker only when the remaining title is still informative.
-    if (t.length > 1 && /^[EQA]/.test(t)) return t.slice(1)
+    if (t.length > 1 && /^[EQATZ]/.test(t)) t = t.slice(1)
+    // SR titles often differ only by whether they keep skill markers in the middle.
+    if (game === "sr") t = t.replace(/[EQATZ]/g, "")
     return t
   }
 
@@ -160,8 +191,26 @@ function diffRuns(baseline, generated) {
     const bRet = b?.dmg?.profile?.ret || []
     const gRet = g?.dmg?.profile?.ret || []
 
+    const collectFiniteAvg = (arr) =>
+      (arr || [])
+        .map((r) => (r && typeof r.avg === "number" && Number.isFinite(r.avg) ? r.avg : null))
+        .filter((v) => v !== null)
+
+    const bAvgs = collectFiniteAvg(bRet)
+    const gAvgs = collectFiniteAvg(gRet)
+    const bMaxAvg = bAvgs.length ? Math.max(...bAvgs) : null
+    const gMaxAvg = gAvgs.length ? Math.max(...gAvgs) : null
+    const maxAvgRatio =
+      bMaxAvg !== null && gMaxAvg !== null && bMaxAvg !== 0
+        ? gMaxAvg / bMaxAvg
+        : bMaxAvg === 0 && gMaxAvg === 0
+          ? 1
+          : null
+    const bNonZeroAvg = bAvgs.filter((v) => v > 0).length
+    const gNonZeroAvg = gAvgs.filter((v) => v > 0).length
+
     const entries = []
-    let worst = { ratio: 1, abs: 0, title: "" }
+    let worst = { ratio: null, abs: 0, title: "" }
 
     // Evidence-first matching:
     // - Strict: only match when normalized titles are exactly equal.
@@ -242,15 +291,25 @@ function diffRuns(baseline, generated) {
       const bDmg = typeof br?.dmg === "number" ? br.dmg : null
       const gDmg = typeof gr?.dmg === "number" ? gr.dmg : null
 
-      const ratio = bAvg && gAvg ? gAvg / bAvg : null
+      const ratio =
+        bAvg !== null && gAvg !== null && bAvg !== 0
+          ? gAvg / bAvg
+          : bAvg === 0 && gAvg === 0
+            ? 1
+            : null
       const abs = bAvg !== null && gAvg !== null ? Math.abs(gAvg - bAvg) : null
 
-      if (ratio !== null && abs !== null) {
+      if (abs !== null) {
         // Track the most suspicious entry for quick scanning.
-        const ratioDist = Math.abs(1 - ratio)
-        const worstDist = Math.abs(1 - worst.ratio)
-        if (ratioDist > worstDist || (ratioDist === worstDist && abs > worst.abs)) {
-          worst = { ratio, abs, title }
+        // Prefer ratio distance when ratio is available; otherwise fall back to absolute difference.
+        if (ratio !== null && Number.isFinite(ratio)) {
+          const ratioDist = Math.abs(1 - ratio)
+          const worstDist = typeof worst.ratio === "number" ? Math.abs(1 - worst.ratio) : -1
+          if (ratioDist > worstDist || (ratioDist === worstDist && abs > worst.abs)) {
+            worst = { ratio, abs, title }
+          }
+        } else if (typeof worst.ratio !== "number" && abs > worst.abs) {
+          worst = { ratio: null, abs, title }
         }
       }
 
@@ -289,6 +348,12 @@ function diffRuns(baseline, generated) {
       level: b.level,
       cons: b.cons,
       weapon: b.weapon?.name || "",
+      maxAvg: {
+        baseline: bMaxAvg,
+        generated: gMaxAvg,
+        ratio: maxAvgRatio,
+        nonZero: { baseline: bNonZeroAvg, generated: gNonZeroAvg }
+      },
       createdBy: {
         baseline: b?.dmg?.profile?.createdBy || "",
         generated: g?.dmg?.profile?.createdBy || ""
@@ -306,9 +371,14 @@ function diffRuns(baseline, generated) {
 
   // Sort by severity (worst ratio distance first).
   diffs.sort((a, b) => {
-    const ar = a?.worst?.ratio ?? 1
-    const br = b?.worst?.ratio ?? 1
-    return Math.abs(1 - br) - Math.abs(1 - ar)
+    const ar = a?.worst?.ratio
+    const br = b?.worst?.ratio
+    const arDist = typeof ar === "number" ? Math.abs(1 - ar) : 0
+    const brDist = typeof br === "number" ? Math.abs(1 - br) : 0
+    if (brDist !== arDist) return brDist - arDist
+    const aa = typeof a?.worst?.abs === "number" ? a.worst.abs : 0
+    const ba = typeof b?.worst?.abs === "number" ? b.worst.abs : 0
+    return ba - aa
   })
 
   return diffs
@@ -336,6 +406,14 @@ function renderDiffMd({ uid, game, enemyLv, baselineMetaRoot, generatedMetaRoot,
     lines.push(`- level/cons: Lv.${d.level} C${d.cons}`)
     lines.push(`- weapon: ${d.weapon}`)
     lines.push(`- createdBy: baseline=${d.createdBy?.baseline || ""} | generated=${d.createdBy?.generated || ""}`)
+    if (d.maxAvg) {
+      const b = typeof d.maxAvg.baseline === "number" ? d.maxAvg.baseline.toFixed(2) : "n/a"
+      const g = typeof d.maxAvg.generated === "number" ? d.maxAvg.generated.toFixed(2) : "n/a"
+      const r = typeof d.maxAvg.ratio === "number" ? d.maxAvg.ratio.toFixed(4) : "n/a"
+      const bn = d.maxAvg.nonZero?.baseline ?? 0
+      const gn = d.maxAvg.nonZero?.generated ?? 0
+      lines.push(`- maxAvg(avg): baseline=${b} (${bn} nonZero) | generated=${g} (${gn} nonZero) | ratio=${r}`)
+    }
     if (d.dmgError?.baseline || d.dmgError?.generated) {
       lines.push(`- dmgError: baseline=${d.dmgError?.baseline ? "YES" : "NO"} | generated=${d.dmgError?.generated ? "YES" : "NO"}`)
     }

@@ -39,6 +39,27 @@ function detectRawKind(raw) {
   return "unknown"
 }
 
+const ALLOWED_PROFILE_SOURCES = new Set([
+  "enka",
+  "EnkaHSR",
+  "change",
+  "miao",
+  "mgg",
+  "hanxuan",
+  "lyln",
+  "homo",
+  "avocado.wiki",
+  "mysPanel",
+  "mysPanelHSR"
+])
+
+function normalizeProfileSource(game, source) {
+  const s = String(source || "").trim()
+  if (ALLOWED_PROFILE_SOURCES.has(s)) return s
+  // Local datasets may use custom source tags; force one that miao-plugin accepts.
+  return game === "sr" ? "homo" : "enka"
+}
+
 function sanitizePlayerInfo(raw, uid) {
   // Avoid storing personal info (nickname/signature/avatar showcase list...) in evidence outputs.
   // We only keep fields that are useful for debugging without being identifying content.
@@ -171,6 +192,11 @@ async function main() {
   if (!Avatar || !ProfileDmg || !Character || !Weapon || !Artifact) {
     throw new Error("[circaltest] miao-plugin models/index.js missing expected exports")
   }
+  const DmgAttrMod = await importFromMiao("models/dmg/DmgAttr.js")
+  const DmgAttr = DmgAttrMod?.default || DmgAttrMod
+  if (!DmgAttr || typeof DmgAttr.getAttr !== "function" || typeof DmgAttr.calcAttr !== "function") {
+    throw new Error("[circaltest] miao-plugin DmgAttr import failed")
+  }
   console.log(`[circaltest] panel-worker imports ready`)
 
   const errors = []
@@ -196,6 +222,8 @@ async function main() {
         const avatarDs = { ...ds }
         // Ensure uid is present for downstream consumers.
         avatarDs.uid = uid
+        // Ensure the dataset is treated as a valid panel/profile snapshot by miao-plugin.
+        avatarDs._source = normalizeProfileSource(game, avatarDs._source)
         // Some datasets store id as string keys under `avatars`, normalize to number.
         if (avatarDs.id !== undefined) avatarDs.id = Number(avatarDs.id)
 
@@ -209,6 +237,31 @@ async function main() {
         const hasProfile = !!avatar.isProfile
         const hasDmg = !!avatar.hasDmg
 
+        const attrSummary = (() => {
+          const a = avatar.attr || {}
+          const pick = (k) => {
+            const v = a?.[k]
+            return typeof v === "number" && Number.isFinite(v) ? v : v ?? null
+          }
+          return {
+            atk: pick("atk"),
+            atkBase: pick("atkBase"),
+            hp: pick("hp"),
+            hpBase: pick("hpBase"),
+            def: pick("def"),
+            defBase: pick("defBase"),
+            speed: pick("speed"),
+            recharge: pick("recharge"),
+            cpct: pick("cpct"),
+            cdmg: pick("cdmg"),
+            dmg: pick("dmg"),
+            enemydmg: pick("enemydmg"),
+            effPct: pick("effPct"),
+            effDef: pick("effDef"),
+            stance: pick("stance")
+          }
+        })()
+
         let dmgProfile = null
         let dmgSingle = null
         let dmgError = null
@@ -218,6 +271,122 @@ async function main() {
             dmgProfile = await avatar.calcDmg({ enemyLv, mode: "profile" })
           } catch (e) {
             dmgError = e instanceof Error ? (e.stack || e.message) : String(e)
+          }
+        }
+
+        let dmgCtx = null
+        let talentSample = null
+        let talentLv = null
+        let talentTableLen = null
+        if (hasProfile && hasDmg && !dmgError) {
+          try {
+            const pd = avatar.dmg
+            if (pd && typeof pd.getCalcRule === "function") {
+              const charCalcData = await pd.getCalcRule()
+              talentLv = pd.profile?.talent || null
+              const detail = pd.char?.detail || {}
+              const maxTableLen = (tk) => {
+                const tables = detail?.talent?.[tk]?.tables
+                const list = Array.isArray(tables) ? tables : Object.values(tables || {})
+                let max = 0
+                for (const ds of list) {
+                  const len = Array.isArray(ds?.values) ? ds.values.length : 0
+                  if (len > max) max = len
+                }
+                return max || null
+              }
+              talentTableLen = {
+                a: maxTableLen("a"),
+                e: maxTableLen("e"),
+                q: maxTableLen("q"),
+                t: maxTableLen("t")
+              }
+              const talentPlan = pd.talent()
+              const meta = {
+                charId: pd.char?.id,
+                uid: pd.profile?.uid,
+                level: pd.profile?.level,
+                cons: (pd.profile?.cons || 0) * 1,
+                talent: talentPlan,
+                trees: pd.trees(),
+                weapon: pd.profile?.weapon
+              }
+              let defParams = charCalcData?.defParams || {}
+              defParams = typeof defParams === "function" ? defParams(meta) : defParams || {}
+              const originalAttr = DmgAttr.getAttr({
+                originalAttr: null,
+                id: pd.profile?.id,
+                weapon: pd.profile?.weapon,
+                attr: pd.profile?.attr,
+                char: pd.char,
+                game
+              })
+              const buffsAll = pd.getBuffs(charCalcData?.buffs || [])
+              const { attr } = DmgAttr.calcAttr({
+                originalAttr,
+                buffs: buffsAll,
+                meta,
+                artis: pd.profile?.artis,
+                params: defParams,
+                game
+              })
+              const sampleMap = (m) => {
+                const out = {}
+                for (const [k, v] of Object.entries(m || {})) {
+                  out[k] = v === undefined ? null : v
+                  if (Object.keys(out).length >= 8) break
+                }
+                return out
+              }
+              talentSample = {
+                a: sampleMap(talentPlan?.a),
+                e: sampleMap(talentPlan?.e),
+                q: sampleMap(talentPlan?.q),
+                t: sampleMap(talentPlan?.t)
+              }
+              const pickNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : v ?? null)
+              dmgCtx = {
+                kx: pickNum(attr?.kx),
+                enemy: {
+                  def: pickNum(attr?.enemy?.def),
+                  ignore: pickNum(attr?.enemy?.ignore)
+                },
+                a: {
+                  pct: pickNum(attr?.a?.pct),
+                  plus: pickNum(attr?.a?.plus),
+                  dmg: pickNum(attr?.a?.dmg),
+                  enemydmg: pickNum(attr?.a?.enemydmg),
+                  cpct: pickNum(attr?.a?.cpct),
+                  cdmg: pickNum(attr?.a?.cdmg)
+                },
+                e: {
+                  pct: pickNum(attr?.e?.pct),
+                  plus: pickNum(attr?.e?.plus),
+                  dmg: pickNum(attr?.e?.dmg),
+                  enemydmg: pickNum(attr?.e?.enemydmg),
+                  cpct: pickNum(attr?.e?.cpct),
+                  cdmg: pickNum(attr?.e?.cdmg)
+                },
+                q: {
+                  pct: pickNum(attr?.q?.pct),
+                  plus: pickNum(attr?.q?.plus),
+                  dmg: pickNum(attr?.q?.dmg),
+                  enemydmg: pickNum(attr?.q?.enemydmg),
+                  cpct: pickNum(attr?.q?.cpct),
+                  cdmg: pickNum(attr?.q?.cdmg)
+                },
+                t: {
+                  pct: pickNum(attr?.t?.pct),
+                  plus: pickNum(attr?.t?.plus),
+                  dmg: pickNum(attr?.t?.dmg),
+                  enemydmg: pickNum(attr?.t?.enemydmg),
+                  cpct: pickNum(attr?.t?.cpct),
+                  cdmg: pickNum(attr?.t?.cdmg)
+                }
+              }
+            }
+          } catch (e) {
+            dmgCtx = { error: e instanceof Error ? (e.stack || e.message) : String(e) }
           }
         }
 
@@ -247,6 +416,11 @@ async function main() {
           weapon: avatar.weapon,
           artisSet: avatar.artisSet,
           talent: avatar.originalTalent,
+          attr: attrSummary,
+          talentLv,
+          talentTableLen,
+          talentSample,
+          dmgCtx,
           hasProfile,
           hasDmg,
           calc: calcPath ? { path: calcPath, sha256: calcSha256 } : null,
@@ -370,6 +544,31 @@ async function main() {
       const hasProfile = !!avatar.isProfile
       const hasDmg = !!avatar.hasDmg
 
+      const attrSummary = (() => {
+        const a = avatar.attr || {}
+        const pick = (k) => {
+          const v = a?.[k]
+          return typeof v === "number" && Number.isFinite(v) ? v : v ?? null
+        }
+        return {
+          atk: pick("atk"),
+          atkBase: pick("atkBase"),
+          hp: pick("hp"),
+          hpBase: pick("hpBase"),
+          def: pick("def"),
+          defBase: pick("defBase"),
+          speed: pick("speed"),
+          recharge: pick("recharge"),
+          cpct: pick("cpct"),
+          cdmg: pick("cdmg"),
+          dmg: pick("dmg"),
+          enemydmg: pick("enemydmg"),
+          effPct: pick("effPct"),
+          effDef: pick("effDef"),
+          stance: pick("stance")
+        }
+      })()
+
       let dmgProfile = null
       let dmgSingle = null
       let dmgError = null
@@ -379,6 +578,122 @@ async function main() {
           dmgProfile = await avatar.calcDmg({ enemyLv, mode: "profile" })
         } catch (e) {
           dmgError = e instanceof Error ? (e.stack || e.message) : String(e)
+        }
+      }
+
+      let dmgCtx = null
+      let talentSample = null
+      let talentLv = null
+      let talentTableLen = null
+      if (hasProfile && hasDmg && !dmgError) {
+        try {
+          const pd = avatar.dmg
+          if (pd && typeof pd.getCalcRule === "function") {
+            const charCalcData = await pd.getCalcRule()
+            talentLv = pd.profile?.talent || null
+            const detail = pd.char?.detail || {}
+            const maxTableLen = (tk) => {
+              const tables = detail?.talent?.[tk]?.tables
+              const list = Array.isArray(tables) ? tables : Object.values(tables || {})
+              let max = 0
+              for (const ds of list) {
+                const len = Array.isArray(ds?.values) ? ds.values.length : 0
+                if (len > max) max = len
+              }
+              return max || null
+            }
+            talentTableLen = {
+              a: maxTableLen("a"),
+              e: maxTableLen("e"),
+              q: maxTableLen("q"),
+              t: maxTableLen("t")
+            }
+            const talentPlan = pd.talent()
+            const meta = {
+              charId: pd.char?.id,
+              uid: pd.profile?.uid,
+              level: pd.profile?.level,
+              cons: (pd.profile?.cons || 0) * 1,
+              talent: talentPlan,
+              trees: pd.trees(),
+              weapon: pd.profile?.weapon
+            }
+            let defParams = charCalcData?.defParams || {}
+            defParams = typeof defParams === "function" ? defParams(meta) : defParams || {}
+            const originalAttr = DmgAttr.getAttr({
+              originalAttr: null,
+              id: pd.profile?.id,
+              weapon: pd.profile?.weapon,
+              attr: pd.profile?.attr,
+              char: pd.char,
+              game
+            })
+            const buffsAll = pd.getBuffs(charCalcData?.buffs || [])
+            const { attr } = DmgAttr.calcAttr({
+              originalAttr,
+              buffs: buffsAll,
+              meta,
+              artis: pd.profile?.artis,
+              params: defParams,
+              game
+            })
+            const sampleMap = (m) => {
+              const out = {}
+              for (const [k, v] of Object.entries(m || {})) {
+                out[k] = v === undefined ? null : v
+                if (Object.keys(out).length >= 8) break
+              }
+              return out
+            }
+            talentSample = {
+              a: sampleMap(talentPlan?.a),
+              e: sampleMap(talentPlan?.e),
+              q: sampleMap(talentPlan?.q),
+              t: sampleMap(talentPlan?.t)
+            }
+            const pickNum = (v) => (typeof v === "number" && Number.isFinite(v) ? v : v ?? null)
+            dmgCtx = {
+              kx: pickNum(attr?.kx),
+              enemy: {
+                def: pickNum(attr?.enemy?.def),
+                ignore: pickNum(attr?.enemy?.ignore)
+              },
+              a: {
+                pct: pickNum(attr?.a?.pct),
+                plus: pickNum(attr?.a?.plus),
+                dmg: pickNum(attr?.a?.dmg),
+                enemydmg: pickNum(attr?.a?.enemydmg),
+                cpct: pickNum(attr?.a?.cpct),
+                cdmg: pickNum(attr?.a?.cdmg)
+              },
+              e: {
+                pct: pickNum(attr?.e?.pct),
+                plus: pickNum(attr?.e?.plus),
+                dmg: pickNum(attr?.e?.dmg),
+                enemydmg: pickNum(attr?.e?.enemydmg),
+                cpct: pickNum(attr?.e?.cpct),
+                cdmg: pickNum(attr?.e?.cdmg)
+              },
+              q: {
+                pct: pickNum(attr?.q?.pct),
+                plus: pickNum(attr?.q?.plus),
+                dmg: pickNum(attr?.q?.dmg),
+                enemydmg: pickNum(attr?.q?.enemydmg),
+                cpct: pickNum(attr?.q?.cpct),
+                cdmg: pickNum(attr?.q?.cdmg)
+              },
+              t: {
+                pct: pickNum(attr?.t?.pct),
+                plus: pickNum(attr?.t?.plus),
+                dmg: pickNum(attr?.t?.dmg),
+                enemydmg: pickNum(attr?.t?.enemydmg),
+                cpct: pickNum(attr?.t?.cpct),
+                cdmg: pickNum(attr?.t?.cdmg)
+              }
+            }
+          }
+        } catch (e) {
+          dmgCtx = { error: e instanceof Error ? (e.stack || e.message) : String(e) }
         }
       }
 
@@ -408,6 +723,11 @@ async function main() {
         weapon: avatar.weapon,
         artisSet: avatar.artisSet,
         talent: avatar.originalTalent,
+        attr: attrSummary,
+        talentLv,
+        talentTableLen,
+        talentSample,
+        dmgCtx,
         hasProfile,
         hasDmg,
         calc: calcPath ? { path: calcPath, sha256: calcSha256 } : null,

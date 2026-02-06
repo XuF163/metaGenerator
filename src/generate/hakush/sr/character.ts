@@ -605,6 +605,15 @@ function guessSrParamName(opts: {
   const hasDamage = /伤害/.test(descPlain)
   const isShieldParam = local.includes('护盾')
   const isHealParam = /(治疗|回复|恢复)/.test(local) && /生命上限|生命值/.test(local)
+  const isHpUpParam =
+    /(?:生命上限|生命值)/.test(local) &&
+    /(提高|提升|增加)/.test(local) &&
+    !/(治疗|回复|恢复)/.test(local) &&
+    !/伤害/.test(local)
+  const isAtkUpParam =
+    /攻击力/.test(local) && /(提高|提升|增加)/.test(local) && !/伤害/.test(local)
+  const isDefUpParam =
+    /防御力/.test(local) && /(提高|提升|增加)/.test(local) && !/伤害/.test(local)
   const isAdjacentDamage = /相邻目标|相邻敌方|相邻/.test(before) && /伤害/.test(around)
   const isCounterDamage = before.includes('反击') && /伤害/.test(around)
   const isFollowUpDamage = before.includes('追加攻击') && /伤害/.test(around)
@@ -631,6 +640,12 @@ function guessSrParamName(opts: {
   if (/普攻.*伤害.*(提高|增加)$/.test(beforeSeg)) return '普攻伤害提高'
   if (/天赋.*伤害.*(提高|增加)$/.test(beforeSeg)) return '天赋伤害提高'
   if (/伤害.*(提高|增加)$/.test(beforeSeg)) return '伤害提高'
+
+  // Common non-heal stat-up params (HP/ATK/DEF). These are frequently shown alongside heals/buffs and should not
+  // fall back to generic "参数1/2", otherwise LLMs may accidentally use them as heal multipliers.
+  if (isHpUpParam) return isPercent ? '生命提高·百分比生命' : '生命提高·固定值'
+  if (isAtkUpParam) return isPercent ? '攻击提高·攻击力百分比' : '攻击提高·固定值'
+  if (isDefUpParam) return isPercent ? '防御提高·防御力百分比' : '防御提高·固定值'
 
   if (isShieldParam) {
     if (isPercent && stat === 'def') return srShieldDefPctNameCompatById[String(charId)] || '百分比防御'
@@ -665,11 +680,10 @@ function guessSrParamName(opts: {
 
   // Heal-only skills (no damage present in the whole description) use more specific naming.
   if (isHealParam) {
-    const needsPrefix = descPlain.includes('立即') && /(每回合|回合开始)/.test(descPlain)
-    const isRegen = needsPrefix && /(每回合|回合开始)/.test(before)
-    const prefix = needsPrefix ? (isRegen ? '复活·' : '治疗·') : ''
-
-    const healBasedOnAtk = descPlain.includes('攻击力')
+    const isRevive = /(复活|复苏|复原)/.test(descPlain)
+    const hasInstantAndRegen = descPlain.includes('立即') && /(每回合|回合开始|持续)/.test(descPlain)
+    const isRegenParam = /(每回合|回合开始|持续)/.test(before) || /(每回合|回合开始)/.test(afterClause)
+    const prefix = isRevive ? '复活·' : hasInstantAndRegen ? (isRegenParam ? '持续治疗·' : '治疗·') : '治疗·'
 
     if (isPercent) {
       const name =
@@ -684,8 +698,7 @@ function guessSrParamName(opts: {
     }
 
     // Fixed value.
-    const name = healBasedOnAtk && stat === 'hp' ? '固定生命值' : '固定值'
-    return `${prefix}${name}`
+    return `${prefix}固定值`
   }
 
   return guessPrimaryParamName(descPlain, outIdx)
@@ -1336,8 +1349,8 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
     }
 
     const pointId = skillIdToPointId.get(sid) ?? derivePointIdFromSkillId(charId, sid) ?? sid
+    // Downstream expects id->key mapping to be unambiguous; avoid mixing Hakush skillId and pointId spaces.
     talentId[String(pointId)] = key
-    talentId[String(sid)] = key
 
     let tagCn = tagLabel(sRaw.Tag)
     const skillName = typeof sRaw.Name === 'string' ? sRaw.Name : ''
@@ -1385,7 +1398,6 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       const s = memSkills[String(skillId)]
       if (!isRecord(s)) return
       talentId[String(pointId)] = key
-      talentId[String(skillId)] = key
       const tagCn = tagLabel(s.Tag)
       const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
       const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, { tagCn, charId, noElemSpan })
@@ -1455,6 +1467,8 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
 
   const compat = srTalentIdCompat[String(charId)]
   if (compat) {
+    const compatKeys = new Set(Object.values(compat) as SrTalentKey[])
+    const compatIds = new Set(Object.keys(compat))
     const keyToId = new Map<SrTalentKey, number>()
     for (const [idKey, key] of Object.entries(compat)) {
       talentId[idKey] = key as SrTalentKey
@@ -1473,6 +1487,13 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       if (isRecord(blk)) {
         const idVal: string | number = srTalentBlockIdStringCompatIds.has(String(charId)) ? String(n) : n
         ;(blk as Record<string, unknown>).id = idVal
+      }
+    }
+
+    // Prune non-compat ids for keys covered by compat to avoid downstream choosing the wrong id by enumeration order.
+    for (const [idKey, key] of Object.entries(talentId)) {
+      if (compatKeys.has(key) && !compatIds.has(idKey)) {
+        delete talentId[idKey]
       }
     }
   }
@@ -1692,6 +1713,16 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
           for (const [k, v] of Object.entries(tidCompat)) {
             if (cur[k] !== v) {
               cur[k] = v
+              tidChanged = true
+            }
+          }
+
+          // Prune non-compat ids for compat-covered keys to avoid downstream choosing the wrong id.
+          const compatKeys = new Set(Object.values(tidCompat))
+          const compatIds = new Set(Object.keys(tidCompat))
+          for (const [k, v] of Object.entries(cur)) {
+            if (typeof v === 'string' && compatKeys.has(v) && !compatIds.has(k)) {
+              delete cur[k]
               tidChanged = true
             }
           }

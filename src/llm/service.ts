@@ -36,6 +36,37 @@ export class LlmService {
     this.queue = new AsyncQueue(cfg.maxConcurrency)
   }
 
+  private static extractContent(res: unknown): string | null {
+    const r: any = res as any
+    const c0 = r?.choices?.[0]
+
+    const direct = c0?.message?.content
+    if (typeof direct === 'string') return direct
+
+    // Some providers return `message.content` as an array of parts:
+    // - [{ type: "text", text: "..." }, ...]
+    // - ["...", ...]
+    if (Array.isArray(direct)) {
+      const parts: string[] = []
+      for (const p of direct) {
+        if (typeof p === 'string') {
+          if (p) parts.push(p)
+          continue
+        }
+        const t = typeof p?.text === 'string' ? p.text : ''
+        if (t) parts.push(t)
+      }
+      const joined = parts.join('')
+      if (joined) return joined
+    }
+
+    // Legacy/compat: some endpoints expose `choices[0].text`.
+    const legacyText = c0?.text
+    if (typeof legacyText === 'string') return legacyText
+
+    return null
+  }
+
   get model(): string {
     return this.cfg.model
   }
@@ -52,11 +83,26 @@ export class LlmService {
         temperature: opts.temperature,
         max_tokens: opts.maxTokens
       })
-      const content = res.choices?.[0]?.message?.content
-      if (typeof content !== 'string') {
-        throw new Error(`[meta-gen] LLM response missing choices[0].message.content`)
-      }
-      return content
+
+      const content = LlmService.extractContent(res)
+      if (typeof content === 'string') return content
+
+      const r: any = res as any
+      const errMsg = typeof r?.error?.message === 'string' ? String(r.error.message) : ''
+      const preview = (() => {
+        try {
+          const raw = JSON.stringify(res)
+          return raw ? raw.slice(0, 1200) : ''
+        } catch {
+          return ''
+        }
+      })()
+
+      throw new Error(
+        `[meta-gen] LLM response missing assistant content` +
+          (errMsg ? ` (error=${errMsg})` : '') +
+          (preview ? `: ${preview}` : '')
+      )
     })
   }
 }

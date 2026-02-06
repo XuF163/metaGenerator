@@ -90,6 +90,33 @@ function getGsTables(meta) {
   return { a, e, q }
 }
 
+function getSrTables(meta) {
+  const talentRaw = isRecord(meta.talent) ? meta.talent : null
+  if (!talentRaw) return null
+  const get = (k) => {
+    const blk = talentRaw[k]
+    if (!isRecord(blk)) return []
+    const tablesRaw = blk.tables
+    const names = []
+    if (Array.isArray(tablesRaw)) {
+      for (const t of tablesRaw) {
+        if (isRecord(t) && typeof t.name === "string") names.push(t.name.trim())
+      }
+    } else if (isRecord(tablesRaw)) {
+      for (const t of Object.values(tablesRaw)) {
+        if (isRecord(t) && typeof t.name === "string") names.push(t.name.trim())
+      }
+    }
+    return names.filter(Boolean)
+  }
+  const a = get("a")
+  const e = get("e")
+  const q = get("q")
+  const t = get("t")
+  if (a.length === 0 && e.length === 0 && q.length === 0 && t.length === 0) return null
+  return { a, e, q, t }
+}
+
 function buildGsDescAndUnits(meta) {
   const talentDesc = {}
   const tableUnits = {}
@@ -98,6 +125,51 @@ function buildGsDescAndUnits(meta) {
   if (!talentRaw) return { talentDesc, tableUnits, tableTextByName }
 
   for (const k of ["a", "e", "q"]) {
+    const blk = talentRaw[k]
+    if (!isRecord(blk)) continue
+
+    const desc = blk.desc
+    if (typeof desc === "string") talentDesc[k] = desc
+    else if (Array.isArray(desc)) talentDesc[k] = desc.filter((x) => typeof x === "string").join("\n")
+
+    const tablesRaw = blk.tables
+    const outUnits = {}
+    const outText = {}
+    const pushTable = (t) => {
+      if (!isRecord(t)) return
+      const name = typeof t.name === "string" ? t.name.trim() : ""
+      if (!name || name in outUnits) return
+      let unit = typeof t.unit === "string" ? t.unit : ""
+      unit = unit.trim()
+      if (!unit) unit = inferUnitHintFromTableValues(t.values)
+      outUnits[name] = unit
+
+      const values = t.values
+      if (Array.isArray(values) && values.length) {
+        const sampleText = normalizeTextInline(values[0])
+        if (sampleText) outText[name] = sampleText
+      }
+    }
+    if (Array.isArray(tablesRaw)) {
+      for (const t of tablesRaw) pushTable(t)
+    } else if (isRecord(tablesRaw)) {
+      for (const t of Object.values(tablesRaw)) pushTable(t)
+    }
+    if (Object.keys(outUnits).length) tableUnits[k] = outUnits
+    if (Object.keys(outText).length) tableTextByName[k] = outText
+  }
+
+  return { talentDesc, tableUnits, tableTextByName }
+}
+
+function buildSrDescAndUnits(meta) {
+  const talentDesc = {}
+  const tableUnits = {}
+  const tableTextByName = {}
+  const talentRaw = isRecord(meta.talent) ? meta.talent : null
+  if (!talentRaw) return { talentDesc, tableUnits, tableTextByName }
+
+  for (const k of ["a", "e", "q", "t"]) {
     const blk = talentRaw[k]
     if (!isRecord(blk)) continue
 
@@ -175,6 +247,54 @@ function buildBuffHintsGs(meta) {
   return hints
 }
 
+function buildBuffHintsSr(meta) {
+  const hints = []
+
+  const talentRaw = isRecord(meta.talent) ? meta.talent : null
+  const z = talentRaw && isRecord(talentRaw.z) ? talentRaw.z : null
+  if (z) {
+    const name = typeof z.name === "string" ? z.name.trim() : ""
+    const desc = typeof z.desc === "string" ? z.desc.trim() : ""
+    if (name && desc) hints.push(`秘技：${name}：${desc}`)
+  }
+
+  const consRaw = isRecord(meta.cons) ? meta.cons : null
+  if (consRaw) {
+    const keys = Object.keys(consRaw)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b)
+    for (const n of keys) {
+      const c = consRaw[String(n)]
+      if (!isRecord(c)) continue
+      const name = typeof c.name === "string" ? c.name.trim() : ""
+      const desc = typeof c.desc === "string" ? c.desc.trim() : ""
+      if (!name || !desc) continue
+      hints.push(`${n}魂：${name}：${desc}`)
+    }
+  }
+
+  const treeData = isRecord(meta.treeData) ? meta.treeData : null
+  if (treeData) {
+    const nodes = []
+    for (const v of Object.values(treeData)) {
+      if (!isRecord(v)) continue
+      if (v.type !== "skill" || v.root !== true) continue
+      const idx = typeof v.idx === "number" && Number.isFinite(v.idx) ? Math.trunc(v.idx) : 0
+      const name = typeof v.name === "string" ? v.name.trim() : ""
+      const desc = typeof v.desc === "string" ? v.desc.trim() : ""
+      if (!idx || !name || !desc) continue
+      nodes.push({ idx, name, desc })
+    }
+    nodes.sort((a, b) => a.idx - b.idx)
+    for (const n of nodes) {
+      hints.push(`行迹${n.idx}：${n.name}：${n.desc}`)
+    }
+  }
+
+  return hints
+}
+
 function buildTableSamples(meta) {
   const out = {}
   const talentData = isRecord(meta.talentData) ? meta.talentData : null
@@ -230,11 +350,20 @@ function pickNamesFromDiff(diffJsonPathAbs, { top, minDev }) {
   for (const d of diffs) {
     const name = typeof d?.name === "string" ? d.name : ""
     const ratio = Number(d?.worst?.ratio)
+    const abs = Number(d?.worst?.abs || 0)
     if (!name) continue
-    if (!Number.isFinite(ratio) || ratio <= 0) continue
+    if (!Number.isFinite(ratio)) continue
+    // Include hard-zero cases: baseline>0 vs generated=0 commonly yields ratio=0.
+    // Prefer regenerating these first (dev=Infinity).
+    if (ratio === 0) {
+      if (!(abs > 0)) continue
+      rows.push({ name, ratio, dev: Number.POSITIVE_INFINITY, abs, title: String(d?.worst?.title || "") })
+      continue
+    }
+    if (ratio < 0) continue
     const dev = ratio >= 1 ? ratio : 1 / ratio
     if (dev < minDev) continue
-    rows.push({ name, ratio, dev, abs: Number(d?.worst?.abs || 0), title: String(d?.worst?.title || "") })
+    rows.push({ name, ratio, dev, abs, title: String(d?.worst?.title || "") })
   }
   rows.sort((a, b) => b.dev - a.dev)
   return rows.slice(0, top).map((r) => r.name)
@@ -254,11 +383,6 @@ const top = Math.max(1, Math.trunc(parseNum(args.top, 12)))
 
 if (game !== "gs" && game !== "sr") {
   console.error(`[regen-calc-batch] invalid --game: ${game}`)
-  process.exitCode = 1
-  process.exit(1)
-}
-if (game !== "gs") {
-  console.error(`[regen-calc-batch] currently only supports --game gs`)
   process.exitCode = 1
   process.exit(1)
 }
@@ -328,11 +452,11 @@ await runPromisePool(
     const elem = typeof metaRaw.elem === "string" ? metaRaw.elem : ""
     const weapon = typeof metaRaw.weapon === "string" ? metaRaw.weapon : ""
     const star = typeof metaRaw.star === "number" && Number.isFinite(metaRaw.star) ? metaRaw.star : 0
-    const tables = getGsTables(metaRaw)
+    const tables = game === "gs" ? getGsTables(metaRaw) : getSrTables(metaRaw)
     if (!tables) throw new Error(`[regen-calc-batch] failed to infer talent tables: ${name}`)
 
-    const { talentDesc, tableUnits, tableTextByName } = buildGsDescAndUnits(metaRaw)
-    const buffHints = buildBuffHintsGs(metaRaw)
+    const { talentDesc, tableUnits, tableTextByName } = game === "gs" ? buildGsDescAndUnits(metaRaw) : buildSrDescAndUnits(metaRaw)
+    const buffHints = game === "gs" ? buildBuffHintsGs(metaRaw) : buildBuffHintsSr(metaRaw)
     const tableSamples = buildTableSamples(metaRaw)
     const tableTextSamples = buildTableTextSamples(tableSamples, tableTextByName)
 
@@ -392,4 +516,3 @@ if (failures.length) {
     console.log(`- ${f.name}: ${f.error}`)
   }
 }
-
