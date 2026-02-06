@@ -163,7 +163,10 @@ async function main() {
 
   const raw = JSON.parse(fs.readFileSync(rawJsonPath, "utf8"))
   const rawKind = detectRawKind(raw)
-  const uid = String(raw?.playerInfo?.uid || raw?.uid || process.env.CIRCALTEST_UID || "")
+  const uid = String(raw?.playerInfo?.uid || raw?.uid || process.env.CIRCALTEST_UID || "").trim()
+  if (uid === "100000000") {
+    throw new Error("[circaltest] forbidden uid=100000000 (do not use this uid for regression tests)")
+  }
 
   const importFromMiao = (rel) => import(pathToFileURL(path.join(sandboxMiaoRoot, rel)).href)
 

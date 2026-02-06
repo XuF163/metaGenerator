@@ -33,6 +33,7 @@ node circaltest/regression.mjs
 说明：
 - 全流程只在 `circaltest/` 下运行：会创建 `circaltest/.sandbox/`（隔离的 miao-plugin 环境）与 `circaltest/evidence/`（证据输出），**不会触碰你的生产环境**。
 - 如需代理：优先读取 `--proxy`，否则读取环境变量 `HTTP_PROXY`。
+- 约束：禁止使用 `uid=100000000` 作为测试 UID（脚本已强制拦截）。
 
 ```powershell
 # 基本用法（GS）
@@ -40,6 +41,9 @@ node circaltest/panel-regression.mjs --uid 147962990
 
 # 使用本地 testData（避免实时拉取；推荐用于可复现实验）
 node circaltest/panel-regression.mjs --useTestdata --uid 147962990 --game gs
+
+# SR：使用本地 testData（SR 不支持 Enka 拉取模式）
+node circaltest/panel-regression.mjs --useTestdata --uid 100000296 --game sr
 
 # 使用代理（按需：本地 10809）
 node circaltest/panel-regression.mjs --uid 147962990 --proxy http://127.0.0.1:10809

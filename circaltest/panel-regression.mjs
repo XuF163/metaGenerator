@@ -212,80 +212,111 @@ function diffRuns(baseline, generated) {
     const entries = []
     let worst = { ratio: null, abs: 0, title: "" }
 
-    // Evidence-first matching:
-    // - Strict: only match when normalized titles are exactly equal.
-    // - Loose (fallback): strip a single leading skill marker (E/Q/A) to match baseline "Qxxx" vs generated "xxx",
-    //   but ONLY when the loose key is unique on both sides (prevents misleading pairings).
-    const gBucketsStrict = new Map()
-    for (const gr0 of gRet) {
-      const gr = gr0 || null
-      const gn = normTitle(gr?.title)
-      if (!gn) continue
-      const list = gBucketsStrict.get(gn) || []
-      list.push(gr)
-      gBucketsStrict.set(gn, list)
+    // Best-effort matching:
+    // - Prefer strict normalized title match.
+    // - Allow loose match (strip leading skill marker / SR mid-markers) when it yields a closer value,
+    //   even if strict matches exist (prevents false positives when generated rows have wrong prefixes).
+    const toFiniteNumOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null)
+    const scoreDiff = (bAvg, gAvg) => {
+      if (bAvg === null || gAvg === null) return Number.POSITIVE_INFINITY
+      if (bAvg === 0) return gAvg === 0 ? 0 : Math.abs(gAvg)
+      if (gAvg <= 0) return Number.POSITIVE_INFINITY
+      const r = gAvg / bAvg
+      if (!Number.isFinite(r) || r <= 0) return Number.POSITIVE_INFINITY
+      return Math.abs(Math.log(r))
     }
 
-    const matchStrict = new Map() // baseline idx -> generated entry
+    const gRows = gRet.map((gr0, gi) => {
+      const gr = gr0 || null
+      return {
+        gi,
+        gr,
+        strict: normTitle(gr?.title),
+        loose: normTitleLoose(gr?.title),
+        avg: toFiniteNumOrNull(gr?.avg),
+        dmg: toFiniteNumOrNull(gr?.dmg)
+      }
+    })
+    const gByStrict = new Map()
+    const gByLoose = new Map()
+    for (const row of gRows) {
+      if (row.strict) {
+        const list = gByStrict.get(row.strict) || []
+        list.push(row.gi)
+        gByStrict.set(row.strict, list)
+      }
+      if (row.loose) {
+        const list = gByLoose.get(row.loose) || []
+        list.push(row.gi)
+        gByLoose.set(row.loose, list)
+      }
+    }
+
+    const usedGenIdx = new Set()
+    const matches = new Map() // baseline idx -> { gi, match }
+    const pickBest = (br, bi) => {
+      const bStrict = normTitle(br?.title)
+      const bLoose = normTitleLoose(br?.title)
+      const bAvg = toFiniteNumOrNull(br?.avg)
+
+      const cand = new Set()
+      for (const gi of (bStrict ? gByStrict.get(bStrict) || [] : [])) {
+        if (!usedGenIdx.has(gi)) cand.add(gi)
+      }
+      if (bLoose && bLoose.length >= 2) {
+        for (const gi of gByLoose.get(bLoose) || []) {
+          if (!usedGenIdx.has(gi)) cand.add(gi)
+        }
+      }
+
+      if (cand.size === 0) return null
+
+      let best = null
+      for (const gi of cand) {
+        const row = gRows[gi]
+        if (!row) continue
+
+        const isStrict = !!bStrict && row.strict === bStrict
+        const match = isStrict ? "strict" : "loose"
+        const penalty = isStrict ? 0 : 0.35
+        const diff = scoreDiff(bAvg, row.avg)
+        const score = penalty + diff
+
+        if (!best || score < best.score - 1e-12) {
+          best = { gi, match, score, diff }
+          continue
+        }
+        if (Math.abs(score - best.score) < 1e-12) {
+          // Tie-break: prefer strict, then smaller diff, then smaller index.
+          if (match === "strict" && best.match !== "strict") best = { gi, match, score, diff }
+          else if (diff < best.diff - 1e-12) best = { gi, match, score, diff }
+          else if (gi < best.gi) best = { gi, match, score, diff }
+        }
+      }
+
+      return best ? { ...best, bi } : null
+    }
+
     for (let i = 0; i < bRet.length; i++) {
       const br = bRet[i] || null
-      const bn = normTitle(br?.title)
-      const bucket = bn ? gBucketsStrict.get(bn) || [] : []
-      const gr = bucket.length ? bucket.shift() : null
-      if (bn) gBucketsStrict.set(bn, bucket)
-      if (gr) matchStrict.set(i, gr)
+      const picked = pickBest(br, i)
+      if (!picked) continue
+      usedGenIdx.add(picked.gi)
+      matches.set(i, { gi: picked.gi, match: picked.match })
     }
 
-    const gUnmatched = []
-    for (const list of gBucketsStrict.values()) {
-      for (const gr0 of list) gUnmatched.push(gr0 || null)
-    }
-
-    const bUnmatchedIdx = []
-    for (let i = 0; i < bRet.length; i++) {
-      if (!matchStrict.has(i)) bUnmatchedIdx.push(i)
-    }
-
-    const bLooseCount = new Map()
-    for (const bi of bUnmatchedIdx) {
-      const br = bRet[bi] || null
-      const k = normTitleLoose(br?.title)
-      if (!k) continue
-      bLooseCount.set(k, (bLooseCount.get(k) || 0) + 1)
-    }
-    const gLooseCount = new Map()
-    const gLooseBucket = new Map()
-    for (const gr of gUnmatched) {
-      const k = normTitleLoose(gr?.title)
-      if (!k) continue
-      gLooseCount.set(k, (gLooseCount.get(k) || 0) + 1)
-      const list = gLooseBucket.get(k) || []
-      list.push(gr)
-      gLooseBucket.set(k, list)
-    }
-
-    const matchLoose = new Map() // baseline idx -> generated entry
-    for (const bi of bUnmatchedIdx) {
-      const br = bRet[bi] || null
-      const k = normTitleLoose(br?.title)
-      if (!k) continue
-      if ((bLooseCount.get(k) || 0) !== 1) continue
-      if ((gLooseCount.get(k) || 0) !== 1) continue
-      const list = gLooseBucket.get(k) || []
-      const gr = list.length ? list[0] : null
-      if (!gr) continue
-      matchLoose.set(bi, gr)
-      gLooseBucket.delete(k)
-    }
-
-    const gUsedLoose = new Set(matchLoose.values())
+    const bMatchedAvgs = []
+    const gMatchedAvgs = []
 
     let outIdx = 0
     for (let i = 0; i < bRet.length; i++) {
       const br = bRet[i] || null
-      const gr = matchStrict.get(i) || matchLoose.get(i) || null
+      const mi = matches.get(i)
+      const gr = mi ? gRows[mi.gi]?.gr || null : null
 
-      const title = (br?.title || gr?.title || "").trim()
+      const baselineTitle = (br?.title || "").trim()
+      const generatedTitle = (gr?.title || "").trim()
+      const title = (baselineTitle || generatedTitle || "").trim()
       const bAvg = typeof br?.avg === "number" ? br.avg : null
       const gAvg = typeof gr?.avg === "number" ? gr.avg : null
       const bDmg = typeof br?.dmg === "number" ? br.dmg : null
@@ -311,12 +342,17 @@ function diffRuns(baseline, generated) {
         } else if (typeof worst.ratio !== "number" && abs > worst.abs) {
           worst = { ratio: null, abs, title }
         }
+
+        bMatchedAvgs.push(bAvg)
+        gMatchedAvgs.push(gAvg)
       }
 
       entries.push({
         idx: outIdx++,
         title,
-        match: matchStrict.has(i) ? "strict" : matchLoose.has(i) ? "loose" : "missing",
+        match: mi ? mi.match : "missing",
+        baselineTitle,
+        generatedTitle,
         baseline: { avg: bAvg, dmg: bDmg },
         generated: { avg: gAvg, dmg: gDmg },
         ratio,
@@ -324,23 +360,30 @@ function diffRuns(baseline, generated) {
       })
     }
 
-    for (const gr0 of gUnmatched) {
-      const gr = gr0 || null
-      if (!gr) continue
-      if (gUsedLoose.has(gr)) continue
-      const title = (gr?.title || "").trim()
-      const gAvg = typeof gr?.avg === "number" ? gr.avg : null
-      const gDmg = typeof gr?.dmg === "number" ? gr.dmg : null
+    for (const row of gRows) {
+      if (!row || usedGenIdx.has(row.gi)) continue
+      const title = (row?.gr?.title || "").trim()
       entries.push({
         idx: outIdx++,
         title,
         match: "generated-only",
+        baselineTitle: "",
+        generatedTitle: title,
         baseline: { avg: null, dmg: null },
-        generated: { avg: gAvg, dmg: gDmg },
+        generated: { avg: typeof row.avg === "number" ? row.avg : null, dmg: typeof row.dmg === "number" ? row.dmg : null },
         ratio: null,
         abs: null
       })
     }
+
+    const bMaxAvgMatched = bMatchedAvgs.length ? Math.max(...bMatchedAvgs) : null
+    const gMaxAvgMatched = gMatchedAvgs.length ? Math.max(...gMatchedAvgs) : null
+    const maxAvgMatchedRatio =
+      bMaxAvgMatched !== null && gMaxAvgMatched !== null && bMaxAvgMatched !== 0
+        ? gMaxAvgMatched / bMaxAvgMatched
+        : bMaxAvgMatched === 0 && gMaxAvgMatched === 0
+          ? 1
+          : null
 
     diffs.push({
       id,
@@ -353,6 +396,12 @@ function diffRuns(baseline, generated) {
         generated: gMaxAvg,
         ratio: maxAvgRatio,
         nonZero: { baseline: bNonZeroAvg, generated: gNonZeroAvg }
+      },
+      maxAvgMatched: {
+        baseline: bMaxAvgMatched,
+        generated: gMaxAvgMatched,
+        ratio: maxAvgMatchedRatio,
+        matched: bMatchedAvgs.length
       },
       createdBy: {
         baseline: b?.dmg?.profile?.createdBy || "",
@@ -369,13 +418,16 @@ function diffRuns(baseline, generated) {
     })
   }
 
-  // Sort by severity (worst ratio distance first).
+  // Sort by severity (maxAvg/worst ratio drift first).
   diffs.sort((a, b) => {
-    const ar = a?.worst?.ratio
-    const br = b?.worst?.ratio
-    const arDist = typeof ar === "number" ? Math.abs(1 - ar) : 0
-    const brDist = typeof br === "number" ? Math.abs(1 - br) : 0
-    if (brDist !== arDist) return brDist - arDist
+    const scoreRatio = (r) => (typeof r === "number" && Number.isFinite(r) && r > 0 ? Math.abs(Math.log(r)) : 0)
+    const score = (d) =>
+      Math.max(scoreRatio(d?.maxAvg?.ratio), scoreRatio(d?.maxAvgMatched?.ratio), scoreRatio(d?.worst?.ratio))
+
+    const as = score(a)
+    const bs = score(b)
+    if (bs !== as) return bs - as
+
     const aa = typeof a?.worst?.abs === "number" ? a.worst.abs : 0
     const ba = typeof b?.worst?.abs === "number" ? b.worst.abs : 0
     return ba - aa
@@ -414,6 +466,13 @@ function renderDiffMd({ uid, game, enemyLv, baselineMetaRoot, generatedMetaRoot,
       const gn = d.maxAvg.nonZero?.generated ?? 0
       lines.push(`- maxAvg(avg): baseline=${b} (${bn} nonZero) | generated=${g} (${gn} nonZero) | ratio=${r}`)
     }
+    if (d.maxAvgMatched) {
+      const b = typeof d.maxAvgMatched.baseline === "number" ? d.maxAvgMatched.baseline.toFixed(2) : "n/a"
+      const g = typeof d.maxAvgMatched.generated === "number" ? d.maxAvgMatched.generated.toFixed(2) : "n/a"
+      const r = typeof d.maxAvgMatched.ratio === "number" ? d.maxAvgMatched.ratio.toFixed(4) : "n/a"
+      const n = d.maxAvgMatched.matched ?? 0
+      lines.push(`- maxAvgMatched(avg): baseline=${b} | generated=${g} | ratio=${r} | matched=${n}`)
+    }
     if (d.dmgError?.baseline || d.dmgError?.generated) {
       lines.push(`- dmgError: baseline=${d.dmgError?.baseline ? "YES" : "NO"} | generated=${d.dmgError?.generated ? "YES" : "NO"}`)
     }
@@ -423,14 +482,21 @@ function renderDiffMd({ uid, game, enemyLv, baselineMetaRoot, generatedMetaRoot,
       lines.push(`- worst: ${d.worst.title} (ratio=${ratio}, abs=${abs})`)
     }
     lines.push("")
-    lines.push("| idx | title | baseline.avg | generated.avg | ratio | abs |")
-    lines.push("|---:|---|---:|---:|---:|---:|")
+    lines.push("| idx | match | title | gen.title | baseline.avg | generated.avg | ratio | abs |")
+    lines.push("|---:|---|---|---|---:|---:|---:|---:|")
+    const esc = (s) => String(s || "").replace(/\|/g, "\\|")
     for (const e of d.entries || []) {
+      const genTitle =
+        e.match === "generated-only"
+          ? e.generatedTitle || ""
+          : e.generatedTitle && e.baselineTitle && e.generatedTitle !== e.baselineTitle
+            ? e.generatedTitle
+            : ""
       const bAvg = e.baseline.avg === null ? "" : e.baseline.avg.toFixed(2)
       const gAvg = e.generated.avg === null ? "" : e.generated.avg.toFixed(2)
       const ratio = e.ratio === null ? "" : e.ratio.toFixed(4)
       const abs = e.abs === null ? "" : e.abs.toFixed(2)
-      lines.push(`| ${e.idx} | ${e.title} | ${bAvg} | ${gAvg} | ${ratio} | ${abs} |`)
+      lines.push(`| ${e.idx} | ${e.match} | ${esc(e.title)} | ${esc(genTitle)} | ${bAvg} | ${gAvg} | ${ratio} | ${abs} |`)
     }
     lines.push("")
   }
@@ -490,6 +556,11 @@ async function main() {
 
   if (!uid) {
     throw new Error(`[circaltest] failed to infer uid (pass --uid explicitly): raw=${rawJsonPath}`)
+  }
+  if (uid === "100000000") {
+    throw new Error(
+      `[circaltest] forbidden uid=100000000 (do not use this uid for regression tests); please pick another uid from testData/${game}/*.json`
+    )
   }
 
   const baselineMetaRoot = toAbs(repoRoot, args.baselineMetaRoot || `temp/metaBaselineRef/meta-${game}`)

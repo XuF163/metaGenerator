@@ -60,6 +60,10 @@
 - 已补齐“运行时结果对照”的面板回归（证据链）：
   - `node circaltest/panel-regression.mjs --uid <UID>`：拉取 Enka 面板 JSON，在 **基线 meta** 与 **生成 meta** 两套环境中分别计算并落盘，输出 `diff/*.md + diff/*.json`。
   - 最新证据示例（滚动）：`circaltest/evidence/*/diff/gs/147962990.md`（同 UID、同角色对照）。
+- SR 面板回归最新进展（`uid=100000296`）：
+  - 证据链：`circaltest/evidence/2026-02-06T03-49-19-834Z/diff/sr/100000296.md`
+  - 关键修正：SR calc 输入扩展到所有 talent blocks（含 `me/mt/...`）+ 推导 `defParams.Memosprite` + 过滤“秘技=开战伤害”类文案避免误生成 `atkPct` buff。
+  - 指标观察：极端偏差显著收敛（max dev 约从 `~159` 降至 `~17`；仍存在少量 0 值/未匹配标题导致的 diff 观感偏大）。
 
 仍需迭代点（运行时差异层面）：
 - `details` 标题/粒度不一定与基线 1:1 对齐（基线可能输出“某技能总伤害/循环伤害”，生成侧可能输出“单段/每跳/分段”），导致 diff 中出现 baseline 行无法匹配或 ratio 看起来偏离。

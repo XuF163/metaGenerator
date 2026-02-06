@@ -453,8 +453,12 @@ function buildSrCalcBuffHints(talent: unknown, cons: unknown, treeData: unknown)
     const z = (talent as Record<string, unknown>).z
     if (isRecord(z)) {
       const name = typeof z.name === 'string' ? (z.name as string).trim() : ''
-      const desc = typeof z.desc === 'string' ? (z.desc as string).trim() : ''
-      if (name && desc) hints.push(`秘技：${name}：${desc}`)
+      const descRaw = typeof z.desc === 'string' ? (z.desc as string) : ''
+      const desc = normalizeTextInline(descRaw).replace(/<[^>]+>/g, '')
+      const isBuffLike =
+        /(提高|提升|增加|降低|减少|加成)/.test(desc) &&
+        /(攻击力|防御力|生命值上限|生命值|速度|暴击率|暴击伤害|伤害|受到.{0,6}伤害|击破|效果命中|效果抵抗|无视|穿透|抗性)/.test(desc)
+      if (name && desc && isBuffLike) hints.push(`秘技：${name}：${desc}`)
     }
   }
 
@@ -660,9 +664,39 @@ function guessSrParamName(opts: {
 
   // Damage params (including mixed skills): infer special cases from local context.
   if (/伤害/.test(around)) {
+    // Break / Super-break damage ratios.
+    // These are not regular "技能伤害" multipliers and should be named explicitly so downstream calc.js
+    // can model them via `reaction("<elem>Break"/"superBreak")` and related buffs.
+    if (/(击破伤害)/.test(local) || /(击破伤害)/.test(around)) {
+      if (/超击破/.test(local) || /超击破/.test(around)) return '超击破伤害比例'
+      return '击破伤害比例'
+    }
+
+    // Repeated-release multipliers: "可重复发动... 伤害倍率依次提高至 $2%/$3% ..."
+    // These MUST have distinct names; miao-plugin maps tables by name and overrides duplicates.
+    if (
+      varCount >= 2 &&
+      /(重复|再次|再度)/.test(descPlain) &&
+      /(依次|分别)/.test(descPlain) &&
+      /(提高|提升|增加).{0,6}至/.test(descPlain) &&
+      /[\/∕]/.test(descPlain)
+    ) {
+      if (outIdx === 2) return '二次释放伤害'
+      if (outIdx === 3) return '三次释放伤害'
+      if (outIdx === 4) return '四次释放伤害'
+      if (outIdx === 5) return '五次释放伤害'
+      if (outIdx === 6) return '六次释放伤害'
+    }
+
+    // Explicit "第N次/二次/三次..." context near the placeholder.
+    if (/(二次|第二次)/.test(local)) return '二次释放伤害'
+    if (/(三次|第三次)/.test(local)) return '三次释放伤害'
+    if (/(四次|第四次)/.test(local)) return '四次释放伤害'
+
     if (/(随机).{0,6}(敌方|目标|单体)/.test(local)) return '随机伤害'
     if (local.includes('持续伤害')) return '持续伤害'
     if (/每段/.test(around)) return '每段伤害'
+    if (/每次/.test(around)) return '每次伤害'
     if (isAdjacentDamage) return '相邻目标伤害'
     if (isCounterDamage) return '反击伤害'
     if (isFollowUpDamage) return varCount <= 1 ? '技能伤害' : '追加攻击伤害'
@@ -836,6 +870,29 @@ function skillDescAndTables(
       name: '削韧',
       isSame: true,
       values: compactConstTables ? [stance] : Array.from({ length: levelLen }, () => stance)
+    }
+  }
+
+  // Ensure table names are unique within this skill.
+  // miao-plugin runtime maps talent tables by name (object key), so duplicates will be overridden and
+  // calc.js will observe missing params (often turning into 0 damage).
+  const nameCounts = new Map<string, number>()
+  for (const t of Object.values(tables)) {
+    const n = typeof t?.name === 'string' ? t.name.trim() : ''
+    if (!n) continue
+    nameCounts.set(n, (nameCounts.get(n) || 0) + 1)
+  }
+  if (Array.from(nameCounts.values()).some((n) => n > 1)) {
+    const seen = new Map<string, number>()
+    for (const t of Object.values(tables)) {
+      const baseName = typeof t?.name === 'string' ? t.name.trim() : ''
+      if (!baseName) continue
+      const total = nameCounts.get(baseName) || 0
+      if (total <= 1) continue
+      const idx = (seen.get(baseName) || 0) + 1
+      seen.set(baseName, idx)
+      if (idx === 1) continue
+      t.name = `${baseName}(${idx})`
     }
   }
 
@@ -1948,8 +2005,37 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     ensurePlaceholderCalcJs(calcPath, name)
 
     if (isPlaceholderCalc(calcPath)) {
-      const getTables = (k: 'a' | 'e' | 'q' | 't'): string[] => {
-        const blk = (talent as Record<string, unknown>)[k]
+      const talentRaw = isRecord(talent) ? (talent as Record<string, unknown>) : {}
+
+      const sortTalentKey = (a: string, b: string): number => {
+        const order = [
+          'a',
+          'a2',
+          'a3',
+          'e',
+          'e1',
+          'e2',
+          'q',
+          'q2',
+          't',
+          't2',
+          'z',
+          'me',
+          'me2',
+          'mt',
+          'mt1',
+          'mt2'
+        ]
+        const ia = order.indexOf(a)
+        const ib = order.indexOf(b)
+        const na = ia === -1 ? 999 : ia
+        const nb = ib === -1 ? 999 : ib
+        if (na !== nb) return na - nb
+        return a.localeCompare(b)
+      }
+
+      const getTables = (k: string): string[] => {
+        const blk = talentRaw[k]
         if (!isRecord(blk)) return []
         const tablesRaw = (blk as Record<string, unknown>).tables
         const entries: Array<{ name: string }> = []
@@ -1967,8 +2053,8 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
           .filter(Boolean)
       }
 
-      const getDesc = (k: 'a' | 'e' | 'q' | 't'): string => {
-        const blk = (talent as Record<string, unknown>)[k]
+      const getDesc = (k: string): string => {
+        const blk = talentRaw[k]
         if (!isRecord(blk)) return ''
         const desc = (blk as Record<string, unknown>).desc
         if (typeof desc === 'string') return desc
@@ -1976,8 +2062,8 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
         return ''
       }
 
-      const getUnitMap = (k: 'a' | 'e' | 'q' | 't'): Record<string, string> => {
-        const blk = (talent as Record<string, unknown>)[k]
+      const getUnitMap = (k: string): Record<string, string> => {
+        const blk = talentRaw[k]
         if (!isRecord(blk)) return {}
         const tablesRaw = (blk as Record<string, unknown>).tables
         const out: Record<string, string> = {}
@@ -1998,15 +2084,91 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
         return out
       }
 
+      const getTableSamples = (k: string): Record<string, unknown> => {
+        const blk = talentRaw[k]
+        if (!isRecord(blk)) return {}
+        const tablesRaw = (blk as Record<string, unknown>).tables
+        const out: Record<string, unknown> = {}
+        const pushTable = (t: unknown): void => {
+          if (!isRecord(t)) return
+          const name = typeof t.name === 'string' ? t.name.trim() : ''
+          if (!name || name in out) return
+          const values = (t as any).values
+          if (!Array.isArray(values) || values.length === 0) return
+          const sample = values[0]
+          // Only include non-scalar samples to keep the prompt compact while still enabling
+          // array schema inference (e.g. [pct, flat] / [pct, hits] tables).
+          if (Array.isArray(sample) || (sample && typeof sample === 'object')) out[name] = sample
+        }
+        if (Array.isArray(tablesRaw)) {
+          for (const t of tablesRaw) pushTable(t)
+        } else if (isRecord(tablesRaw)) {
+          for (const t of Object.values(tablesRaw)) pushTable(t)
+        }
+        return out
+      }
+
+      const getTableTextSamples = (k: string): Record<string, string> => {
+        const blk = talentRaw[k]
+        if (!isRecord(blk)) return {}
+        const tablesRaw = (blk as Record<string, unknown>).tables
+        const out: Record<string, string> = {}
+        const pushTable = (t: unknown): void => {
+          if (!isRecord(t)) return
+          const name = typeof t.name === 'string' ? t.name.trim() : ''
+          if (!name || name in out) return
+          const values = (t as any).values
+          if (!Array.isArray(values) || values.length === 0) return
+          const sampleText = normalizeTextInline(values[0])
+          if (sampleText) out[name] = sampleText
+        }
+        if (Array.isArray(tablesRaw)) {
+          for (const t of tablesRaw) pushTable(t)
+        } else if (isRecord(tablesRaw)) {
+          for (const t of Object.values(tablesRaw)) pushTable(t)
+        }
+        return out
+      }
+
+      const talentKeys = Object.keys(talentRaw)
+        .filter((k) => {
+          const blk = talentRaw[k]
+          if (!isRecord(blk)) return false
+          const tablesRaw = (blk as Record<string, unknown>).tables
+          return Boolean(tablesRaw)
+        })
+        .sort(sortTalentKey)
+
+      const tables: Record<string, string[]> = {}
+      const tableUnits: Record<string, Record<string, string>> = {}
+      const tableSamples: Record<string, Record<string, unknown>> = {}
+      const tableTextSamples: Record<string, Record<string, string>> = {}
+      const talentDesc: Record<string, string> = {}
+      for (const k of talentKeys) {
+        const arr = getTables(k)
+        if (arr.length) tables[k] = arr
+        const units = getUnitMap(k)
+        if (Object.keys(units).length) tableUnits[k] = units
+        const samples = getTableSamples(k)
+        if (Object.keys(samples).length) tableSamples[k] = samples
+        const textSamples = getTableTextSamples(k)
+        if (Object.keys(textSamples).length) tableTextSamples[k] = textSamples
+        const desc = getDesc(k)
+        if (desc) talentDesc[k] = desc
+      }
+
       const input: CalcSuggestInput = {
         game: 'sr',
         name,
         elem,
         weapon,
         star,
-        tables: { a: getTables('a'), e: getTables('e'), q: getTables('q'), t: getTables('t') },
-        tableUnits: { a: getUnitMap('a'), e: getUnitMap('e'), q: getUnitMap('q'), t: getUnitMap('t') },
-        talentDesc: { a: getDesc('a'), e: getDesc('e'), q: getDesc('q'), t: getDesc('t') },
+        // NOTE: SR may include extra talent blocks (e.g. Memory path: me/mt). Keep them available for the LLM.
+        tables: tables as any,
+        tableUnits: tableUnits as any,
+        tableSamples: tableSamples as any,
+        tableTextSamples: tableTextSamples as any,
+        talentDesc: talentDesc as any,
         buffHints: buildSrCalcBuffHints(talent, cons, treeData)
       }
 

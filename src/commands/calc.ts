@@ -86,7 +86,7 @@ function metaGameDir(root: string, game: Game): string {
   return path.join(root, `meta-${game}`)
 }
 
-type CalcTables = Partial<Record<'a' | 'e' | 'q' | 't', string[]>>
+type CalcTables = Record<string, string[]>
 
 function getGsTables(meta: Record<string, unknown>): CalcTables | null {
   const talentData = isRecord(meta.talentData) ? (meta.talentData as Record<string, unknown>) : null
@@ -106,9 +106,10 @@ function getGsTables(meta: Record<string, unknown>): CalcTables | null {
 function getSrTables(meta: Record<string, unknown>): CalcTables | null {
   const talent = isRecord(meta.talent) ? (meta.talent as Record<string, unknown>) : null
   if (!talent) return null
-  const get = (k: 'a' | 'e' | 'q' | 't'): string[] => {
-    const blk = talent[k]
-    if (!isRecord(blk)) return []
+
+  const out: CalcTables = {}
+  for (const [k, blk] of Object.entries(talent)) {
+    if (!isRecord(blk)) continue
     const tablesRaw = (blk as Record<string, unknown>).tables
     const names: string[] = []
     if (Array.isArray(tablesRaw)) {
@@ -120,14 +121,10 @@ function getSrTables(meta: Record<string, unknown>): CalcTables | null {
         if (isRecord(t) && typeof t.name === 'string') names.push((t.name as string).trim())
       }
     }
-    return names.filter(Boolean)
+    const list = names.filter(Boolean)
+    if (list.length) out[k] = list
   }
-  const a = get('a')
-  const e = get('e')
-  const q = get('q')
-  const t = get('t')
-  if (a.length === 0 && e.length === 0 && q.length === 0 && t.length === 0) return null
-  return { a, e, q, t }
+  return Object.keys(out).length ? out : null
 }
 
 function buildBuffHints(game: Game, meta: Record<string, unknown>): string[] {
@@ -175,12 +172,17 @@ function buildBuffHints(game: Game, meta: Record<string, unknown>): string[] {
       }
     }
   } else if (game === 'sr') {
+    const isSrTechniqueBuffLike = (desc: string): boolean =>
+      /(提高|提升|增加|降低|减少|加成)/.test(desc) &&
+      /(攻击力|防御力|生命值上限|生命值|速度|暴击率|暴击伤害|伤害|受到.{0,6}伤害|击破|效果命中|效果抵抗|无视|穿透|抗性)/.test(desc)
+
     const talent = isRecord(meta.talent) ? (meta.talent as Record<string, unknown>) : null
     const z = talent && isRecord(talent.z) ? (talent.z as Record<string, unknown>) : null
     if (z) {
       const name = typeof z.name === 'string' ? (z.name as string).trim() : ''
-      const desc = typeof z.desc === 'string' ? (z.desc as string).trim() : ''
-      if (name && desc) hints.push(`秘技：${name}：${desc}`)
+      const descRaw = typeof z.desc === 'string' ? (z.desc as string) : ''
+      const desc = normalizeTextInline(descRaw)
+      if (name && desc && isSrTechniqueBuffLike(desc)) hints.push(`秘技：${name}：${desc}`)
     }
 
     const consRaw = isRecord(meta.cons) ? (meta.cons as Record<string, unknown>) : null
@@ -289,14 +291,14 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
 	    const tables = game === 'gs' ? getGsTables(metaRaw) : game === 'sr' ? getSrTables(metaRaw) : null
 	    if (!tables) return
 
-	    const talentDesc: Partial<Record<'a' | 'e' | 'q' | 't', string>> = {}
-	    const tableUnits: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
-	    const tableSamples: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, unknown>>> = {}
-	    const tableTextSamples: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
-	    const tableTextByName: Partial<Record<'a' | 'e' | 'q' | 't', Record<string, string>>> = {}
+	    const talentDesc: Record<string, string> = {}
+	    const tableUnits: Record<string, Record<string, string>> = {}
+	    const tableSamples: Record<string, Record<string, unknown>> = {}
+	    const tableTextSamples: Record<string, Record<string, string>> = {}
+	    const tableTextByName: Record<string, Record<string, string>> = {}
 	    const talentRaw = isRecord(metaRaw.talent) ? (metaRaw.talent as Record<string, unknown>) : null
 	    if (talentRaw) {
-	      for (const k of ['a', 'e', 'q', 't'] as const) {
+	      for (const k of Object.keys(tables)) {
 	        const blk = talentRaw[k]
 	        if (!isRecord(blk)) continue
         const desc = (blk as Record<string, unknown>).desc
@@ -335,7 +337,7 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
     // Provide sample values (only for non-scalar tables) to help the LLM distinguish array-typed tables.
 	    const talentDataRaw = isRecord(metaRaw.talentData) ? (metaRaw.talentData as Record<string, unknown>) : null
 	    if (talentDataRaw) {
-	      for (const k of ['a', 'e', 'q', 't'] as const) {
+	      for (const k of Object.keys(tables)) {
 	        const blk = talentDataRaw[k]
 	        if (!isRecord(blk)) continue
 	        const out: Record<string, unknown> = {}
@@ -381,11 +383,11 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
         elem,
         weapon,
         star,
-	        tables,
-	        tableUnits,
-	        tableSamples,
-	        tableTextSamples,
-	        talentDesc,
+	        tables: tables as any,
+	        tableUnits: tableUnits as any,
+	        tableSamples: tableSamples as any,
+	        tableTextSamples: tableTextSamples as any,
+	        talentDesc: talentDesc as any,
 	        buffHints: buildBuffHints(game, metaRaw)
 	      },
       { cacheRootAbs: llmCacheRootAbs, force: options.forceCache }

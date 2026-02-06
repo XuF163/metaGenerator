@@ -93,9 +93,9 @@ function getGsTables(meta) {
 function getSrTables(meta) {
   const talentRaw = isRecord(meta.talent) ? meta.talent : null
   if (!talentRaw) return null
-  const get = (k) => {
-    const blk = talentRaw[k]
-    if (!isRecord(blk)) return []
+  const out = {}
+  for (const [k, blk] of Object.entries(talentRaw)) {
+    if (!isRecord(blk)) continue
     const tablesRaw = blk.tables
     const names = []
     if (Array.isArray(tablesRaw)) {
@@ -107,14 +107,10 @@ function getSrTables(meta) {
         if (isRecord(t) && typeof t.name === "string") names.push(t.name.trim())
       }
     }
-    return names.filter(Boolean)
+    const list = names.filter(Boolean)
+    if (list.length) out[k] = list
   }
-  const a = get("a")
-  const e = get("e")
-  const q = get("q")
-  const t = get("t")
-  if (a.length === 0 && e.length === 0 && q.length === 0 && t.length === 0) return null
-  return { a, e, q, t }
+  return Object.keys(out).length ? out : null
 }
 
 function buildGsDescAndUnits(meta) {
@@ -169,7 +165,34 @@ function buildSrDescAndUnits(meta) {
   const talentRaw = isRecord(meta.talent) ? meta.talent : null
   if (!talentRaw) return { talentDesc, tableUnits, tableTextByName }
 
-  for (const k of ["a", "e", "q", "t"]) {
+  const sortTalentKey = (a, b) => {
+    const order = [
+      "a",
+      "a2",
+      "a3",
+      "e",
+      "e1",
+      "e2",
+      "q",
+      "q2",
+      "t",
+      "t2",
+      "z",
+      "me",
+      "me2",
+      "mt",
+      "mt1",
+      "mt2"
+    ]
+    const ia = order.indexOf(a)
+    const ib = order.indexOf(b)
+    const na = ia === -1 ? 999 : ia
+    const nb = ib === -1 ? 999 : ib
+    if (na !== nb) return na - nb
+    return String(a).localeCompare(String(b))
+  }
+
+  for (const k of Object.keys(talentRaw).sort(sortTalentKey)) {
     const blk = talentRaw[k]
     if (!isRecord(blk)) continue
 
@@ -254,8 +277,12 @@ function buildBuffHintsSr(meta) {
   const z = talentRaw && isRecord(talentRaw.z) ? talentRaw.z : null
   if (z) {
     const name = typeof z.name === "string" ? z.name.trim() : ""
-    const desc = typeof z.desc === "string" ? z.desc.trim() : ""
-    if (name && desc) hints.push(`秘技：${name}：${desc}`)
+    const descRaw = typeof z.desc === "string" ? z.desc : ""
+    const desc = normalizeTextInline(descRaw)
+    const isBuffLike =
+      /(提高|提升|增加|降低|减少|加成)/.test(desc) &&
+      /(攻击力|防御力|生命值上限|生命值|速度|暴击率|暴击伤害|伤害|受到.{0,6}伤害|击破|效果命中|效果抵抗|无视|穿透|抗性)/.test(desc)
+    if (name && desc && isBuffLike) hints.push(`秘技：${name}：${desc}`)
   }
 
   const consRaw = isRecord(meta.cons) ? meta.cons : null
@@ -299,7 +326,7 @@ function buildTableSamples(meta) {
   const out = {}
   const talentData = isRecord(meta.talentData) ? meta.talentData : null
   if (!talentData) return out
-  for (const k of ["a", "e", "q", "t"]) {
+  for (const k of Object.keys(talentData).sort()) {
     const blk = talentData[k]
     if (!isRecord(blk)) continue
     const sampleMap = {}
