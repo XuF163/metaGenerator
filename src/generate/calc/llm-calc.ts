@@ -116,6 +116,7 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
       q: true,
       e: true,
       half: true,
+      halfHp: true,
       // Common state toggles used in baseline meta (GS/SR):
       // - lowHp: below-threshold showcase rows / conditional passives
       // - weak: weakness-broken / debuffed state (SR technique / special effects)
@@ -317,6 +318,8 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
     'windShear',
     'bleed',
     'entanglement',
+    // miao-plugin SR DOT damage kind (used as the 3rd arg of dmg(..., "dot", "skillDot"))
+    'skillDot',
     'lightningBreak',
     'fireBreak',
     'windBreak',
@@ -479,6 +482,36 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
       : ['shock', 'burn', 'windShear', 'bleed', 'entanglement', 'fireBreak', 'iceBreak']
 
   const validateOneBuffPass = (ctx0: any, passLabel: string): void => {
+    const validateBuffNumber = (keyRaw: unknown, ret: number): void => {
+      if (!Number.isFinite(ret)) throw new Error(`buff.data() returned non-finite number`)
+      const key = String(keyRaw || '')
+      if (isCritRateKey(key) && Math.abs(ret) > 100) {
+        throw new Error(`buff.data() returned unreasonable cpct-like value: ${key}=${ret}`)
+      }
+      if (isPercentLikeKey(key) && Math.abs(ret) > 500) {
+        throw new Error(`buff.data() returned unreasonable percent-like value: ${key}=${ret}`)
+      }
+      // SR: tighten sanity bounds for common debuff buckets.
+      // Large values are almost always a unit mistake (e.g. 3% -> 300).
+      if (game === 'sr') {
+        const abs = Math.abs(ret)
+        if (key === 'kx' && abs > 100) {
+          throw new Error(`buff.data() returned unreasonable kx value: ${key}=${ret}`)
+        }
+        if ((key === 'enemyDef' || key === 'enemyIgnore' || key === 'ignore') && abs > 120) {
+          throw new Error(`buff.data() returned unreasonable shred/ignore value: ${key}=${ret}`)
+        }
+        if (key === 'enemydmg' && abs > 250) {
+          throw new Error(`buff.data() returned unreasonable enemydmg value: ${key}=${ret}`)
+        }
+      }
+      // Extremely negative percent-like values almost always mean a unit/semantics mistake
+      // (e.g. `talent.xxx - 100` when talent.xxx is actually a small percent per stack/energy).
+      if (isPercentLikeKey(key) && ret < -80) {
+        throw new Error(`buff.data() returned suspicious negative percent-like value: ${key}=${ret}`)
+      }
+    }
+
     for (const b of buffs) {
       if (!b || typeof b !== 'object') continue
       try {
@@ -502,6 +535,10 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
       const data = (b as any).data
       if (data && typeof data === 'object' && !Array.isArray(data)) {
         for (const [k, v] of Object.entries(data)) {
+          if (typeof v === 'number') {
+            validateBuffNumber(k, v)
+            continue
+          }
           if (typeof v !== 'function') continue
           try {
             const prev = ctx0.currentTalent
@@ -517,19 +554,7 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
 
                 const ret = v(ctx0)
                 if (typeof ret === 'number') {
-                  if (!Number.isFinite(ret)) throw new Error(`buff.data() returned non-finite number`)
-                  const key = String(k || '')
-                  if (isCritRateKey(key) && Math.abs(ret) > 100) {
-                    throw new Error(`buff.data() returned unreasonable cpct-like value: ${key}=${ret}`)
-                  }
-                  if (isPercentLikeKey(key) && Math.abs(ret) > 500) {
-                    throw new Error(`buff.data() returned unreasonable percent-like value: ${key}=${ret}`)
-                  }
-                  // Extremely negative percent-like values almost always mean a unit/semantics mistake
-                  // (e.g. `talent.xxx - 100` when talent.xxx is actually a small percent per stack/energy).
-                  if (isPercentLikeKey(key) && ret < -80) {
-                    throw new Error(`buff.data() returned suspicious negative percent-like value: ${key}=${ret}`)
-                  }
+                  validateBuffNumber(k, ret)
                 } else if (ret === undefined || ret === null || ret === false || ret === '') {
                   // ok (skipped by miao-plugin runtime)
                 } else if (ret === true) {
@@ -553,8 +578,12 @@ function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void {
   // Validate buffs with two different talent/weapon samples:
   // - moderate sample catches missing `/100` style unit bugs (values explode)
   // - small sample catches `- 100` style conversion bugs (values collapse to ~-100)
-  validateOneBuffPass(mkCtx(20), 'N=20')
-  validateOneBuffPass(mkCtx(1), 'N=1')
+  // Note: SR talent tables store many percentages as ratios (0~1). Use a smaller scalar sample there,
+  // otherwise correct `*100` conversions will be falsely flagged as "unreasonable percent-like values".
+  const buffNModerate = game === 'sr' ? 0.2 : 20
+  const buffNSmall = game === 'sr' ? 0.01 : 1
+  validateOneBuffPass(mkCtx(buffNModerate), `N=${buffNModerate}`)
+  validateOneBuffPass(mkCtx(buffNSmall), `N=${buffNSmall}`)
 }
 
 export interface CalcSuggestInput {
@@ -800,7 +829,8 @@ function isAllowedMiaoBuffDataKey(game: string, key: string): boolean {
   if (/^(speed|recharge|cpct|cdmg|heal|dmg|enemydmg|effPct|effDef|shield|stance)(Plus|Pct|Inc)?$/.test(key)) return true
   if (/^(enemyDef|enemyIgnore|ignore)$/.test(key)) return true
   if (/^(kx|multi)$/.test(key)) return true
-  if (/^(a|a2|a3|e|e2|q|q2|t|me|me2|mt|mt2|dot|break)(Def|Ignore|Dmg|Enemydmg|Plus|Pct|Cpct|Cdmg|Multi|Elevated)$/.test(key))
+  // Keep aligned with miao-plugin's DmgAttr key parsing (SR does NOT recognize e2/q2/me2/mt2 in buff keys).
+  if (/^(a|a2|a3|e|q|t|me|mt|dot|break)(Def|Ignore|Dmg|Enemydmg|Plus|Pct|Cpct|Cdmg|Multi|Elevated)$/.test(key))
     return true
   if (/^elation(Pct|Enemydmg|Merrymake|Def|Ignore)?$/.test(key)) return true
   return false
@@ -828,7 +858,10 @@ function shortenText(text: string, maxLen: number): string {
 function pickDamageTable(tables: string[]): string | undefined {
   const list = normalizeTableList(tables)
   // Prefer explicit damage tables; avoid cooldown/energy/toughness-only tables.
-  const dmg = list.find((t) => /伤害/.test(t))
+  // Many SR kits include buff tables like "伤害提高/抗性穿透提高/基础概率提高" which MUST NOT be treated as damage multipliers.
+  const isBuffLike = (t: string): boolean =>
+    /(提高|提升|增加|降低|减少|加成|增伤|穿透|抗性穿透|无视|概率|几率|命中|抵抗|击破效率|削韧|冷却|能量|回合|持续时间)/.test(t)
+  const dmg = list.find((t) => /伤害/.test(t) && !isBuffLike(t))
   if (dmg) return dmg
   // If no obvious damage table exists, skip (prevents generating nonsense like "战技伤害" -> "生命上限提高").
   return undefined
@@ -1102,11 +1135,11 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '  - cons: 1..6；用于限制该 detail 只在对应命座生效时展示/计算。',
     '  - 如果某些伤害在特定状态下才成立（例如 夜魂、月兆、Q期间、满层/满战意），请用不同的 detail 行来表达：',
     '    - 通过 key 使用标签（例如 "e,nightsoul" / "q,nightsoul"）来触发对应的增益域；必要时配合 params 设置默认状态。',
-    '    - GS params 约定（推荐）：e/q/off_field/half 等；例如 E后状态 detail 写 params: { e: true }；对应 buff 用 params.e 判定。',
+    '    - GS params 约定（推荐）：e/q/off_field/halfHp 等；例如 E后状态 detail 写 params: { e: true }；对应 buff 用 params.e 判定；半血阈值用 params.halfHp（≤50%）。',
     '    - 如果描述明确是固定层数（例如 2层/满层），直接按该层数输出，不要额外引入 stack 参数；只有层数可调时才用 params。',
     '    - 若表名/描述出现 "0/1/2/3" 这种档位（例如「汲取0/1/2/3枚...」），并且该表在运行时返回数组，默认按最大档位（最后一个索引）使用，不要额外引入 params。',
     '    - 若机制是可叠加的数值（例如 战意/层数/计数），请用一个数值型 params 表示叠加层数，并至少给出 1 条 detail 用最大值（满层/满战意/上限）。',
-    '    - 对于“生命值低于/高于xx%”这类当前血量条件：不要用 attr.hp/hpBase 做判断；可直接假设满足（基线常默认），或用 params.half 之类开关。',
+    '    - 对于“生命值低于/高于xx%”这类当前血量条件：不要用 attr.hp/hpBase 做判断；可用 params.halfHp 开关表达（仅在对应行/条件下启用）。',
     '- GS key 建议：普攻=a，重击=a2，下落=a3；元素战技=e；元素爆发=q；可在后面追加标签（逗号分隔）。',
     '- GS: 关于 details[i].ele（dmg(...) 的第三参）：',
     '  - ele 是“元素/反应”参数（如 vaporize/melt/... 或 phy）。绝大多数条目不要写 phy（会切换到物伤加成桶，可能丢失通用 dmg 加成），只有明确需要物理体系/物理特化时才写。',
@@ -1124,12 +1157,21 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '    - 若表值本身就是“总倍率%”（常见 100~400），请直接输出数字（例如 137.9），本地会自动折算为 Multi 的 delta。',
     '    - 若表值很小（例如 0.3），通常是“每点能量/每层/每次”的系数：应乘上对应的能量/层数（优先用 talent.q["元素能量"] 或 params.num），不要减 100。',
     '    - 常见例子：talent.e 存在「元素爆发伤害提高」（数值很小），且 q 表存在「元素能量」时，通常表示“每点能量提升X%爆发伤害”：buff 应写 qDmg = talent.e["元素爆发伤害提高"] * talent.q["元素能量"]。',
+    '    - 常见例子：被动写“元素伤害加成提升程度相当于元素充能效率的20%” => buff 写 dmg = calc(attr.recharge) * 0.2。',
+    '    - 常见例子：被动写“基于元素充能效率超过100%的部分，每1%提升0.4%元素伤害加成” => dmg = Math.max(calc(attr.recharge) - 100, 0) * 0.4。',
+    '    - 若 q 表存在「伤害加成」这类 buff 表名，通常应写入 buffs（例如 dmg: talent.q["伤害加成"]），不要当作 details 的伤害倍率表。',
     '- GS 提示：若 a 表存在明显的“特殊重击/蓄力形态”表名（例如包含「重击·」/「持续伤害」/「蓄力」），请让“重击伤害/重击”条目优先代表该特殊形态，而不是普通「重击伤害」。',
     '- SR key 建议：普攻=a；战技=e；终结技=q；天赋=t（追击等）；可在后面追加逗号标签。',
-	    '- details 可选字段：dmgExpr 用于表达复杂公式（当需要多属性混合、多段合计、或多表/条件分支时）。',
-	    '  - dmgExpr: JS 表达式（不要写 function/箭头函数），必须返回 dmg(...) 的结果对象；可用变量 talent, attr, calc, params, cons, weapon, trees, dmg, toRatio；不要使用 currentTalent（detail 运行时不可用）。',
-	    '  - GS: 如果 talent.<a/e/q>["表名2"] 在运行时返回数组（如 [atkPct, masteryPct] 或 [pct, flat]），请在 dmgExpr 中用 [0]/[1] 取值，不要直接把数组传给 dmg(...)。',
-	    '  - GS: 如果“表值文字样本”里出现 "*N"（例如 "57.28%*2" / "1.41%HP*5" / "80%ATK×3"），并且该表的样本值形如 [x, N]，表示“多段/次数倍率”，应使用乘法：base * x/100 * N（不要写成 + N）。',
+    '- SR 重要提示：表名含「提高/提升/增加/加成/增伤/抗性穿透/无视防御/防御降低/概率/效果命中/效果抵抗/击破效率/削韧」通常是 buffs/debuff 表，不要把它当作 details 的“伤害倍率表”用于 dmg(...)；应写入 buffs.data（否则会把 buff 当成伤害倍率，面板回归会出现 1.5x~3x 的离群偏差）。',
+    '  - 例：talent.t["伤害提高"] => buffs: { dmg: talent.t["伤害提高"] }（SR 通常还需要 *100 转为百分数点）。',
+    '  - 例：talent.q["抗性穿透提高"] => buffs: { kx: talent.q["抗性穿透提高"] }（并建议用 params.qBuff gating）。',
+    '  - 例：talent.q["防御力降低"] => buffs: { enemyDef: talent.q["防御力降低"] }。',
+    '  - 例："...基础概率..." / "...效果命中..." 不影响伤害，不要写成 dmg/eDmg/qDmg。',
+    '- SR 相邻目标：若同一招式存在「X」与「X(2)」，且 detail 标题包含「相邻/次要目标」，优先用「X(2)」。',
+ 	    '- details 可选字段：dmgExpr 用于表达复杂公式（当需要多属性混合、多段合计、或多表/条件分支时）。',
+ 	    '  - dmgExpr: JS 表达式（不要写 function/箭头函数），必须返回 dmg(...) 的结果对象；可用变量 talent, attr, calc, params, cons, weapon, trees, dmg, toRatio；不要使用 currentTalent（detail 运行时不可用）。',
+ 	    '  - GS: 如果 talent.<a/e/q>["表名2"] 在运行时返回数组（如 [atkPct, masteryPct] 或 [pct, flat]），请在 dmgExpr 中用 [0]/[1] 取值，不要直接把数组传给 dmg(...)。',
+ 	    '  - GS: 如果“表值文字样本”里出现 "*N"（例如 "57.28%*2" / "1.41%HP*5" / "80%ATK×3"），并且该表的样本值形如 [x, N]，表示“多段/次数倍率”，应使用乘法：base * x/100 * N（不要写成 + N）。',
 	    '  - 提示：如果“表值样本”里出现了某个表名，说明该表在运行时返回数组/对象；不在样本里的表通常是 number。',
 	    '  - 对于出现在“表值样本”里的表名（通常以 2 结尾），优先选它作为 table；常见 [pct,flat] / [pct,hits] / [%stat + %stat] 由生成器处理，只有复杂合计才用 dmgExpr。',
 	    '  - 若同一招式同时存在 X 与 X2 两个表名，且 X2 出现在“表值样本”（数组）里：优先只输出 X2（更准确），不要重复输出 X（避免重复与误判缩放）。',
@@ -1245,6 +1287,10 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
   ].join('\n')
 
   const userText = user.length > 18_000 ? userCompact : user
+  const userTextFinal =
+    input.game === 'sr'
+      ? `${userText}\n\nSR 提示：SR talent 表里的很多“百分比”是比例值（例如 0.4 表示 40%）；但 miao-plugin 的 buffs.data（如 atkPct/cpct/cdmg/dmg/...）按“百分数数值”存储（40）。因此从 talent 表取值作为 buff 百分比时通常需要乘以 100。`
+      : userText
 
   return [
     {
@@ -1253,7 +1299,7 @@ function buildMessages(input: CalcSuggestInput): ChatMessage[] {
         '你是一个谨慎的 Node.js/JS 工程师，熟悉 miao-plugin 的 calc.js 结构。' +
         ' 你必须严格按要求输出 JSON，不要输出解释、Markdown、代码块。'
     },
-    { role: 'user', content: userText }
+    { role: 'user', content: userTextFinal }
   ]
 }
 
@@ -1593,6 +1639,81 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
     }
   }
 
+  // SR: Hakush tables often use generic names like "技能伤害/技能伤害(2)" without units,
+  // and the *first* "技能伤害" may actually represent a debuff value (e.g. 防御力降低).
+  // Infer intent tables from the talent description placeholder contexts to:
+  // - pick a safer canonical table for generic "普攻/战技/终结技伤害" rows
+  // - derive core debuff buffs (enemyDef/enemydmg) when the model misses them
+  type SrDescIntent = 'directDmg' | 'enemydmg' | 'enemyDef'
+  const srIntentTableByTalent = new Map<TalentKey, Partial<Record<SrDescIntent, string>>>()
+  const srCanonicalSkillDamageTable = new Map<TalentKey, string>()
+  if (input.game === 'sr') {
+    const inferIntentTables = (talentKey: TalentKey, descRaw: unknown): Partial<Record<SrDescIntent, string>> => {
+      const desc = normalizePromptText(descRaw)
+      if (!desc) return {}
+      const allowed = tables[talentKey] || []
+      if (allowed.length === 0) return {}
+
+      const out: Partial<Record<SrDescIntent, string>> = {}
+      const re = /\$(\d+)\[[^\]]*\]/g
+      for (const m of desc.matchAll(re)) {
+        const idx = Number(m[1])
+        if (!Number.isFinite(idx) || idx < 1 || idx > 20) continue
+        const table = allowed[idx - 1]
+        if (!table) continue
+
+        const pos = typeof m.index === 'number' ? m.index : -1
+        const before = pos >= 0 ? desc.slice(Math.max(0, pos - 60), pos) : ''
+        const after = pos >= 0 ? desc.slice(pos, Math.min(desc.length, pos + 100)) : ''
+
+        if (!out.enemyDef && /防御力降低/.test(before)) {
+          out.enemyDef = table
+          continue
+        }
+        if (!out.enemydmg && /受到.{0,10}伤害(?:提高|提升|增加)/.test(before)) {
+          out.enemydmg = table
+          continue
+        }
+        if (
+          !out.directDmg &&
+          /造成/.test(before) &&
+          /伤害/.test(after) &&
+          /(攻击力|生命上限|生命值上限|最大生命值|生命值|防御力)/.test(after)
+        ) {
+          out.directDmg = table
+          continue
+        }
+      }
+      return out
+    }
+
+    for (const tk0 of Object.keys(tables)) {
+      const tk = tk0 as TalentKey
+      const allowed = tables[tk] || []
+      const inferred = inferIntentTables(tk, (input.talentDesc as any)?.[tk])
+      if (Object.keys(inferred).length) srIntentTableByTalent.set(tk, inferred)
+      if (allowed.includes('技能伤害')) {
+        const canonical = inferred.directDmg && allowed.includes(inferred.directDmg) ? inferred.directDmg : '技能伤害'
+        srCanonicalSkillDamageTable.set(tk, canonical)
+      }
+    }
+  }
+
+  const srIsBuffOnlyTableName = (tableNameRaw: unknown): boolean => {
+    if (input.game !== 'sr') return false
+    const tn = normalizePromptText(tableNameRaw)
+    if (!tn) return false
+    // Whitelist: real output tables (damage / break / special hits).
+    if (
+      /(技能伤害|每段伤害|附加伤害|追加攻击伤害|追击伤害|反击伤害|持续伤害|dot|击破伤害|超击破|秘技伤害)/i.test(tn)
+    ) {
+      return false
+    }
+    // Anything that reads like "increase/decrease/penetration/chance" is a buff/debuff table, not a dmg multiplier table.
+    if (/(提高|提升|增加|降低|减少|加成|增伤|穿透|抗性穿透|无视|概率|几率|命中|抵抗|击破效率|削韧)/.test(tn)) return true
+    return false
+  }
+
   const detailsRaw = Array.isArray(plan.details) ? plan.details : []
   const detailsIn = clampDetails(detailsRaw, 20)
   const details: CalcSuggestDetail[] = []
@@ -1719,7 +1840,38 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
 	        tableFinal = t2
 	      }
 	    }
-	    if (!allowed.includes(tableFinal)) continue
+      // SR: Prefer the canonical "技能伤害" table for generic A/E/Q rows.
+      // LLMs often pick nearby tables like "附加伤害", which can systematically drift baseline comparisons.
+      if (kind === 'dmg' && input.game === 'sr' && allowed.includes('技能伤害')) {
+        const t = normalizePromptText(title)
+        const talentKey = String(talent || '')
+        const isGeneric =
+          ((/普攻|普通攻击/.test(t) && talentKey.startsWith('a')) ||
+            (/战技/.test(t) && talentKey.startsWith('e')) ||
+            (/终结技/.test(t) && talentKey.startsWith('q'))) &&
+          !/(追加|附加|持续|DOT|秘技|强化|反击|击破|超击破|灼烧|触电|风化|裂伤|纠缠|冻结)/i.test(t)
+        if (isGeneric) {
+          const canon = srCanonicalSkillDamageTable.get(talent) || '技能伤害'
+          if (canon && allowed.includes(canon)) tableFinal = canon
+        }
+      }
+  	    if (!allowed.includes(tableFinal)) continue
+
+      // SR: Guardrail — drop non-damage mechanics mistakenly modeled as `kind=dmg`.
+      // This commonly happens when SR ParamList tables are generically named (参数1/2/...) and LLMs emit them as damage rows.
+      if (kind === 'dmg' && input.game === 'sr') {
+        const t = normalizePromptText(title)
+        if (
+          /(基础概率|概率|几率|效果命中|效果抵抗|命中|抵抗|持续时间|回合|削韧|击破效率|层数上限|次数)/.test(t) ||
+          (/(抗性降低|防御力降低|攻击力降低|速度降低)/.test(t) && !/伤害/.test(t))
+        ) {
+          continue
+        }
+      }
+
+      // SR: "伤害提高/抗性穿透/概率..." tables are buffs, not direct damage multiplier tables.
+      // Keep calc.js aligned with baseline semantics: these should become buffs.data instead of dmg details.
+      if (kind === 'dmg' && input.game === 'sr' && srIsBuffOnlyTableName(tableFinal)) continue
 
       // Guardrail: GS heal/shield rows are frequently hallucinated from unrelated "上限/阈值/持续时间/能量" tables.
       // Drop such rows early to avoid wildly inflated avg values in panel regression (e.g. using "赤鬃之血上限"
@@ -1830,27 +1982,364 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
 	      // Guardrail: dmgExpr must be derived from at least one concrete talent table.
 	      // Expressions based only on attr/params/const are often hallucinations (e.g. `calc(attr.atk) * 2`)
 	      // and can explode maxAvg in panel regression.
-	      if (!/\btalent\?*\.[A-Za-z_][A-Za-z0-9_]*\s*\[\s*(['"])/.test(dmgExpr)) {
-	        throw new Error(`[meta-gen] invalid LLM plan: detail.dmgExpr must reference talent tables`)
+	      const hasTalentTableRef = /\btalent\?*\.[A-Za-z_][A-Za-z0-9_]*\s*\[\s*(['"])/.test(dmgExpr)
+	      if (!hasTalentTableRef) {
+	        // Drop hallucinated custom formulas but keep the row (fall back to structured table rendering).
+	      } else {
+	        // Guardrail: dmgExpr must return a calcRet-like object (or call dmg/heal/shield/reaction).
+	        // Some models output a plain number expression (e.g. `talent.t["伤害提高"] * 100`) which breaks runtime.
+	        const looksLikeObjLiteral = /\{\s*[^}]*\bavg\s*:/.test(dmgExpr)
+	        const looksLikeCalcRet = /\b(?:dmg|heal|shield|reaction)\s*\(/.test(dmgExpr) || looksLikeObjLiteral
+	        // Another common failure mode: returning only `.avg`/`.dmg` (a number) instead of the full ret object.
+	        const returnsScalar = !looksLikeObjLiteral && /\.\s*(?:avg|dmg)\s*$/.test(dmgExpr)
+	        if (!looksLikeCalcRet || returnsScalar) {
+	          // Drop invalid formulas but keep the row (fall back to structured table rendering).
+	        } else {
+	        // Disallow hardcoding transformative reaction ids inside dmgExpr (should use kind=reaction instead).
+	        if (
+	          input.game === 'gs' &&
+	          /(['"])(?:swirl|crystallize|bloom|hyperbloom|burgeon|burning|overloaded|electrocharged|superconduct|shatter|lunarcharged|lunarbloom|lunarcrystallize)\1/i.test(
+	            dmgExpr
+	          )
+	        ) {
+	          throw new Error(
+	            `[meta-gen] invalid LLM plan: detail.dmgExpr must not hardcode transformative reactions (use kind=reaction)`
+	          )
+	        }
+	        validateTalentTableRefs(dmgExpr)
+	        out.dmgExpr = dmgExpr
+	        }
 	      }
-	      // Disallow hardcoding transformative reaction ids inside dmgExpr (should use kind=reaction instead).
-	      if (
-	        input.game === 'gs' &&
-	        /(['"])(?:swirl|crystallize|bloom|hyperbloom|burgeon|burning|overloaded|electrocharged|superconduct|shatter|lunarcharged|lunarbloom|lunarcrystallize)\1/i.test(
-	          dmgExpr
-	        )
-	      ) {
-	        throw new Error(
-	          `[meta-gen] invalid LLM plan: detail.dmgExpr must not hardcode transformative reactions (use kind=reaction)`
-	        )
-	      }
-	      validateTalentTableRefs(dmgExpr)
-	      out.dmgExpr = dmgExpr
 	    }
     details.push(out)
   }
 
   if (details.length === 0) throw new Error(`[meta-gen] invalid LLM plan: no valid details`)
+
+  // SR: Correct common "(2)" variant mixups (main vs adjacent target) using title hints.
+  // LLMs frequently reuse the main-target "技能伤害" table for adjacent-target rows, causing 1.5x~3x deviations.
+  if (input.game === 'sr') {
+    const parseVariant = (nameRaw: unknown): { base: string; idx: number } => {
+      const name = String(nameRaw || '').trim()
+      if (!name) return { base: '', idx: 1 }
+      const m = /^(.*?)(?:\(|（)(\d{1,2})(?:\)|）)\s*$/.exec(name)
+      if (m) {
+        const idx = Number(m[2])
+        return { base: String(m[1] || '').trim(), idx: Number.isFinite(idx) && idx >= 1 ? Math.trunc(idx) : 1 }
+      }
+      return { base: name, idx: 1 }
+    }
+
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (d.kind !== 'dmg') continue
+      const title = normalizePromptText(d.title)
+      if (!title) continue
+      const tk = typeof d.talent === 'string' ? (d.talent as TalentKey) : undefined
+      const table = typeof d.table === 'string' ? d.table : ''
+      if (!tk || !table) continue
+      const allowed = tables[tk] || []
+      if (!allowed.length) continue
+
+      const { base, idx } = parseVariant(table)
+      if (!base) continue
+
+      const wantsAdjacent = /(相邻|次要|副目标)/.test(title)
+      const wantsMain = /(主目标|主目標)/.test(title)
+
+      const isAdjacentName = (nameRaw: unknown): boolean => /(相邻|次要|副目标)/.test(normalizePromptText(nameRaw))
+      const isValidDmgTable = (nameRaw: unknown): boolean => {
+        const t = normalizePromptText(nameRaw)
+        if (!t) return false
+        if (srIsBuffOnlyTableName(t)) return false
+        return /伤害/.test(t)
+      }
+
+      const pickAdjacentTable = (): string | null => {
+        const explicit = allowed.find((t) => isAdjacentName(t) && isValidDmgTable(t))
+        if (explicit) return explicit
+        const cand = `${base}(2)`
+        return allowed.includes(cand) ? cand : null
+      }
+
+      const pickMainTable = (): string | null => {
+        if (!isAdjacentName(base) && allowed.includes(base)) return base
+        const canon = srCanonicalSkillDamageTable.get(tk)
+        if (canon && allowed.includes(canon) && !isAdjacentName(canon)) return canon
+        const fallback = allowed.find(
+          (t) =>
+            isValidDmgTable(t) &&
+            !isAdjacentName(t) &&
+            !/(?:\(|（)\s*(?:2|3|4|5|6)\s*(?:\)|）)\s*$/.test(t)
+        )
+        return fallback || null
+      }
+
+      // Adjacent/secondary targets: some kits use explicit names like "相邻目标伤害" instead of "X(2)".
+      if (wantsAdjacent && idx === 1) {
+        const cand = pickAdjacentTable()
+        if (cand) d.table = cand
+        continue
+      }
+
+      // Main target: prefer the base table (or canonical skill damage table) when a "(2)" or adjacent table is selected.
+      if (wantsMain && (idx >= 2 || isAdjacentName(table))) {
+        const cand = pickMainTable()
+        if (cand) d.table = cand
+      }
+    }
+  }
+
+  // SR: When unit hints are missing (tables often contain only numeric values), the LLM may omit `stat`
+  // and we would fall back to ATK scaling, causing extreme underestimation for HP/DEF-scaling kits.
+  // Infer single-stat scaling from talent descriptions / table text samples when unambiguous.
+  if (input.game === 'sr') {
+      const inferSingleStatFromText = (raw: unknown): CalcScaleStat | null => {
+        const s = normalizePromptText(raw)
+        if (!s) return null
+        const hasHp = /(生命上限|生命值上限|最大生命值|生命值|\bhp\b)/i.test(s)
+        // NOTE: do NOT treat generic “攻击” as ATK-scaling hint (e.g. “连携攻击”).
+        const hasAtk = /(攻击力|\batk\b)/i.test(s)
+        const hasDef = /(防御力|防御|\bdef\b)/i.test(s)
+        const hits = Number(hasHp) + Number(hasAtk) + Number(hasDef)
+        if (hits !== 1) return null
+        if (hasHp) return 'hp'
+      if (hasDef) return 'def'
+      if (hasAtk) return 'atk'
+      return null
+    }
+
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (d.kind === 'reaction') continue
+      const tk = typeof d.talent === 'string' ? String(d.talent) : ''
+      const table = typeof d.table === 'string' ? String(d.table) : ''
+      if (!tk || !table) continue
+
+      const cur = typeof (d as any).stat === 'string' ? String((d as any).stat) : ''
+      const unit = (input.tableUnits as any)?.[tk]?.[table]
+      const textSample = (input.tableTextSamples as any)?.[tk]?.[table]
+      const desc = (input.talentDesc as any)?.[tk]
+      const inferred = inferSingleStatFromText(unit) || inferSingleStatFromText(textSample) || inferSingleStatFromText(desc)
+      if (!inferred) continue
+      // Only override when the inferred stat is non-ATK (ATK is the safe default for SR).
+      if (inferred === 'hp' || inferred === 'def') {
+        if (!cur || cur === 'atk') (d as any).stat = inferred
+      }
+    }
+  }
+
+  // SR: Some dmg tables represent an additive "multiplier increase" (e.g. "...倍率提高") that should be added on
+  // top of a base damage multiplier table from another talent block (baseline commonly models it as base + delta).
+  // Weak models frequently emit the delta table as a standalone dmg row, causing extreme underestimation (~0.05x).
+  if (input.game === 'sr') {
+    const isDeltaMultTable = (t: string): boolean => /(伤害)?倍率(提高|提升|增加)/.test(String(t || ''))
+    const norm = (s: string): string => normalizePromptText(s).replace(/\s+/g, '')
+    const stripEnhancePrefix = (s: string): string =>
+      norm(s)
+        .replace(/[()（）【】\[\]<>]/g, '')
+        .replace(/^(?:终结技|战技|普攻|普通攻击|天赋|秘技)+/g, '')
+        .replace(/(?:终结技|战技|普攻|普通攻击|天赋|秘技)/g, '')
+        .replace(/(?:强化|加强|增强|提升|提高|额外|追加)+/g, '')
+        .trim()
+
+    const srTables = (input.tables || {}) as any
+    const listTables = (tk: string): string[] => (Array.isArray(srTables[tk]) ? (srTables[tk] as string[]) : [])
+    const candidatesByTalent: Array<{ tk: TalentKey; tables: string[] }> = Object.keys(srTables)
+      .map((tk) => ({ tk, tables: listTables(tk) }))
+      .filter((x) => x.tk && x.tables.length > 0)
+
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (d.kind !== 'dmg') continue
+      if (typeof (d as any).dmgExpr === 'string' && (d as any).dmgExpr.trim()) continue
+      const deltaTk = typeof d.talent === 'string' ? String(d.talent) : ''
+      const deltaTable = typeof d.table === 'string' ? String(d.table) : ''
+      if (!deltaTk || !deltaTable) continue
+      if (!isDeltaMultTable(deltaTable)) continue
+
+      // Infer base table by stripping common "强化/终结技..." prefixes from the title.
+      const titleToken = stripEnhancePrefix(d.title || '')
+      if (!titleToken || titleToken.length < 2) continue
+
+      let best: { tk: TalentKey; table: string; score: number } | null = null
+      for (const cand of candidatesByTalent) {
+        const tk = String(cand.tk || '').trim()
+        if (!tk || tk === deltaTk) continue
+        for (const t of cand.tables) {
+          const tn = String(t || '').trim()
+          if (!tn) continue
+          if (isDeltaMultTable(tn)) continue
+          if (!/伤害/.test(tn)) continue
+          const tNorm = norm(tn)
+          const eq = tNorm === titleToken
+          const hit = eq || tNorm.includes(titleToken) || titleToken.includes(tNorm)
+          if (!hit) continue
+          const score = eq ? 3 : 2
+          if (!best || score > best.score) best = { tk: cand.tk, table: tn, score }
+        }
+      }
+      if (!best) continue
+
+      // Prefer the base talent key for dmgKey/buff buckets when the model didn't specify one.
+      if (!d.key || String(d.key || '').trim() === deltaTk) d.key = String(best.tk)
+      const keyLit = JSON.stringify(String(d.key || best.tk))
+      const eleLit = typeof d.ele === 'string' && d.ele.trim() ? `, ${JSON.stringify(d.ele.trim())}` : ''
+
+      ;(d as any).dmgExpr = `dmg(talent.${String(best.tk)}[${JSON.stringify(best.table)}] + talent.${deltaTk}[${JSON.stringify(
+        deltaTable
+      )}], ${keyLit}${eleLit})`
+    }
+  }
+
+  // SR: DOT detonation patterns (e.g. "引爆持续伤害").
+  // Baseline meta often models "终结技伤害" as direct damage + a triggered DOT instance.
+  // When the required tables exist, patch the main ult dmg row to include that DOT term.
+  if (input.game === 'sr') {
+    const qTables = (tables as any).q || []
+    const qDesc = normalizePromptText((input.talentDesc as any)?.q)
+    // Support multiple upstream naming styles:
+    // - baseline-like: "回合持续伤害" + "额外持续伤害"
+    // - hakush-style: "持续伤害" (dot ratio) + "技能伤害(2)" (detonation ratio)
+    const dotBaseTable =
+      Array.isArray(qTables) && qTables.includes('回合持续伤害')
+        ? '回合持续伤害'
+        : Array.isArray(qTables) && qTables.includes('持续伤害') && /(每回合|回合开始)/.test(qDesc)
+          ? '持续伤害'
+          : ''
+    const dotScaleTable =
+      Array.isArray(qTables) && qTables.includes('额外持续伤害')
+        ? '额外持续伤害'
+        : Array.isArray(qTables) &&
+            qTables.includes('技能伤害(2)') &&
+            /(持续伤害|触电|风化|裂伤|灼烧|纠缠|冻结)/.test(qDesc) &&
+            /(立即|立刻|立即产生|立即结算)/.test(qDesc)
+          ? '技能伤害(2)'
+          : ''
+    const hasDotDetonate = !!dotBaseTable && !!dotScaleTable
+    if (hasDotDetonate) {
+      for (const d of details) {
+        if (!d || typeof d !== 'object') continue
+        if (d.kind !== 'dmg') continue
+        if (d.talent !== 'q') continue
+        if (typeof (d as any).dmgExpr === 'string' && (d as any).dmgExpr.trim()) continue
+
+        const t = normalizePromptText(d.title)
+        if (!/终结技/.test(t) || !/伤害/.test(t)) continue
+
+        const canonQ = srCanonicalSkillDamageTable.get('q') || ''
+        const direct =
+          canonQ && qTables.includes(canonQ)
+            ? canonQ
+            : qTables.includes('技能伤害')
+              ? '技能伤害'
+              : typeof d.table === 'string'
+                ? d.table
+                : ''
+        if (!direct || !qTables.includes(direct)) continue
+
+        // Ensure buffs gated by `params.isDot === true` can work on this showcase row.
+        const p = isParamsObject(d.params) ? (d.params as any) : {}
+        if (!('isDot' in p)) p.isDot = true
+        d.params = p
+
+        if (!d.key || String(d.key || '').trim() === 'q') d.key = 'q'
+        const keyLit = JSON.stringify(String(d.key || 'q'))
+        const eleLit = typeof d.ele === 'string' && d.ele.trim() ? `, ${JSON.stringify(d.ele.trim())}` : ''
+        const qDmg = `dmg(talent.q[${JSON.stringify(direct)}], ${keyLit}${eleLit})`
+        const dotDmg = `dmg(talent.q[${JSON.stringify(dotBaseTable)}] * talent.q[${JSON.stringify(dotScaleTable)}], "dot", "skillDot")`
+        ;(d as any).dmgExpr = `({ dmg: (${qDmg}).dmg + (${dotDmg}).avg, avg: (${qDmg}).avg + (${dotDmg}).avg })`
+        break
+      }
+
+      // Some DOT kits also allow the skill to "detonate" an existing DOT immediately (baseline often models as a
+      // combined showcase row: 战技伤害 + 引爆DOT). When the scale table exists, add the combined row.
+      const eTables = (tables as any).e || []
+      const eScale =
+        Array.isArray(eTables) && eTables.includes('额外持续伤害')
+          ? '额外持续伤害'
+          : Array.isArray(eTables)
+            ? eTables.find((t: string) => /额外.{0,4}持续伤害/.test(String(t || ''))) || ''
+            : ''
+      const eDirect =
+        Array.isArray(eTables) && eTables.includes('单体伤害')
+          ? '单体伤害'
+          : Array.isArray(eTables) && eTables.includes('技能伤害')
+            ? '技能伤害'
+            : ''
+
+      const hasDetonateSkill = !!eScale && !!eDirect && Array.isArray(qTables) && qTables.includes(dotBaseTable)
+      if (hasDetonateSkill && details.length < 20) {
+        const title = '战技+引爆dot伤害'
+        const exists = details.some((x) => normalizePromptText((x as any)?.title) === title)
+        if (!exists) {
+          const eDmg = `dmg(talent.e[${JSON.stringify(eDirect)}], "e")`
+          const dotTrig = `dmg(talent.q[${JSON.stringify(dotBaseTable)}] * talent.e[${JSON.stringify(
+            eScale
+          )}], "dot", "skillDot")`
+          details.push({
+            title,
+            kind: 'dmg',
+            talent: 'e',
+            table: eDirect,
+            key: 'e',
+            params: { isDot: true },
+            dmgExpr: `({ dmg: (${eDmg}).dmg + (${dotTrig}).avg, avg: (${eDmg}).avg + (${dotTrig}).avg })`
+          })
+        }
+      }
+    }
+  }
+
+  // GS: Prevent low-HP conditional talent tables (e.g. "低血量时...") from being used as normal rows.
+  // If the model selects a conditional table but forgets to set params.halfHp, damage can drift by 2x+.
+  if (input.game === 'gs') {
+    const isLowHpLike = (s: string): boolean =>
+      /(低血|低生命|低于50%|半血|生命值低于|生命值少于)/.test(String(s || ''))
+    const stripLowHpMark = (s: string): string =>
+      String(s || '')
+        .replace(/低血量时/g, '')
+        .replace(/低血量/g, '')
+        .replace(/低血/g, '')
+        .replace(/低生命/g, '')
+        .replace(/半血/g, '')
+        .replace(/生命值(?:低于|少于)\s*50%?\s*时?/g, '')
+        .replace(/[()（）【】\[\]<>]/g, '')
+        .trim()
+
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (typeof d.table !== 'string' || !d.table.trim()) continue
+      if (!isLowHpLike(d.table)) continue
+
+      const title = String(d.title || '')
+      const p = isParamsObject(d.params) ? d.params : null
+      const hasHalf = !!p && (((p as any).halfHp === true) || ((p as any).half === true))
+      if (hasHalf || isLowHpLike(title)) continue
+
+      const tk = typeof d.talent === 'string' ? String(d.talent) : ''
+      if (!tk) continue
+      const allowed = tables[tk] || []
+
+      const base = stripLowHpMark(d.table)
+      if (base && allowed.includes(base)) {
+        d.table = base
+        continue
+      }
+      // Some sources append "2" variants; try the base name without trailing "2".
+      const base2 = base && base.endsWith('2') ? base.slice(0, -1) : base
+      if (base2 && allowed.includes(base2)) {
+        d.table = base2
+        continue
+      }
+
+      // Fallback: explicitly tag it as a half-HP row so it doesn't silently act as a normal row.
+      const params = (p || {}) as Record<string, any>
+      params.halfHp = true
+      d.params = params
+      if (!isLowHpLike(title)) d.title = `${title}(半血)`
+    }
+  }
 
   let wantsMavuikaWarWill = false
   let wantsColombinaLunar = false
@@ -2461,7 +2950,7 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
         table: '持续治疗量2',
         stat: 'hp',
         key: 'q',
-        params: { half: true }
+        params: { halfHp: true }
       })
       pushFront({
         title: '长按E护盾量',
@@ -3065,12 +3554,85 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       d.title = t.replace(/治疗/g, '生命回复')
     }
 
+    // SR: Normalize dmgKey buckets for variant talent blocks (e2/q2/me2/mt1/mt2/...).
+    // In miao-plugin SR mode, most buffs and attr buckets are routed by the base skill key (e/q/me/mt),
+    // and variant keys frequently cause large underestimation (missing crit/dmg buckets).
+    const normalizeSrDetailKey = (keyRaw: string): string => {
+      const k = String(keyRaw || '').trim()
+      if (!k) return k
+      const parts = k
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+      if (parts.length === 0) return k
+      const head = parts[0]!
+      // Only normalize keys that miao-plugin does NOT treat as separate buff buckets (keep a2/a3 as-is).
+      // - e2/e1/... => e
+      // - q2/... => q
+      // - me2/... => me
+      // - mt1/mt2/... => mt
+      const m = /^(e|q|me|mt)\d+$/.exec(head)
+      if (m) parts[0] = m[1]!
+      return parts.join(',')
+    }
+
+    for (const d of details) {
+      const kind = normalizeKind(d.kind)
+      if (kind === 'reaction') continue
+      const key0 = typeof (d as any).key === 'string' ? String((d as any).key) : undefined
+      if (typeof key0 === 'string') {
+        // Keep intentional empty key (rare; used in some baseline rows).
+        if (key0.trim() === '') continue
+        const norm = normalizeSrDetailKey(key0)
+        if (norm !== key0) (d as any).key = norm
+        continue
+      }
+      // If key omitted, prefer base talent key for variant blocks.
+      const tk = typeof (d as any).talent === 'string' ? String((d as any).talent).trim() : ''
+      const base = tk.replace(/\d+$/, '')
+      if (base && base !== tk && /^(e|q|me|mt)$/.test(base)) (d as any).key = base
+    }
+
     // Keep the list bounded.
     while (details.length > 20) details.pop()
   }
 
+  // GS: Natlan "夜魂" (Nightsoul) kits often use a dedicated dmgKey suffix (",nightsoul") in baseline meta to
+  // route the correct buff buckets. If the plan contains at least one nightsoul-keyed row for a talent,
+  // normalize other rows of that talent to also include the suffix to reduce drift.
+  if (input.game === 'gs') {
+    const hasNightByTalent = new Set<TalentKeyGs>()
+    for (const d of details) {
+      const tk = (d as any)?.talent
+      if (tk !== 'a' && tk !== 'e' && tk !== 'q') continue
+      const k = String((d as any)?.key || '').trim().toLowerCase()
+      if (k && /nightsoul/.test(k)) hasNightByTalent.add(tk)
+      // Some models forget to tag dmgKey but do set `params.Nightsoul`; treat that as a nightsoul indicator.
+      const p = (d as any)?.params
+      if (isParamsObject(p) && (((p as any).Nightsoul === true) || ((p as any).nightsoul === true))) hasNightByTalent.add(tk)
+    }
+    if (hasNightByTalent.size) {
+      for (const d of details) {
+        const tk = (d as any)?.talent
+        if (tk !== 'a' && tk !== 'e' && tk !== 'q') continue
+        if (!hasNightByTalent.has(tk)) continue
+        const keyRaw = typeof (d as any)?.key === 'string' ? ((d as any).key as string).trim() : ''
+        if (!keyRaw) {
+          ;(d as any).key = `${tk},nightsoul`
+          continue
+        }
+        if (/nightsoul/i.test(keyRaw)) continue
+        ;(d as any).key = `${keyRaw},nightsoul`
+      }
+    }
+  }
+
   // Keep defDmgKey only when it matches one of the rendered detail dmgKey keys.
-  const defDmgKeyRaw = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : ''
+  let defDmgKeyRaw = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : ''
+  if (input.game === 'sr' && defDmgKeyRaw) {
+    const m = /^(e|q|me|mt)\d+$/.exec(defDmgKeyRaw)
+    if (m) defDmgKeyRaw = m[1]!
+  }
   const validDmgKeys = new Set(
     details
       .map((d) => (typeof d.key === 'string' && d.key.trim() ? d.key.trim() : typeof d.talent === 'string' ? d.talent : ''))
@@ -3088,6 +3650,90 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
     a3Multi: 'a3Dmg',
     eMulti: 'eDmg',
     qMulti: 'qDmg'
+  }
+  const srIsPercentPointKey = (kRaw: string): boolean => {
+    if (input.game !== 'sr') return false
+    const k = String(kRaw || '').trim()
+    if (!k || k.startsWith('_')) return false
+    if (k.endsWith('Plus') || k === 'atkPlus' || k === 'hpPlus' || k === 'defPlus') return false
+    if (k === 'atk' || k === 'hp' || k === 'def' || k === 'mastery' || k === 'speed') return false
+    // Percent-like buckets (stored as percent points in miao-plugin, while SR tables often provide ratios 0~1).
+    if (k.endsWith('Pct')) return true
+    if (k.endsWith('Dmg')) return true
+    if (k.endsWith('Cpct')) return true
+    if (k.endsWith('Cdmg')) return true
+    if (k.endsWith('Inc')) return true
+    if (k === 'cpct' || k === 'cdmg' || k === 'dmg' || k === 'phy' || k === 'heal' || k === 'shield') return true
+    if (k === 'recharge' || k === 'kx' || k === 'enemyDef' || k === 'enemyIgnore' || k === 'ignore') return true
+    if (k === 'fypct' || k === 'fyinc') return true
+    return false
+  }
+  const srIsCritRatePointKey = (kRaw: string): boolean => {
+    if (input.game !== 'sr') return false
+    const k = String(kRaw || '').trim()
+    if (!k || k.startsWith('_')) return false
+    return k === 'cpct' || k.endsWith('Cpct')
+  }
+
+  const srPctKeyToPlusKey: Record<string, string> = {
+    atkPct: 'atkPlus',
+    hpPct: 'hpPlus',
+    defPct: 'defPlus',
+    speedPct: 'speedPlus'
+  }
+  const srMaybeTeamBuffKeys = new Set([
+    'atkPct',
+    'atkPlus',
+    'hpPct',
+    'hpPlus',
+    'defPct',
+    'defPlus',
+    'speedPct',
+    'speedPlus',
+    'cpct',
+    'cdmg',
+    'dmg',
+    'heal',
+    'shield',
+    'aDmg',
+    'eDmg',
+    'qDmg',
+    'tDmg'
+  ])
+  const srTalentDesc = input.game === 'sr' ? (input.talentDesc || {}) : {}
+  const srDescText = (tk: string): string => normalizePromptText((srTalentDesc as any)?.[tk])
+  const srIsAllyTargetedTalent = (tk: string): boolean => {
+    const t = srDescText(tk)
+    if (!t) return false
+    // "我方全体/全队" buffs usually include the caster; keep them.
+    // Only drop clear single-target ally buffs (baseline often assumes these are used on teammates, not self).
+    const team = /(我方全体|全队|全体队友)/.test(t)
+    if (team) return false
+    const single = /(指定我方单体|指定我方目标|指定1名我方|指定我方)/.test(t)
+    const self = /自身/.test(t)
+    return single && !self
+  }
+
+  const srBuffKeyAllowedByTitle = (keyRaw: string, titleRaw: string): boolean => {
+    if (input.game !== 'sr') return true
+    const key = String(keyRaw || '').trim()
+    if (!key) return false
+    if (key.startsWith('_')) return true // display-only placeholder (safe)
+
+    const title = normalizePromptText(titleRaw)
+    if (!title) return true
+
+    // Mechanics that do NOT directly affect damage numbers in panel calc.
+    // These are frequently hallucinated into dmg buffs and cause large deviations.
+    if (/(击破效率|削韧|弱点击破效率)/.test(title)) return false
+
+    // Probability / effect hit / effect res should never become dmg buckets.
+    if (/效果抵抗/.test(title)) return key === 'effDef'
+    if (/效果命中/.test(title)) return key === 'effPct'
+    if (/(基础概率|概率|几率)/.test(title)) return key === 'effPct' || key === 'effDef'
+    if (/命中/.test(title) && /(提高|提升|增加)/.test(title)) return key === 'effPct' || key === 'effDef'
+
+    return true
   }
 
   const baseTableName = (t: string): string => (t && t.endsWith('2') ? t.slice(0, -1) : t)
@@ -3208,9 +3854,18 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
           if (/Multi$/.test(key) && num >= 100 && num <= 400) num = num - 100
           // Shred/ignore values should be non-negative; use positive numbers to represent "reduce/ignore".
           if (/^(enemyDef|enemyIgnore|ignore|kx|fykx)$/.test(key) && num < 0) num = Math.abs(num)
+          // SR: Talent tables store percent values as ratios (e.g. 0.4 means 40%),
+          // while buff buckets expect percent points (40). Fix obvious ratio values.
+          if (srIsPercentPointKey(key) && Math.abs(num) <= 3) num = num * 100
+          // Guardrail: prune obviously wrong percent-like magnitudes early to avoid blocking batch regen.
+          // (e.g. mis-modeled heal amount emitted as `heal: 6400` instead of a heal detail row)
+          if (srIsCritRatePointKey(key) && Math.abs(num) > 100) continue
+          if (srIsPercentPointKey(key) && Math.abs(num) > 500) continue
+          if (srIsPercentPointKey(key) && num < -80) continue
+          if (!srBuffKeyAllowedByTitle(key, title)) continue
           out[key] = num
           n++
-	        } else if (typeof v === 'string') {
+ 	        } else if (typeof v === 'string') {
 	          const vv0 = v.trim()
           if (!vv0) continue
           const vv = normalizeCalcExpr(vv0)
@@ -3244,6 +3899,40 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
           }
 
  	          let expr = vv
+            // SR: If a percent-type key is assigned a stat-based expression, it's almost always meant to be a flat "+ value"
+            // (baseline uses atkPlus/hpPlus/defPlus/speedPlus). Convert to *Plus to avoid extreme damage inflation.
+            if (input.game === 'sr') {
+              const mapped = srPctKeyToPlusKey[key]
+              if (mapped && /\bcalc\s*\(\s*attr\./.test(expr)) {
+                key = mapped
+                if (key in out) continue
+              }
+            }
+
+            if (!srBuffKeyAllowedByTitle(key, title)) continue
+
+            // SR: Skill descriptions often include *team/ally* buffs. In miao-plugin's single-character panel calc,
+            // these should not be applied to the current character (baseline usually omits them).
+            if (input.game === 'sr' && srMaybeTeamBuffKeys.has(key)) {
+              const m = expr.match(/\btalent\s*\.\s*(a|e|q|t)\s*\[/)
+              const tk = m ? m[1] : ''
+              if (tk && srIsAllyTargetedTalent(tk)) continue
+            }
+
+            // SR: Convert ratio-space expressions into percent points for percent-like buckets.
+            // Only do this when the expression looks like a ratio (no large numeric literals, no explicit *100),
+            // otherwise we risk double-scaling already-correct constants like 30.
+            if (srIsPercentPointKey(key)) {
+              const mNum = expr.match(/^\s*([+-]?\d+(?:\.\d+)?)\s*$/)
+              if (mNum) {
+                const num = Number(mNum[1])
+                if (Number.isFinite(num) && Math.abs(num) <= 3) expr = String(num * 100)
+              } else if (/\btalent\s*\./.test(expr)) {
+                const hasExplicit100 = /\*\s*(?:100|1e2)\b/.test(expr) || /\/\s*(?:0\.01|1e-2)\b/i.test(expr)
+                const hasBigNum = /\b[5-9]\d*(?:\.\d+)?\b/.test(expr)
+                if (!hasExplicit100 && !hasBigNum) expr = `(${expr}) * 100`
+              }
+            }
  	          // `*Multi` keys are stored as delta-percent in miao-plugin; a plain talent table reference is
  	          // almost always the *total* percent (e.g. 137.91%), so we convert it to delta by subtracting 100.
 	          if (/Multi$/.test(key)) {
@@ -3289,48 +3978,614 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       if (Object.keys(out).length) data = out
     }
 
+    // Drop no-op buff shells (check-only / title-only). They clutter outputs and can skew defParams inference.
+    if (!data) continue
+
     const out: CalcSuggestBuff = { title }
     if (typeof sort === 'number') out.sort = sort
     if (typeof cons === 'number') out.cons = cons
     if (typeof tree === 'number') out.tree = tree
     if (check) out.check = check
-    if (data) out.data = data
+    out.data = data
     buffsOut.push(out)
+  }
+
+  // Buff checks that reference params.<key> must use keys that are actually set by at least one detail row
+  // (or be part of our small common-state allowlist). Otherwise the buff will silently never apply and panel
+  // regression drifts wildly low; worse, models often hallucinate params keys (e.g. "params.Nightsoul").
+  {
+    const detailParamKeys = new Set<string>()
+    for (const d of details) {
+      const p = (d as any)?.params
+      if (!p || typeof p !== 'object' || Array.isArray(p)) continue
+      for (const k of Object.keys(p as any)) {
+        if (k && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) detailParamKeys.add(k)
+      }
+    }
+
+    const common = new Set<string>([
+      // Common GS state flags (recommended in prompt).
+      'e',
+      'q',
+      'off_field',
+      'offField',
+      'inField',
+      // HP/target conditions.
+      'half',
+      'halfHp',
+      'lowHp',
+      'targetHp50',
+      'targetHp80',
+      'hpBelow50',
+      'hpAbove50',
+      // Common SR state flags (kept here so shared helpers are safe across games).
+      'qBuff',
+      'break',
+      // Common input shapes.
+      'stack',
+      'stacks'
+    ])
+    for (const k of detailParamKeys) common.add(k)
+
+    const re = /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b/g
+    for (const b of buffsOut) {
+      const check = (b as any)?.check
+      if (typeof check !== 'string') continue
+      const expr = check.trim()
+      if (!expr || !/params\./.test(expr)) continue
+
+      const used = new Set<string>()
+      let m: RegExpExecArray | null
+      while ((m = re.exec(expr))) {
+        const k = String(m[1] || '').trim()
+        if (k) used.add(k)
+      }
+      if (used.size === 0) continue
+      const hasUnknown = Array.from(used).some((k) => !common.has(k))
+      if (hasUnknown) delete (b as any).check
+    }
+  }
+
+  // SR: Derive core debuff buffs from the talent description placeholder contexts when the model misses them.
+  // This prevents extreme underestimation for kits where "技能伤害" tables actually represent debuff values
+  // (e.g. 防御力降低、敌方受到伤害提高).
+  const applySrDerivedBuffs = (): void => {
+    if (input.game !== 'sr') return
+    const multiKeys = new Set(['kx', 'enemyDef', 'ignore', 'enemydmg'])
+    const hasKey = (k: string): boolean =>
+      buffsOut.some((b) => {
+        const data = (b as any)?.data
+        return !!data && typeof data === 'object' && !Array.isArray(data) && Object.prototype.hasOwnProperty.call(data, k)
+      })
+
+    const hasSameExpr = (key: string, expr: string): boolean =>
+      buffsOut.some((b) => {
+        const data = (b as any)?.data
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return false
+        if (!Object.prototype.hasOwnProperty.call(data, key)) return false
+        return String((data as any)[key]) === expr
+      })
+
+    const pushIfMissing = (title: string, key: string, expr: string): void => {
+      if (!isAllowedMiaoBuffDataKey('sr', key)) return
+      if (!multiKeys.has(key) && hasKey(key)) return
+      if (hasSameExpr(key, expr)) return
+      buffsOut.push({ title, data: { [key]: expr } as any })
+    }
+
+    const qI = srIntentTableByTalent.get('q')
+    if (qI?.enemyDef) {
+      pushIfMissing('推导：终结技防御力降低[enemyDef]%', 'enemyDef', `talent.q[${jsString(qI.enemyDef)}] * 100`)
+    }
+
+    const eI = srIntentTableByTalent.get('e')
+    if (eI?.enemydmg) {
+      pushIfMissing('推导：战技使敌方受到伤害提高[enemydmg]%', 'enemydmg', `talent.e[${jsString(eI.enemydmg)}] * 100`)
+    }
+
+    const tI = srIntentTableByTalent.get('t')
+    if (tI?.enemyDef) {
+      pushIfMissing('推导：天赋防御力降低[enemyDef]%', 'enemyDef', `talent.t[${jsString(tI.enemyDef)}] * 100`)
+    }
+
+    // SR: Derive common self buffs from table names when LLM misses them.
+    // Keep it conservative: only add when the key is completely missing.
+    const srPickSkillKey = (text: string): 'a' | 'e' | 'q' | 't' | 'me' | 'mt' | '' => {
+      if (/(普攻|普通攻击)/.test(text)) return 'a'
+      if (/战技/.test(text)) return 'e'
+      if (/终结技/.test(text)) return 'q'
+      if (/天赋/.test(text)) return 't'
+      if (/忆灵技/.test(text)) return 'me'
+      if (/忆灵天赋/.test(text)) return 'mt'
+      return ''
+    }
+
+    const srPickBuffKeyFromTableName = (talentKey: TalentKey, tableNameRaw: string): string | null => {
+      const tn = normalizePromptText(tableNameRaw)
+      if (!tn) return null
+      // Non-damage affecting / ambiguous mechanics: ignore.
+      if (/(基础概率|概率|几率|效果命中|效果抵抗|命中|抵抗|击破效率|削韧|持续时间|回合|次数|层数上限)/.test(tn)) return null
+
+      if (/暴击率/.test(tn)) return 'cpct'
+      if (/暴击伤害/.test(tn)) return 'cdmg'
+      if (/抗性穿透/.test(tn)) return 'kx'
+      if (/抗性/.test(tn) && !/效果抵抗|效果抗性|效果命中|命中|抵抗/.test(tn) && /(降低|减少)/.test(tn)) return 'kx'
+      if (/无视/.test(tn) && /防御/.test(tn)) return 'ignore'
+      if (/(防御力降低|防御降低|减防)/.test(tn)) return 'enemyDef'
+      if (/击破特攻/.test(tn)) return 'stance'
+
+      if (/(攻击力|攻击)/.test(tn) && /(提高|提升|增加|加成)/.test(tn)) return 'atkPct'
+      if (/(生命上限|生命值上限|最大生命值|生命值)/.test(tn) && /(提高|提升|增加|加成)/.test(tn)) return 'hpPct'
+      if (/防御力/.test(tn) && /(提高|提升|增加|加成)/.test(tn)) return 'defPct'
+
+      // Damage bonus vs enemy damage taken.
+      if (/受到/.test(tn) && /伤害/.test(tn) && /(提高|提升|增加)/.test(tn)) return 'enemydmg'
+      // Avoid deriving generic self damage-bonus keys from ambiguous "伤害提高/增伤" tables:
+      // - often conditional (stack/state) or ally-targeted (supports)
+      // - baseline typically models them via params/details, not as unconditional buffs
+      if (/伤害/.test(tn) && /(提高|提升|增加|加成|增伤)/.test(tn)) return null
+
+      return null
+    }
+
+    const srSampleNum = (talentKey: TalentKey, tableName: string): number | null => {
+      const s = (input.tableSamples as any)?.[talentKey]?.[tableName]
+      if (typeof s === 'number' && Number.isFinite(s)) return s
+      if (Array.isArray(s) && typeof s[0] === 'number' && Number.isFinite(s[0])) return Number(s[0])
+      return null
+    }
+
+    const srExprFromTable = (talentKey: TalentKey, tableName: string, key: string): string => {
+      const tableLit = jsString(tableName)
+      const base = `talent.${String(talentKey)}[${tableLit}]`
+      if (!srIsPercentPointKey(key)) return base
+      const sn = srSampleNum(talentKey, tableName)
+      // SR scalar tables are usually *ratios* (0.2 means 20%), but we omit scalar samples from prompts for size.
+      // When we can't sample it, default to ratio-space and scale into percent-points to match miao-plugin buff buckets.
+      const ratioLike = sn != null ? Math.abs(sn) <= 3 : true
+      return ratioLike ? `${base} * 100` : base
+    }
+
+    // Add a few core percent buffs (dmg/cpct/cdmg/kx/enemyDef/enemydmg/atkPct/hpPct/defPct/stance).
+    for (const tk0 of Object.keys(tables)) {
+      const tk = tk0 as TalentKey
+      const tkStr = String(tk || '').trim()
+      const isAllyTalent = tkStr ? srIsAllyTargetedTalent(tkStr) : false
+      const list = tables[tk] || []
+      for (const tn of list) {
+        const k = srPickBuffKeyFromTableName(tk, tn)
+        if (!k) continue
+        if (isAllyTalent && srMaybeTeamBuffKeys.has(k)) continue
+        if (!isAllowedMiaoBuffDataKey('sr', k)) continue
+        pushIfMissing(`推导：${tn}[${k}]`, k, srExprFromTable(tk, tn, k))
+      }
+    }
+
+    // Add hpPlus from paired "生命提高(百分比+固定值)" tables (common in SR, affects dmg on HP-scaling kits).
+    if (!hasKey('hpPlus')) {
+      for (const tk0 of Object.keys(tables)) {
+        const tk = tk0 as TalentKey
+        const tkStr = String(tk || '').trim()
+        if (tkStr && srIsAllyTargetedTalent(tkStr)) continue
+        const list = tables[tk] || []
+        const pct = list.find((t) => /(生命|生命上限|生命值上限).*(提高|增加).*(百分比|%)/.test(t) && !/(治疗|回复|恢复|护盾)/.test(t))
+        const flat = list.find((t) => /(生命|生命上限|生命值上限).*(提高|增加).*(固定值|固定数值)/.test(t) && !/(治疗|回复|恢复|护盾)/.test(t))
+        if (!pct || !flat) continue
+        if (!isAllowedMiaoBuffDataKey('sr', 'hpPlus')) break
+
+        const pctBase = `talent.${String(tk)}[${jsString(pct)}]`
+        const sn = srSampleNum(tk, pct)
+        const pctIsRatio = sn != null ? Math.abs(sn) <= 3 : true
+        const pctExpr = pctIsRatio ? pctBase : `(${pctBase}) / 100`
+        const flatExpr = `talent.${String(tk)}[${jsString(flat)}]`
+        pushIfMissing(`推导：生命上限提高[hpPlus]`, 'hpPlus', `attr.hp.base * (${pctExpr}) + (${flatExpr})`)
+        break
+      }
+    }
+  }
+  applySrDerivedBuffs()
+
+  // SR: Prune obviously-duplicated debuff buckets (common LLM artifact after we add derived buffs).
+  // Keep:
+  // - at most 1 expression per (key + talent table ref)
+  // - drop numeric-constant `enemyDef/ignore/enemydmg` when an expression-based one exists
+  if (input.game === 'sr') {
+    try {
+      const debuffKeys = new Set(['enemyDef', 'ignore', 'enemydmg', 'kx'])
+      const refRe = /\btalent\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(['"])(.*?)\2\s*\]/g
+
+      const firstTableRef = (expr: string): { tk: string; table: string } | null => {
+        refRe.lastIndex = 0
+        const m = refRe.exec(expr)
+        if (!m) return null
+        return { tk: String(m[1] || ''), table: String(m[3] || '') }
+      }
+
+      const isSimplePctDerived = (expr: string, tk: string, table: string): boolean => {
+        const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const re = new RegExp(
+          `^\\s*talent\\s*\\.\\s*${esc(tk)}\\s*\\[\\s*(['\"])${esc(table)}\\1\\s*\\]\\s*\\*\\s*100\\s*$`
+        )
+        return re.test(expr.trim())
+      }
+
+      const deleteKeyFromBuff = (buff: any, key: string): void => {
+        const data = buff?.data
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return
+        delete data[key]
+      }
+
+      const cleanupEmptyBuffData = (): void => {
+        for (let i = buffsOut.length - 1; i >= 0; i--) {
+          const b: any = buffsOut[i]
+          const data = b?.data
+          if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+          const keys = Object.keys(data).filter((k) => k && !k.startsWith('_'))
+          if (keys.length === 0) buffsOut.splice(i, 1)
+        }
+      }
+
+      for (const key of debuffKeys) {
+        const items: Array<{ buff: any; expr: string | null; isConst: boolean; refSig: string; ref?: { tk: string; table: string } }> = []
+        for (const b of buffsOut) {
+          const data = (b as any)?.data
+          if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+          if (!Object.prototype.hasOwnProperty.call(data, key)) continue
+          const v = (data as any)[key]
+          if (typeof v === 'number') {
+            items.push({ buff: b, expr: null, isConst: true, refSig: 'const' })
+            continue
+          }
+          if (typeof v === 'string') {
+            const expr = v.trim()
+            const ref = firstTableRef(expr)
+            const refSig = ref ? `${ref.tk}|${ref.table}` : 'expr'
+            items.push({ buff: b, expr, isConst: false, refSig, ref: ref || undefined })
+            continue
+          }
+          // function/object: keep (hard to compare safely)
+          items.push({ buff: b, expr: null, isConst: false, refSig: 'opaque' })
+        }
+        if (items.length <= 1) continue
+
+        // Drop constant debuffs when expression-based exists (except kx: constants are common in baseline).
+        if (key !== 'kx') {
+          const hasExpr = items.some((x) => !x.isConst && (x.refSig.includes('|') || x.refSig === 'expr'))
+          if (hasExpr) {
+            for (const it of items) {
+              if (it.isConst) deleteKeyFromBuff(it.buff, key)
+            }
+          }
+        }
+
+        // De-dup per (talent table ref).
+        const byRef = new Map<string, typeof items>()
+        for (const it of items) {
+          if (!it.expr || !it.ref || it.refSig === 'opaque' || it.refSig === 'const') continue
+          const list = byRef.get(it.refSig) || []
+          list.push(it)
+          byRef.set(it.refSig, list)
+        }
+        for (const list of byRef.values()) {
+          if (list.length <= 1) continue
+          // Prefer the simple `talent.<tk>["<table>"] * 100` form if present.
+          let keep = list.find((it) => it.expr && it.ref && isSimplePctDerived(it.expr, it.ref.tk, it.ref.table)) || list[0]
+          for (const it of list) {
+            if (it === keep) continue
+            deleteKeyFromBuff(it.buff, key)
+          }
+        }
+      }
+
+      cleanupEmptyBuffData()
+    } catch {
+      // best-effort pruning
+    }
+  }
+
+  // SR: Infer major trace (行迹) index from buffHints to match baseline gating behavior.
+  // LLMs often omit `tree`, causing trace buffs to be applied unconditionally and inflating damage.
+  if (input.game === 'sr') {
+    try {
+      const hints = Array.isArray(input.buffHints) ? (input.buffHints as unknown[]) : []
+      const nameToIdx = new Map<string, number>()
+      for (const h0 of hints) {
+        const h = normalizePromptText(h0)
+        if (!h) continue
+        const m = /^行迹\s*(\d{1,2})\s*[：:]\s*([^：:]+)\s*[：:]/.exec(h)
+        if (!m) continue
+        const idx = Number(m[1])
+        const name = String(m[2] || '').trim()
+        if (!name) continue
+        if (!Number.isFinite(idx) || idx < 1 || idx > 10) continue
+        if (!nameToIdx.has(name)) nameToIdx.set(name, Math.trunc(idx))
+      }
+
+      if (nameToIdx.size) {
+        const extractTraceName = (titleRaw: unknown): string => {
+          const title = normalizePromptText(titleRaw)
+          if (!title) return ''
+          if (!/行迹/.test(title)) return ''
+          // Prefer the first segment after "行迹" and an optional separator/digits.
+          // Examples:
+          // - 行迹·视界外来信·暴击伤害提高  -> 视界外来信
+          // - 行迹-止厄：普攻造成的伤害提高40% -> 止厄
+          // - 行迹1：冷漠的诚实：... -> 冷漠的诚实
+          const m =
+            /行迹\s*(?:\d{1,2})?\s*[·\-_—–]?\s*([^：:·\-_—–，。；;]+)\s*(?:[：:·\-_—–，。；;]|$)/.exec(title) ||
+            null
+          return m ? String(m[1] || '').trim() : ''
+        }
+
+        for (const b of buffsOut) {
+          const name = extractTraceName((b as any)?.title)
+          if (!name) continue
+          const idx = nameToIdx.get(name)
+          if (idx == null) continue
+          ;(b as any).tree = idx
+        }
+      }
+    } catch {
+      // Best-effort: do not block generation.
+    }
+  }
+
+  // SR: Drop clearly ally-targeted / teammate-only eidolon buffs (common on supports).
+  // Baseline meta often omits these from the caster's own panel damage calc to avoid inflating self damage.
+  if (input.game === 'sr') {
+    try {
+      const hints = Array.isArray(input.buffHints) ? (input.buffHints as unknown[]) : []
+      const consDesc = new Map<number, string>()
+      for (const h0 of hints) {
+        const h = normalizePromptText(h0)
+        if (!h) continue
+        const m = /^(\d)\s*魂\s*[：:]\s*[^：:]+\s*[：:]\s*(.+)$/.exec(h)
+        if (!m) continue
+        const cons = Number(m[1])
+        if (!Number.isFinite(cons) || cons < 1 || cons > 6) continue
+        const desc = String(m[2] || '').trim()
+        if (desc) consDesc.set(cons, desc)
+      }
+
+      if (consDesc.size) {
+        const kept: CalcSuggestBuff[] = []
+        for (const b of buffsOut) {
+          const consRaw = (b as any)?.cons
+          const cons = typeof consRaw === 'number' && Number.isFinite(consRaw) ? Math.trunc(consRaw) : NaN
+          if (!Number.isFinite(cons) || cons < 1 || cons > 6) {
+            kept.push(b)
+            continue
+          }
+
+          const desc = consDesc.get(cons)
+          const t = normalizePromptText(desc)
+          if (!t) {
+            kept.push(b)
+            continue
+          }
+
+          const hasSelf = /(自身|自己)/.test(t)
+          const allyOnly = /(指定我方|我方目标|队友|其他我方|除自身|为其他)/.test(t)
+          if (!hasSelf && allyOnly) continue
+          kept.push(b)
+        }
+        buffsOut.splice(0, buffsOut.length, ...kept)
+      }
+    } catch {
+      // Best-effort: do not block generation.
+    }
+  }
+
+  // SR: DOT damage does not crit. If a DOT-related buff was (mis)modeled using crit buckets,
+  // re-map it to dot buckets to avoid systematic drift.
+  if (input.game === 'sr') {
+    for (const b of buffsOut) {
+      const title = normalizePromptText((b as any)?.title)
+      if (!title) continue
+      const isDotLike = /(持续伤害|dot|触电|风化|裂伤|灼烧|纠缠|冻结)/i.test(title)
+      if (!isDotLike) continue
+
+      const data = (b as any)?.data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+      if (Object.prototype.hasOwnProperty.call(data, 'dotDmg') || Object.prototype.hasOwnProperty.call(data, 'dotEnemydmg') || Object.prototype.hasOwnProperty.call(data, 'dotMulti')) {
+        continue
+      }
+
+      if (Object.prototype.hasOwnProperty.call(data, 'cpct')) delete (data as any).cpct
+
+      if (Object.prototype.hasOwnProperty.call(data, 'cdmg')) {
+        const v = (data as any).cdmg
+        delete (data as any).cdmg
+        const wantsMulti = /倍率/.test(title)
+        const k = wantsMulti ? 'dotMulti' : /受到/.test(title) ? 'dotEnemydmg' : 'dotDmg'
+        if (isAllowedMiaoBuffDataKey('sr', k)) (data as any)[k] = v
+      }
+    }
+  }
+
+  // SR: Similar to GS, models often over-gate plain stat/debuff buffs with ad-hoc params flags, causing
+  // systematic underestimation on baseline-style showcases. Drop params-only gating for safe global keys.
+  if (input.game === 'sr') {
+    const safeKeys = new Set([
+      'atkPct',
+      'hpPct',
+      'defPct',
+      'speedPct',
+      'recharge',
+      'cpct',
+      'cdmg',
+      'dmg',
+      'enemydmg',
+      'effPct',
+      'effDef',
+      'heal',
+      'shield',
+      'stance',
+      'multi',
+      'kx',
+      'enemyDef',
+      'enemyIgnore',
+      'ignore',
+      // DOT-only buckets (won't affect non-DOT rows even if unconditional).
+      'dotDmg',
+      'dotEnemydmg',
+      'dotMulti'
+    ])
+
+    const isHpConditionTitle = (t: string): boolean =>
+      /(半血|低血|生命值\s*(?:低于|小于|少于|高于|大于|不少于|不低于|不小于)|目标生命)/.test(t)
+
+    for (const b of buffsOut) {
+      const data = (b as any)?.data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+      const keys = Object.keys(data).filter((k) => k && !k.startsWith('_'))
+      if (keys.length === 0) continue
+      if (!keys.every((k) => safeKeys.has(k))) continue
+
+      const check = (b as any)?.check
+      if (typeof check !== 'string') continue
+      const expr = check.trim()
+      if (!expr) continue
+      if (!/params\./.test(expr)) continue
+      // `params.<key>` may legitimately use names like "talent"/"attr"; strip them before detecting real scope refs.
+      const exprNoParams = expr.replace(/\bparams\.[A-Za-z_][A-Za-z0-9_]*/g, 'params')
+      if (/\b(cons|weapon|trees|currentTalent|attr|calc|talent|element)\b/.test(exprNoParams)) continue
+      if (/\bparams\.(?:half|halfHp|lowHp|targetHp50|targetHp80|hpBelow50|hpAbove50)\b/i.test(expr)) continue
+      // Keep core state gating (e/q/qBuff/break). These are used to align baseline-style showcase assumptions.
+      if (/\bparams\.(?:e|q|qBuff|break)\b/.test(expr)) continue
+
+      const title = normalizePromptText((b as any)?.title)
+      if (title && isHpConditionTitle(title)) continue
+
+      delete (b as any).check
+    }
+  }
+
+  // SR: Ensure detail params exist when buffs reference `params.*`.
+  // Note: baseline SR calc.js rarely uses `params.qBuff` gating; do not auto-gate ultimate buffs here.
+  const applySrStateGating = (): void => {
+    if (input.game !== 'sr') return
+
+    const wantsParam = (k: string): boolean =>
+      buffsOut.some((b) => typeof (b as any)?.check === 'string' && new RegExp(`\\bparams\\.${k}\\b`).test((b as any).check))
+
+    const ensureParamOnDetails = (pred: (d: CalcSuggestDetail) => boolean, k: string, v: boolean): void => {
+      if (!wantsParam(k)) return
+      for (const d of details) {
+        if (!pred(d)) continue
+        const p0 = (d as any)?.params
+        if (p0 && typeof p0 === 'object' && !Array.isArray(p0) && Object.prototype.hasOwnProperty.call(p0, k)) continue
+        const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, number | boolean | string>) } : {}
+        p[k] = v
+        ;(d as any).params = p
+      }
+    }
+
+    ensureParamOnDetails((d) => typeof d.talent === 'string' && String(d.talent).startsWith('e'), 'e', true)
+    ensureParamOnDetails(
+      (d) => (typeof d.talent === 'string' && String(d.talent).startsWith('q')) || /终结技/.test(normalizePromptText(d.title)),
+      'qBuff',
+      true
+    )
+    ensureParamOnDetails((d) => d.kind === 'reaction' || /击破/.test(normalizePromptText(d.title)), 'break', true)
+  }
+  applySrStateGating()
+
+  // GS: "元素附魔/转为X伤害" is frequently (and incorrectly) modeled by LLMs as a flat `dmg` buff.
+  // In baseline semantics, infusion/conversion should be expressed via params/ele selection, not by adding damage%.
+  // Prune such rows to avoid 2x+ overestimation in panel regression.
+  if (input.game === 'gs') {
+    for (let i = buffsOut.length - 1; i >= 0; i--) {
+      const b = buffsOut[i]!
+      const title = normalizePromptText((b as any)?.title)
+      if (!title) continue
+      const elemWord = '(?:火|水|雷|冰|风|岩|草|物理)'
+      const looksLikeInfusion =
+        /(元素附魔|附魔)/.test(title) ||
+        /将.{0,24}(普通攻击|普攻|重击|下落攻击).{0,24}转为/.test(title) ||
+        /(普通攻击|普攻|重击|下落攻击).{0,24}转为/.test(title) ||
+        new RegExp(`${elemWord}.{0,12}(?:附魔|转为|转化)`).test(title) ||
+        new RegExp(`(?:转为|转化为|转换为).{0,12}${elemWord}`).test(title) ||
+        new RegExp(`伤害(?:转为|转化为|转换为).{0,12}${elemWord}`).test(title)
+      if (!looksLikeInfusion) continue
+
+      const data = (b as any).data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        // No effect anyway; keep the list clean.
+        buffsOut.splice(i, 1)
+        continue
+      }
+      const keys = Object.keys(data).filter((k) => k && !k.startsWith('_'))
+      if (keys.length === 0) {
+        buffsOut.splice(i, 1)
+        continue
+      }
+      const isDmgLikeKey = (k: string): boolean =>
+        k === 'dmg' || k === 'phy' || k === 'aDmg' || k === 'a2Dmg' || k === 'a3Dmg'
+      if (keys.every(isDmgLikeKey)) {
+        buffsOut.splice(i, 1)
+      }
+    }
   }
 
   // If official passive/cons hints contain "抗性降低xx%", normalize to a single baseline-like max-tier `kx` buff.
   // (LLMs frequently omit or mis-model kx gating, leading to systematic underestimation in comparisons.)
   if (input.game === 'gs') {
     const hints = (input.buffHints || []).filter((s) => typeof s === 'string') as string[]
-    let best: number | null = null
-    for (const h of hints) {
-      if (!/(抗性|元素抗性)/.test(h) || !/降低/.test(h)) continue
-      const nums: number[] = []
-      const re = /(\d+(?:\.\d+)?)\s*[%％]/g
-      let m: RegExpExecArray | null
-      while ((m = re.exec(h))) {
-        const n = Number(m[1])
-        if (!Number.isFinite(n)) continue
-        if (n <= 0 || n > 100) continue
-        nums.push(n)
+    const hasKx = buffsOut.some((b) => {
+      const data = (b as any)?.data
+      return !!data && typeof data === 'object' && !Array.isArray(data) && Object.prototype.hasOwnProperty.call(data, 'kx')
+    })
+    // Only derive when the model missed it entirely; otherwise prefer model output to avoid double-counting.
+    if (!hasKx) {
+      type KxCand = { kx: number; cons?: number }
+      const cands: KxCand[] = []
+      for (const h0 of hints) {
+        const h = normalizePromptText(h0)
+        if (!h) continue
+        if (!/(抗性|元素抗性)/.test(h) || !/降低/.test(h)) continue
+
+        const consM = h.match(/^\s*(\d)\s*命[：:]/)
+        const cons = consM ? Math.trunc(Number(consM[1])) : undefined
+        const consOk = typeof cons === 'number' && cons >= 1 && cons <= 6
+
+        // Try to capture the percent specifically tied to "抗性降低", not the max percent in the whole sentence
+        // (some cons texts also include "伤害提升100%" which must NOT become kx=100).
+        const pats = [
+          /(?:草|火|水|雷|冰|风|岩)?元素?\s*抗性.{0,12}降低.{0,10}?([0-9]+(?:\.[0-9]+)?)\s*[%％]/,
+          /降低.{0,10}?([0-9]+(?:\.[0-9]+)?)\s*[%％].{0,12}?(?:草|火|水|雷|冰|风|岩)?元素?\s*抗性/
+        ]
+        let best: number | null = null
+        for (const re of pats) {
+          const m = h.match(re)
+          if (!m) continue
+          const n = Number(m[1])
+          if (!Number.isFinite(n) || n <= 0 || n > 80) continue
+          best = best === null ? n : Math.max(best, n)
+        }
+        if (best === null) continue
+        cands.push({ kx: best, ...(consOk ? { cons } : {}) })
       }
-      if (nums.length === 0) continue
-      const max = Math.max(...nums)
-      if (!best || max > best) best = max
-    }
-    if (best) {
-      // Remove any existing kx rows (avoid double counting / broken gating).
-      for (let i = buffsOut.length - 1; i >= 0; i--) {
-        const b = buffsOut[i]!
-        const data = b?.data
-        if (!data || typeof data !== 'object') continue
-        if (!Object.prototype.hasOwnProperty.call(data, 'kx')) continue
-        buffsOut.splice(i, 1)
+
+      if (cands.length) {
+        // De-dup by (cons,kx) and keep stable order: passives first, then cons asc.
+        const seen = new Set<string>()
+        const uniq = cands.filter((c) => {
+          const k = `${c.cons ?? 0}:${c.kx}`
+          if (seen.has(k)) return false
+          seen.add(k)
+          return true
+        })
+        uniq.sort((a, b) => (a.cons ?? 0) - (b.cons ?? 0) || b.kx - a.kx)
+
+        for (const c of uniq) {
+          buffsOut.unshift({
+            title: `被动/命座：敌方元素抗性降低[kx]%`,
+            ...(typeof c.cons === 'number' ? { cons: c.cons } : {}),
+            data: { kx: c.kx }
+          })
+        }
       }
-      buffsOut.unshift({
-        title: `被动/命座：敌方元素抗性降低[kx]%（默认按最大档位）`,
-        data: { kx: best }
-      })
     }
   }
 
@@ -3340,6 +4595,15 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
     const hints = (input.buffHints || []).filter((s) => typeof s === 'string') as string[]
     const elemRe = /(火|水|雷|冰|风|岩|草)元素伤害加成/g
     for (const h of hints) {
+      const hn = normalizePromptText(h)
+      // Skip stat-derived conversions like:
+      // - "基于元素充能效率的20%提升水元素伤害加成"
+      // - "超过100%的部分，每1%获得0.4%雷元素伤害加成"
+      // These are NOT flat buffs and should be modeled as attr-based formulas.
+      if (/(基于|根据|超过|超出|每)\S{0,20}(元素充能效率|充能效率|生命值上限|最大生命值|生命上限|攻击力|防御力|元素精通|精通)/.test(hn)) {
+        continue
+      }
+
       const elems: string[] = []
       const seen = new Set<string>()
       let m: RegExpExecArray | null
@@ -3352,17 +4616,58 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       }
       if (!elems.length) continue
 
-      const nums: number[] = []
-      const reNum = /(\d+(?:\.\d+)?)\s*[%％]/g
-      let mm: RegExpExecArray | null
-      while ((mm = reNum.exec(h))) {
-        const n = Number(mm[1])
-        if (!Number.isFinite(n)) continue
-        if (n <= 0 || n > 200) continue
-        nums.push(n)
+      const hnLower = hn.toLowerCase()
+      const isHalfHpCond =
+        /(半血|低血|生命值.{0,12}(?:低于|小于|少于|不高于|不大于|不超过|≤|<=).{0,6}50\s*[%％]|生命值.{0,12}50\s*[%％])/.test(
+          hn
+        ) || /hp.{0,12}50\s*%/.test(hnLower)
+
+      const pickElemDmgPct = (text: string, elem: string): number | null => {
+        const t = normalizePromptText(text)
+        if (!t) return null
+        const out: number[] = []
+        const pats = [
+          new RegExp(`(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]\\\\s*${elem}元素伤害加成`, 'g'),
+          new RegExp(`(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]\\\\s*${elem}伤害加成`, 'g'),
+          new RegExp(`${elem}元素伤害加成\\\\s*(?:提高|提升|增加|加成)?\\\\s*(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]`, 'g'),
+          new RegExp(`${elem}伤害加成\\\\s*(?:提高|提升|增加|加成)?\\\\s*(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]`, 'g')
+        ]
+        for (const re of pats) {
+          for (const m of t.matchAll(re)) {
+            const n = Number(m[1])
+            if (!Number.isFinite(n) || n <= 0 || n > 200) continue
+            out.push(n)
+          }
+        }
+        if (out.length) return Math.max(...out)
+
+        // Fallback: choose percent numbers that are close to the element-dmg wording, and skip HP-threshold percents.
+        const nums: number[] = []
+        const reNum = /(\d+(?:\.\d+)?)\s*[%％]/g
+        let mm: RegExpExecArray | null
+        while ((mm = reNum.exec(t))) {
+          const n = Number(mm[1])
+          if (!Number.isFinite(n) || n <= 0 || n > 200) continue
+          const pos = typeof mm.index === 'number' ? mm.index : -1
+          const ctx = pos >= 0 ? t.slice(Math.max(0, pos - 18), Math.min(t.length, pos + 30)) : ''
+          // Skip HP-threshold wording (e.g. "生命值低于50%") even if the same sentence later mentions dmg bonus.
+          // Otherwise we may mis-treat the threshold percent as an element dmg bonus (common LLM drift cause).
+          if (/(生命值|生命|血量)/.test(ctx) && /(低于|小于|少于|不高于|不大于|不超过|≤|<=)/.test(ctx)) {
+            continue
+          }
+          if (ctx.includes(elem) && /伤害加成/.test(ctx)) nums.push(n)
+        }
+        if (nums.length) return Math.max(...nums)
+        return null
       }
-      if (!nums.length) continue
-      const baseVal = Math.max(...nums)
+
+      const baseVals: number[] = []
+      for (const e of elems) {
+        const n = pickElemDmgPct(h, e)
+        if (n != null) baseVals.push(n)
+      }
+      if (!baseVals.length) continue
+      const baseVal = Math.max(...baseVals)
       // Baseline commonly assumes "full stacks" for showcase buffs.
       // If the hint explicitly mentions max stacks, multiply the base percent accordingly.
       let stack = 1
@@ -3379,20 +4684,34 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
 
       for (const e of elems) {
         const title = `${consOk ? `${cons}命：` : ''}${e}元素伤害加成提升[dmg]%`
-        const already = buffsOut.some((b) => {
-          if (!b || typeof b !== 'object') return false
-          if (consOk && typeof b.cons === 'number' && b.cons !== cons) return false
-          const data = (b as any).data
-          if (!data || typeof data !== 'object') return false
-          if (!Object.prototype.hasOwnProperty.call(data, 'dmg')) return false
+
+        // Remove wrong/duplicate elemental dmg bonus buffs for this element (models often confuse thresholds like "50%" with the buff value).
+        // Also drop half-HP shorthand rows like "半血火伤加成[dmg]%" to avoid double-counting after we normalize into a canonical row.
+        for (let i = buffsOut.length - 1; i >= 0; i--) {
+          const b = buffsOut[i]!
+          const t0 = normalizePromptText((b as any)?.title)
+          if (!t0) continue
+          const isElemBonusTitle = t0.includes(`${e}元素伤害加成`) || t0.includes(`${e}伤害加成`)
+          const isHalfHpLikeTitle =
+            isHalfHpCond &&
+            t0.includes(e) &&
+            /(半血|低血|生命值|血量)/.test(t0) &&
+            (/伤/.test(t0) || new RegExp(`${e}伤`).test(t0)) &&
+            /加成/.test(t0)
+          if (!isElemBonusTitle && !isHalfHpLikeTitle) continue
+          if (consOk && typeof (b as any)?.cons === 'number' && (b as any).cons !== cons) continue
+          if (!consOk && typeof (b as any)?.cons === 'number') continue
+          const data = (b as any)?.data
+          if (!data || typeof data !== 'object' || Array.isArray(data)) continue
           const dmg = (data as any).dmg
-          if (typeof dmg !== 'number' || !Number.isFinite(dmg)) return false
-          return String((b as any).title || '').includes(`${e}元素`) && Math.abs(dmg - val) < 1e-9
-        })
-        if (already) continue
+          if (typeof dmg !== 'number' || !Number.isFinite(dmg)) continue
+          buffsOut.splice(i, 1)
+        }
+
         buffsOut.push({
           title,
           ...(consOk ? { cons } : {}),
+          ...(isHalfHpCond ? { check: 'params.halfHp === true' } : {}),
           data: { dmg: val }
         })
       }
@@ -3412,7 +4731,9 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       if (typeof check !== 'string') continue
       const expr = check.trim()
       if (!expr) continue
-      if (/\b(cons|weapon|trees|currentTalent|attr|calc|talent)\b/.test(expr)) continue
+      // `params.<key>` may legitimately use names like "talent"/"attr"; strip them before detecting real scope refs.
+      const exprNoParams = expr.replace(/\bparams\.[A-Za-z_][A-Za-z0-9_]*/g, 'params')
+      if (/\b(cons|weapon|trees|currentTalent|attr|calc|talent)\b/.test(exprNoParams)) continue
       if (/params\./.test(expr)) delete (b as any).check
     }
   }
@@ -3433,7 +4754,12 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       const expr = check.trim()
       if (!expr) continue
       if (!/params\./.test(expr)) continue
-      if (/\b(cons|weapon|trees|currentTalent|attr|calc|talent|element)\b/.test(expr)) continue
+      // Preserve real HP-threshold / target-HP gating (e.g. Hu Tao <=50% HP elemental dmg bonus).
+      // Dropping these checks makes buffs unconditional and can inflate panel regression by 50%+.
+      if (/\bparams\.(?:half|halfHp|lowHp|targetHp50|targetHp80|hpBelow50|hpAbove50)\b/i.test(expr)) continue
+      // `params.<key>` may legitimately use names like "talent"/"attr"; strip them before detecting real scope refs.
+      const exprNoParams = expr.replace(/\bparams\.[A-Za-z_][A-Za-z0-9_]*/g, 'params')
+      if (/\b(cons|weapon|trees|currentTalent|attr|calc|talent|element)\b/.test(exprNoParams)) continue
       delete (b as any).check
     }
   }
@@ -3532,6 +4858,137 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       }
     }
     bumpMissingBoolParamsOnAffectedDetails()
+
+    // If a buff clearly targets a specific attack name (e.g. "迴猎贯鳞炮") but its data key is talent-scoped
+    // (e.g. `eCdmg/eDmg/ePlus`), LLMs often forget to gate it and accidentally apply it to *all* E rows.
+    // Add a conservative tag-based gate when we can uniquely match the token to a subset of details.
+    const gateTalentScopedBuffsByTitleToken = (): void => {
+      const norm = (s: unknown): string =>
+        String(typeof s === 'string' ? s : '')
+          .trim()
+          .replace(/\s+/g, '')
+          .replace(/[·!?！？…\\-_—–()（）【】\\[\\]「」『』《》〈〉“”‘’\"']/g, '')
+
+      const buildTokens = (list: string[]): string[] => {
+        const out: string[] = []
+        for (const t0 of list || []) {
+          const t = String(t0 || '').trim()
+          if (!t) continue
+          const base = t.endsWith('2') ? t.slice(0, -1) : t
+          const noDmg = base.replace(/伤害/g, '').trim()
+          const cand = [base, noDmg].map(norm).filter(Boolean)
+          for (const c of cand) {
+            if (c.length < 2) continue
+            if (/(百分比|固定值|提升|增加|降低|上限|冷却|持续|能量)/.test(c)) continue
+            out.push(c)
+            if (out.length >= 40) return uniq(out)
+          }
+        }
+        return uniq(out)
+      }
+
+      const tokensA = buildTokens(tables.a || [])
+      const tokensE = buildTokens(tables.e || [])
+      const tokensQ = buildTokens(tables.q || [])
+      const tokensForBase = (base: string): string[] => {
+        if (base === 'e') return tokensE
+        if (base === 'q') return tokensQ
+        // a/a2/a3
+        return tokensA
+      }
+
+      const keyBaseOfDetail = (d: CalcSuggestDetail): string => {
+        const keyArg = typeof d.key === 'string' && d.key.trim() ? d.key.trim() : typeof d.talent === 'string' ? d.talent : ''
+        return (keyArg.split(',')[0] || '').trim()
+      }
+
+      const detailsByBase = new Map<string, CalcSuggestDetail[]>()
+      for (const d of details) {
+        const base = keyBaseOfDetail(d)
+        if (!base) continue
+        const list = detailsByBase.get(base) || []
+        list.push(d)
+        detailsByBase.set(base, list)
+      }
+
+      const matchDetailsByToken = (base: string, token: string): CalcSuggestDetail[] => {
+        const list = detailsByBase.get(base) || []
+        if (list.length === 0) return []
+        return list.filter((d) => {
+          const t = norm(d.title || '')
+          const tb = norm(typeof d.table === 'string' ? d.table : '')
+          return (t && t.includes(token)) || (tb && tb.includes(token))
+        })
+      }
+
+      const applyTag = (matched: CalcSuggestDetail[], token: string): boolean => {
+        const tagKey = 'tag'
+        // If there is a conflict, bail out (do not clobber existing tags).
+        for (const d of matched) {
+          const p0 = d.params
+          if (!p0 || typeof p0 !== 'object' || Array.isArray(p0)) continue
+          const pv = (p0 as any)[tagKey]
+          if (typeof pv === 'string' && pv && pv !== token) return false
+        }
+        for (const d of matched) {
+          const p0 = d.params
+          const p: Record<string, unknown> =
+            p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, unknown>) } : {}
+          if (!Object.prototype.hasOwnProperty.call(p, tagKey)) p[tagKey] = token
+          d.params = p as any
+        }
+        return true
+      }
+
+      const inferBaseFromDataKeys = (data: Record<string, unknown>): string | null => {
+        const bases = new Set<string>()
+        for (const k0 of Object.keys(data || {})) {
+          const k = String(k0 || '').trim()
+          const m = k.match(/^(a3|a2|a|e|q)(?:Def|Ignore|Dmg|Enemydmg|Plus|Pct|Cpct|Cdmg|Multi|Elevated)$/)
+          if (!m) continue
+          bases.add(m[1]!)
+        }
+        if (bases.size !== 1) return null
+        return Array.from(bases)[0]!
+      }
+
+      for (const b of buffsOut) {
+        const data = b.data
+        if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+        const base = inferBaseFromDataKeys(data as any)
+        if (!base) continue
+
+        const titleNorm = norm(b.title)
+        if (!titleNorm) continue
+        const tokens = tokensForBase(base)
+        if (tokens.length === 0) continue
+
+        const all = detailsByBase.get(base) || []
+        if (all.length <= 1) continue
+
+        const candidates = tokens.filter((t) => t && titleNorm.includes(t)).sort((a, b) => b.length - a.length)
+        if (candidates.length === 0) continue
+
+        let chosen: string | null = null
+        let matched: CalcSuggestDetail[] = []
+        for (const token of candidates) {
+          const ms = matchDetailsByToken(base, token)
+          // Only gate when it narrows the scope (prevents overly-generic tokens like "技能").
+          if (ms.length >= 1 && ms.length < all.length) {
+            chosen = token
+            matched = ms
+            break
+          }
+        }
+        if (!chosen || matched.length === 0) continue
+        if (!applyTag(matched, chosen)) continue
+
+        const prev = typeof (b as any).check === 'string' ? String((b as any).check).trim() : ''
+        const gate = `params.tag === ${JSON.stringify(chosen)}`
+        ;(b as any).check = prev ? `(${prev}) && (${gate})` : gate
+      }
+    }
+    gateTalentScopedBuffsByTitleToken()
 
     // If a buff's check references params.<key> that is never provided by any detail params,
     // the buff will be silently "dead" and cause systematic underestimation. Prefer simplifying:
@@ -3817,7 +5274,8 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
         while ((m = re.exec(expr))) {
           const tn = normalizePromptText(m[2])
           if (!tn) continue
-          const looksLikeAmount = /(回复|固定值|吸收量)/.test(tn) && !/(提高|增加|提升|加成)/.test(tn)
+          const looksLikeAmount =
+            /(回复|治疗量|护盾量|护盾值|固定值|吸收量)/.test(tn) && !/(提高|增加|提升|加成)/.test(tn)
           if (looksLikeAmount) return true
         }
         return false
@@ -3853,6 +5311,411 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
       }
     }
     pruneDerivedNonPlusBuffData()
+
+    // GS: Derive a small set of high-confidence buffs from official passive/cons texts.
+    // This reduces systematic under/over-estimation without copying baseline calc implementations.
+    const applyGsDerivedBuffsFromHints = (): void => {
+      if (input.game !== 'gs') return
+
+      const hintLines: string[] = []
+      for (const h of input.buffHints || []) {
+        const t = normalizePromptText(h)
+        if (t) hintLines.push(t)
+      }
+      for (const v of Object.values(input.talentDesc || {})) {
+        const t = normalizePromptText(v)
+        if (t) hintLines.push(t)
+      }
+
+      // 1) Recharge -> elemental dmg bonus conversions, e.g.:
+      // - "水元素伤害加成获得额外提升，提升程度相当于元素充能效率的20%。"
+      // - "基于元素充能效率超过100%的部分，每1% … 雷元素伤害加成提升0.4%。"
+      const inferRechargeDmg = (): { coef: number; minus100: boolean } | null => {
+        for (const s of hintLines) {
+          if (!/(元素充能效率|充能效率)/.test(s)) continue
+          if (!/(元素伤害加成|伤害加成)/.test(s)) continue
+
+          const minus100 = /(超过|超出)\s*100\s*%/.test(s) || /超过100%/.test(s)
+          if (minus100) {
+            const m = s.match(/伤害加成.{0,12}?(?:提升|提高|增加|获得).{0,12}?([0-9]+(?:\.[0-9]+)?)\s*%/)
+            if (!m) continue
+            const coef = Number(m[1])
+            if (!Number.isFinite(coef) || coef <= 0 || coef > 10) continue
+            return { coef, minus100: true }
+          }
+
+          const m = s.match(/充能效率.{0,20}?(?:的|×|x|\*)\s*([0-9]+(?:\.[0-9]+)?)\s*%/i)
+          if (!m) continue
+          const n = Number(m[1])
+          if (!Number.isFinite(n) || n <= 0 || n > 200) continue
+          return { coef: n / 100, minus100: false }
+        }
+        return null
+      }
+
+      const rechargeDmg = inferRechargeDmg()
+      if (rechargeDmg) {
+        // Remove likely-wrong recharge-to-dmg buffs emitted by LLM / earlier heuristics.
+        for (let i = buffsOut.length - 1; i >= 0; i--) {
+          const b = buffsOut[i]!
+          const title = normalizePromptText((b as any).title)
+          const data = (b as any).data
+          if (!data || typeof data !== 'object') continue
+          if (!Object.prototype.hasOwnProperty.call(data, 'dmg')) continue
+          if (/(元素充能效率|充能效率|recharge)/i.test(title)) {
+            buffsOut.splice(i, 1)
+            continue
+          }
+          // If the conversion was mis-parsed as a flat "<n>%元素伤害加成", drop it.
+          const dmg = (data as any).dmg
+          if (typeof dmg === 'number' && Number.isFinite(dmg)) {
+            // For "above-100%" conversions, any unconditional flat element dmg buff is very likely a mis-model.
+            if (rechargeDmg.minus100 && /元素伤害加成/.test(title) && typeof (b as any).cons !== 'number') {
+              buffsOut.splice(i, 1)
+              continue
+            }
+            const targetFlat = rechargeDmg.minus100 ? null : rechargeDmg.coef * 100
+            if (targetFlat !== null && Math.abs(dmg - targetFlat) < 1e-9 && /元素伤害加成/.test(title)) {
+              buffsOut.splice(i, 1)
+            }
+          }
+        }
+
+        const expr = rechargeDmg.minus100
+          ? `Math.max(calc(attr.recharge) - 100, 0) * ${rechargeDmg.coef}`
+          : `calc(attr.recharge) * ${rechargeDmg.coef}`
+        buffsOut.push({
+          title: `天赋：元素充能效率转元素伤害加成[dmg]%`,
+          sort: 4,
+          data: { dmg: expr }
+        })
+      }
+
+      // 2) Q-side "伤害加成" tables are usually buffs (e.g. omen/vulnerability-like effects).
+      if (qTables.includes('伤害加成')) {
+        const already = buffsOut.some((b) => {
+          const data = (b as any)?.data
+          if (!data || typeof data !== 'object') return false
+          for (const v of Object.values(data as Record<string, unknown>)) {
+            if (typeof v === 'string' && v.includes('talent.q["伤害加成"]')) return true
+          }
+          return false
+        })
+        if (!already) {
+          buffsOut.push({
+            title: `元素爆发：伤害加成[dmg]%`,
+            data: { dmg: `talent.q["伤害加成"]` }
+          })
+        }
+      }
+
+      // 3) Reaction-specific bonuses (e.g. vaporize/melt/spread/aggravate) from passives.
+      const pushReactionBonus = (key: 'vaporize' | 'melt' | 'spread' | 'aggravate', re: RegExp): void => {
+        const hasKey = buffsOut.some((b) => !!(b as any)?.data && Object.prototype.hasOwnProperty.call((b as any).data, key))
+        if (hasKey) return
+        let best: number | null = null
+        for (const s of hintLines) {
+          if (!/^被动：/.test(s)) continue
+          if (!re.test(s)) continue
+          if (!/(伤害|造成).{0,6}(提高|提升|增加)/.test(s)) continue
+          const reNum = /(\d+(?:\.\d+)?)\s*[%％]/g
+          let m: RegExpExecArray | null
+          while ((m = reNum.exec(s))) {
+            const n = Number(m[1])
+            if (!Number.isFinite(n) || n <= 0 || n > 200) continue
+            best = best === null ? n : Math.max(best, n)
+          }
+        }
+        if (best === null) return
+        buffsOut.push({
+          title: `被动：反应伤害加成[${key}]%`,
+          data: { [key]: best }
+        })
+      }
+      pushReactionBonus('vaporize', /(蒸发|vaporize)/i)
+      pushReactionBonus('melt', /(融化|melt)/i)
+      pushReactionBonus('spread', /(蔓激化|spread)/i)
+      pushReactionBonus('aggravate', /(超激化|aggravate)/i)
+
+      // 3.5) Stacked "damage increase by stat%" additive bonuses:
+      // e.g. "至多叠加2层...每层使本次<技能>造成的伤害基于攻击力的320%提高" => assume max stacks (showcase-style) and emit `ePlus`.
+      const pushStackedStatAdditiveBonus = (): void => {
+        const hasKey = (k: string): boolean =>
+          buffsOut.some((b) => {
+            const data = (b as any)?.data
+            return !!data && typeof data === 'object' && !Array.isArray(data) && Object.prototype.hasOwnProperty.call(data, k)
+          })
+
+        const norm = (s: string): string =>
+          normalizePromptText(s)
+            .replace(/\s+/g, '')
+            .replace(/[()（）【】\[\]<>]/g, '')
+            .trim()
+
+        const buildTokens = (list: string[]): string[] => {
+          const out: string[] = []
+          for (const t0 of list) {
+            const t = String(t0 || '').trim()
+            if (!t) continue
+            const base = t.endsWith('2') ? t.slice(0, -1) : t
+            const noDmg = base.replace(/伤害/g, '').trim()
+            const cand = [base, noDmg].map(norm).filter(Boolean)
+            for (const c of cand) {
+              if (c.length < 2) continue
+              if (/(百分比|固定值|提升|增加|降低|上限|冷却|持续|能量)/.test(c)) continue
+              out.push(c)
+              if (out.length >= 30) return uniq(out)
+            }
+          }
+          return uniq(out)
+        }
+
+        const tokensA = buildTokens(tables.a || [])
+        const tokensE = buildTokens(tables.e || [])
+        const tokensQ = buildTokens(tables.q || [])
+
+        const inferTalentKey = (textRaw: string): TalentKeyGs | null => {
+          const s = norm(textRaw)
+          if (!s) return null
+          if (/(元素战技|战技|E)/.test(s)) return 'e'
+          if (/(元素爆发|爆发|Q)/.test(s)) return 'q'
+          if (/(普攻|普通攻击|A|重击|下落)/.test(s)) return 'a'
+          const hitCount = (tokens: string[]): number => tokens.reduce((acc, t) => (t && s.includes(t) ? acc + 1 : acc), 0)
+          const aHit = hitCount(tokensA)
+          const eHit = hitCount(tokensE)
+          const qHit = hitCount(tokensQ)
+          const best = Math.max(aHit, eHit, qHit)
+          if (best <= 0) return null
+          if (eHit === best && eHit >= qHit && eHit >= aHit) return 'e'
+          if (qHit === best && qHit >= aHit) return 'q'
+          return 'a'
+        }
+
+        const statToKey: Record<CalcScaleStat, string> = { atk: 'atk', hp: 'hp', def: 'def', mastery: 'mastery' }
+        const talentToPlusKey: Partial<Record<TalentKeyGs, string>> = { a: 'aPlus', e: 'ePlus', q: 'qPlus' }
+
+        for (const s0 of hintLines) {
+          const s = normalizePromptText(s0)
+          if (!s) continue
+          if (!/至多叠加/.test(s) || !/每层/.test(s)) continue
+          if (!/伤害/.test(s) || !/(基于|按)/.test(s)) continue
+
+          const stackM = s.match(/至多叠加\s*(\d+)\s*层/)
+          const maxStack = stackM ? Math.max(1, Math.min(10, Math.trunc(Number(stackM[1])))) : 1
+
+          const m = s.match(
+            /每层[^%]{0,60}?(?:基于|按)[^%]{0,20}?(攻击力|生命值上限|最大生命值|生命上限|生命值|防御力|元素精通|精通)[^%]{0,20}?([0-9]+(?:\.[0-9]+)?)\s*[%％]\s*(?:提高|提升|增加)/
+          )
+          if (!m) continue
+          const statWord = String(m[1] || '')
+          const pct = Number(m[2])
+          if (!Number.isFinite(pct) || pct <= 0 || pct > 2000) continue
+
+          const stat: CalcScaleStat =
+            /精通/.test(statWord) ? 'mastery' : /防御/.test(statWord) ? 'def' : /生命/.test(statWord) ? 'hp' : 'atk'
+          const coef = (pct / 100) * maxStack
+          if (!Number.isFinite(coef) || coef <= 0 || coef > 30) continue
+
+          const tk = inferTalentKey(s)
+          if (!tk) continue
+          const key = talentToPlusKey[tk]
+          if (!key) continue
+          if (hasKey(key)) continue
+
+          buffsOut.push({
+            title: `推导：叠层基于${statWord}提高[${key}]（按最大层数）`,
+            sort: 6,
+            data: { [key]: `calc(attr.${statToKey[stat]}) * ${coef}` }
+          })
+        }
+      }
+      pushStackedStatAdditiveBonus()
+
+      // 4) Mastery-based dmg/crit bonuses with threshold + cap (e.g. Nahida A4 style passives).
+      // Best-effort only: derive when the text is explicit, otherwise leave it to the LLM.
+      const pushMasteryThresholdCaps = (): void => {
+        const existing = new Set<string>()
+        for (const b of buffsOut) {
+          const data = (b as any)?.data
+          if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+          for (const k of Object.keys(data as any)) existing.add(String(k))
+        }
+
+        const norm = (s: string): string =>
+          normalizePromptText(s)
+            .replace(/\s+/g, '')
+            .replace(/[()（）【】\[\]<>]/g, '')
+            .trim()
+
+        const aTables = tables.a || []
+        const eTables = tables.e || []
+        const qTablesAll = tables.q || []
+
+        const buildTokens = (list: string[]): string[] => {
+          const out: string[] = []
+          for (const t0 of list) {
+            const t = String(t0 || '').trim()
+            if (!t) continue
+            const base = t.endsWith('2') ? t.slice(0, -1) : t
+            const noDmg = base.replace(/伤害/g, '').trim()
+            const cand = [base, noDmg].map(norm).filter(Boolean)
+            for (const c of cand) {
+              if (c.length < 2) continue
+              if (/(百分比|固定值|提升|增加|降低|上限|冷却|持续|能量)/.test(c)) continue
+              out.push(c)
+              if (out.length >= 30) return uniq(out)
+            }
+          }
+          return uniq(out)
+        }
+
+        const tokensA = buildTokens(aTables)
+        const tokensE = buildTokens(eTables)
+        const tokensQ = buildTokens(qTablesAll)
+
+        const inferTalentKey = (textRaw: string): TalentKeyGs | null => {
+          const s = norm(textRaw)
+          if (!s) return null
+          if (/(元素战技|战技|E)/.test(s)) return 'e'
+          if (/(元素爆发|爆发|Q)/.test(s)) return 'q'
+          if (/(普攻|普通攻击|A|重击|下落)/.test(s)) return 'a'
+
+          const hitCount = (tokens: string[]): number => tokens.reduce((acc, t) => (t && s.includes(t) ? acc + 1 : acc), 0)
+          const aHit = hitCount(tokensA)
+          const eHit = hitCount(tokensE)
+          const qHit = hitCount(tokensQ)
+          const best = Math.max(aHit, eHit, qHit)
+          if (best <= 0) return null
+          if (eHit === best && eHit >= qHit && eHit >= aHit) return 'e'
+          if (qHit === best && qHit >= aHit) return 'q'
+          return 'a'
+        }
+
+        const pickThreshold = (textRaw: string): number => {
+          const s = normalizePromptText(textRaw)
+          if (!s) return 0
+          const m = s.match(/(?:元素精通|精通|mastery).{0,16}?(?:超过|高于|大于)\s*(\d{1,4})/i)
+          if (!m) return 0
+          const n = Number(m[1])
+          return Number.isFinite(n) && n >= 0 && n <= 5000 ? Math.trunc(n) : 0
+        }
+
+        const pickPerPointAndCap = (
+          textRaw: string,
+          keyword: '伤害' | '暴击率' | '暴击伤害'
+        ): { per: number; cap: number } | null => {
+          const s = normalizePromptText(textRaw)
+          if (!s || !s.includes(keyword)) return null
+          const idx = s.indexOf(keyword)
+          const seg = s.slice(Math.max(0, idx - 40), Math.min(s.length, idx + 80))
+          const nums: number[] = []
+          const re = /(\d+(?:\.\d+)?)\s*[%％]/g
+          let m: RegExpExecArray | null
+          while ((m = re.exec(seg))) {
+            const n = Number(m[1])
+            if (!Number.isFinite(n) || n <= 0 || n > 500) continue
+            nums.push(n)
+          }
+          if (nums.length < 2) return null
+          const per = Math.min(...nums)
+          const cap = Math.max(...nums)
+          if (!(per > 0 && cap > 0 && cap >= per)) return null
+          return { per, cap }
+        }
+
+        const keyOf = (tk: TalentKeyGs, kind: 'dmg' | 'cpct' | 'cdmg'): string => {
+          if (kind === 'dmg') return tk === 'a' ? 'aDmg' : tk === 'e' ? 'eDmg' : 'qDmg'
+          if (kind === 'cdmg') return tk === 'a' ? 'aCdmg' : tk === 'e' ? 'eCdmg' : 'qCdmg'
+          return tk === 'a' ? 'aCpct' : tk === 'e' ? 'eCpct' : 'qCpct'
+        }
+
+        for (const line0 of hintLines) {
+          if (!/^琚姩锛?/.test(line0)) continue
+          const line = normalizePromptText(line0)
+          if (!line) continue
+          if (!/(鍏冪礌绮鹃€殀绮鹃€?|mastery)/i.test(line)) continue
+          if (!/姣忕偣/.test(line) || !/(鑷冲|鏈€澶氾紝?|鏈€澶氥€?)/.test(line)) continue
+
+          const tk = inferTalentKey(line)
+          if (!tk) continue
+          const th = pickThreshold(line)
+
+          const dmg = pickPerPointAndCap(line, '伤害')
+          if (dmg) {
+            const k = keyOf(tk, 'dmg')
+            if (!existing.has(k)) {
+              const expr = `Math.min(${dmg.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${dmg.per})`
+              buffsOut.push({ title: `琚姩锛氬熀浜庡厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              existing.add(k)
+            }
+          }
+
+          const cpct = pickPerPointAndCap(line, '暴击率')
+          if (cpct) {
+            const k = keyOf(tk, 'cpct')
+            if (!existing.has(k)) {
+              const expr = `Math.min(${cpct.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${cpct.per})`
+              buffsOut.push({ title: `琚姩锛氬熀浜庅厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              existing.add(k)
+            }
+          }
+
+          const cdmg = pickPerPointAndCap(line, '暴击伤害')
+          if (cdmg) {
+            const k = keyOf(tk, 'cdmg')
+            if (!existing.has(k)) {
+              const expr = `Math.min(${cdmg.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${cdmg.per})`
+              buffsOut.push({ title: `琚姩锛氬熀浜庅厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              existing.add(k)
+            }
+          }
+        }
+      }
+      pushMasteryThresholdCaps()
+
+      // 5) HP-based flat extra damage (Plus) from passives, e.g.:
+      // "共鸣伤害提高生命值上限的1.9%，天星伤害提高生命值上限的33%。"
+      const hpPlus: Record<string, number> = {}
+      const mapPlusKey = (t: string): string | null => {
+        if (/普通攻击|普攻/.test(t)) return 'aPlus'
+        if (/重击/.test(t)) return 'a2Plus'
+        if (/下落攻击|坠地/.test(t)) return 'a3Plus'
+        if (/元素战技|战技|共鸣伤害/.test(t)) return 'ePlus'
+        if (/元素爆发|爆发|天星伤害/.test(t)) return 'qPlus'
+        return null
+      }
+      for (const s of hintLines) {
+        if (!/^被动：/.test(s)) continue
+        if (!/生命值上限/.test(s) || !/伤害/.test(s) || !/(提高|提升|增加)/.test(s)) continue
+        const re = /(普通攻击|重击|下落攻击|元素战技|元素爆发|共鸣伤害|天星伤害)\S{0,30}?生命值上限\S{0,30}?([0-9]+(?:\.[0-9]+)?)\s*[%％]/g
+        let m: RegExpExecArray | null
+        while ((m = re.exec(s))) {
+          const key = mapPlusKey(m[1] || '')
+          if (!key) continue
+          const pct = Number(m[2])
+          if (!Number.isFinite(pct) || pct <= 0 || pct > 200) continue
+          hpPlus[key] = Math.max(hpPlus[key] ?? -Infinity, pct / 100)
+        }
+      }
+      if (Object.keys(hpPlus).length) {
+        const already = buffsOut.some((b) => {
+          const data = (b as any)?.data
+          return !!data && typeof data === 'object' && Object.keys(hpPlus).some((k) => Object.prototype.hasOwnProperty.call(data, k))
+        })
+        if (!already) {
+          const data: Record<string, string> = {}
+          for (const [k, r] of Object.entries(hpPlus)) {
+            data[k] = `calc(attr.hp) * ${r}`
+          }
+          buffsOut.push({
+            title: `被动：基于生命值上限的额外伤害[*Plus]`,
+            sort: 9,
+            data
+          })
+        }
+      }
+    }
+    applyGsDerivedBuffsFromHints()
 
     // If a `qPlus` buff is gated by a simple numeric param threshold (e.g. `params.xxx > 0`),
     // but the main Q showcase row sets `params.xxx = 0`, the comparison will systematically undercount.
@@ -4803,6 +6666,93 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
         ;(d as any).check = String((d as any).check).replace(/\bparams\.stacks\b/g, 'params.num')
       }
     }
+
+    // Some models mistakenly treat "愿力加成" as a damage multiplier table and emit a low-damage row.
+    // Canonical modeling: keep base Q hit tables as details, and apply the bonus via `qPct` with params.type/num.
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i]!
+      if (d.talent !== 'q') continue
+      const tn = typeof d.table === 'string' ? String(d.table) : ''
+      if (tn && /愿力加成/.test(tn)) details.splice(i, 1)
+    }
+
+    const inferMaxWish = (): number => {
+      const texts = [
+        ...(Array.isArray(input.buffHints) ? (input.buffHints as string[]) : []),
+        ...Object.values(input.talentDesc || {})
+      ]
+      for (const t0 of texts) {
+        const t = normalizePromptText(t0)
+        if (!t || !/愿力/.test(t)) continue
+        const m = t.match(/(?:至多|最多)\S{0,8}?(\d{1,3})\S{0,2}层\S{0,6}?愿力/)
+        if (!m) continue
+        const n = Number(m[1])
+        if (Number.isFinite(n) && n > 0 && n <= 120) return Math.trunc(n)
+      }
+      return 60
+    }
+    const maxWish = inferMaxWish()
+
+    const baseSlashTable =
+      qTables.find((t) => /梦想一刀/.test(t) && /基础/.test(t) && /伤害/.test(t)) ||
+      qTables.find((t) => /梦想一刀/.test(t) && /伤害/.test(t)) ||
+      ''
+    const followNaTable = qTables.find((t) => /一段伤害/.test(t)) || ''
+    const followCaTable = qTables.find((t) => /重击伤害/.test(t)) || ''
+
+    const hasTitle = (title: string): boolean => details.some((d) => normalizePromptText(d.title) === title)
+    const slashName = (() => {
+      const n = normalizePromptText(baseSlashTable).replace(/基础/g, '').replace(/伤害/g, '').trim()
+      return n || '梦想一刀'
+    })()
+
+    const insertAt = (() => {
+      const i0 = details.findIndex((d) => d.talent === 'q')
+      return i0 >= 0 ? i0 : 0
+    })()
+    const inserts: CalcSuggestDetail[] = []
+    if (baseSlashTable) {
+      const t0 = `Q${slashName}伤害(零愿力)`
+      const t1 = `Q${slashName}伤害(满愿力)`
+      if (!hasTitle(t0)) inserts.push({ title: t0, kind: 'dmg', talent: 'q', table: baseSlashTable, key: 'q' })
+      if (!hasTitle(t1))
+        inserts.push({
+          title: t1,
+          kind: 'dmg',
+          talent: 'q',
+          table: baseSlashTable,
+          key: 'q',
+          params: { type: 0, num: maxWish }
+        })
+    }
+    if (followNaTable) {
+      const t = `Q后普攻一段伤害(满愿力)`
+      if (!hasTitle(t))
+        inserts.push({
+          title: t,
+          kind: 'dmg',
+          talent: 'q',
+          table: followNaTable,
+          key: 'q',
+          params: { type: 1, num: maxWish }
+        })
+    }
+    if (followCaTable) {
+      const t = `Q后重击伤害(满愿力)`
+      if (!hasTitle(t))
+        inserts.push({
+          title: t,
+          kind: 'dmg',
+          talent: 'q',
+          table: followCaTable,
+          key: 'q',
+          params: { type: 1, num: maxWish }
+        })
+    }
+    if (inserts.length) {
+      // Insert right after the first Q row so tail trimming keeps these high-signal rows.
+      details.splice(insertAt + 1, 0, ...inserts)
+    }
   }
 
   // GS: Fix common LLM confusion between `atkPct` (percent ATK) vs `atkPlus` (flat ATK add).
@@ -4963,150 +6913,7 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
   // Many SR profiles use max talent levels that can exceed table lengths in meta (yielding undefined => 0),
   // and baseline calc.js often relies on `aPlus/tPlus/...` to keep showcase rows non-zero.
   if (input.game === 'sr') {
-    const hints = Array.isArray(input.buffHints) ? input.buffHints : []
-    const existing = new Set<string>()
-    for (const b of buffsOut) {
-      const d = (b as any)?.data
-      if (!d || typeof d !== 'object' || Array.isArray(d)) continue
-      for (const k of Object.keys(d)) existing.add(k)
-    }
-
-    const normTitle = (s: string): string =>
-      String(s || '')
-        .trim()
-        .replace(/\s+/g, '')
-        .replace(/[·!?！？…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, '')
-    const existingTitles = new Set(details.map((d) => normTitle(d.title)))
-    const pushDerivedDetail = (d: CalcSuggestDetail): void => {
-      if (details.length >= 20) return
-      const t = normTitle(d.title)
-      if (!t || existingTitles.has(t)) return
-      existingTitles.add(t)
-      details.push(d)
-    }
-
-    const pickTalentKey = (text: string): 'a' | 'e' | 'q' | 't' | null => {
-      if (/(普攻|普通攻击)/.test(text)) return 'a'
-      if (/战技/.test(text)) return 'e'
-      if (/终结技/.test(text)) return 'q'
-      if (/(反击|天赋)/.test(text)) return 't'
-      return null
-    }
-    const pickStat = (text: string): 'atk' | 'hp' | 'def' | null => {
-      if (/(生命上限|生命值上限|最大生命值|生命值)/.test(text)) return 'hp'
-      if (/防御力/.test(text)) return 'def'
-      if (/(攻击力|攻击)/.test(text)) return 'atk'
-      return null
-    }
-    const pickPct = (text: string, stat: 'atk' | 'hp' | 'def'): number | null => {
-      const num = (s: string): number | null => {
-        const n = Number(s)
-        return Number.isFinite(n) ? n : null
-      }
-      if (stat === 'hp') {
-        const m1 = /([0-9]+(?:\\.[0-9]+)?)\\s*%\\s*(?:生命上限|生命值上限|最大生命值|生命值)/.exec(text)
-        if (m1) return num(m1[1]!)
-        const m2 = /(?:生命上限|生命值上限|最大生命值|生命值)(?:的)?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%/.exec(text)
-        return m2 ? num(m2[1]!) : null
-      }
-      if (stat === 'def') {
-        const m1 = /([0-9]+(?:\\.[0-9]+)?)\\s*%\\s*防御力/.exec(text)
-        if (m1) return num(m1[1]!)
-        const m2 = /防御力(?:的)?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%/.exec(text)
-        return m2 ? num(m2[1]!) : null
-      }
-      const m1 = /([0-9]+(?:\\.[0-9]+)?)\\s*%\\s*(?:攻击力|攻击)/.exec(text)
-      if (m1) return num(m1[1]!)
-      const m2 = /(?:攻击力|攻击)(?:的)?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%/.exec(text)
-      return m2 ? num(m2[1]!) : null
-    }
-    const pickFlat = (text: string): number | null => {
-      const m = /(?:\\+|＋)\\s*([0-9]+(?:\\.[0-9]+)?)\\b/.exec(text)
-      if (!m) return null
-      const n = Number(m[1])
-      return Number.isFinite(n) ? n : null
-    }
-
-    for (const h0 of hints) {
-      const h = normalizePromptText(h0)
-      if (!h) continue
-
-      const mCons = /^(\\d+)\\s*魂[:：]/.exec(h)
-      if (!mCons) continue
-      const cons = Number(mCons[1])
-      if (!Number.isFinite(cons) || cons < 1 || cons > 6) continue
-
-      // Only treat clear "additional damage VALUE" wording as *Plus.
-      if (/(额外造成|伤害值提高|伤害提高|伤害提升|提升数值|提高数值)/.test(h)) {
-        const talentKey = pickTalentKey(h)
-        if (talentKey) {
-          const stat = pickStat(h)
-          if (stat) {
-            const pct = pickPct(h, stat)
-            if (pct != null && Number.isFinite(pct) && pct > 0 && pct <= 2000) {
-              const dataKey = `${talentKey}Plus`
-              if (!existing.has(dataKey)) {
-                const ratio = Number((pct / 100).toFixed(6))
-                const statCn = stat === 'hp' ? '生命上限' : stat === 'def' ? '防御力' : '攻击力'
-                buffsOut.push({
-                  title: `推导：${cons}魂基于${statCn}的追加伤害值`,
-                  cons,
-                  data: {
-                    [dataKey]: `calc(attr.${stat}) * ${ratio}`
-                  }
-                })
-                existing.add(dataKey)
-              }
-            }
-          }
-        }
-      }
-
-      // Derive simple cons heal/shield showcase rows (independent from talent tables).
-      // Helps keep SR panel results non-zero when talent levels exceed table lengths (undefined => 0/null).
-      const wantsShield =
-        /护盾/.test(h) && (/(抵消|吸收)/.test(h) || /护盾.{0,10}持续/.test(h))
-      const wantsHeal =
-        (/(治疗|回复)/.test(h) ||
-          (/恢复/.test(h) && /(生命上限|生命值上限|最大生命值|生命值)/.test(h))) &&
-        /(生命上限|生命值上限|最大生命值|生命值)/.test(h)
-      if (!wantsShield && !wantsHeal) continue
-
-      const statOrder: Array<'atk' | 'hp' | 'def'> = wantsHeal ? ['hp', 'def', 'atk'] : ['def', 'hp', 'atk']
-      let stat: 'atk' | 'hp' | 'def' | null = null
-      let pct: number | null = null
-      for (const s of statOrder) {
-        const p = pickPct(h, s)
-        if (p != null) {
-          stat = s
-          pct = p
-          break
-        }
-      }
-      if (!stat) stat = pickStat(h)
-      if (!stat) continue
-      if (pct == null) pct = pickPct(h, stat)
-      const flat = pickFlat(h)
-      if (pct == null && flat == null) continue
-
-      const ratio = pct != null && Number.isFinite(pct) ? Number((pct / 100).toFixed(6)) : 0
-      const exprParts: string[] = []
-      if (pct != null && Number.isFinite(pct) && pct > 0) exprParts.push(`calc(attr.${stat}) * ${ratio}`)
-      if (flat != null && Number.isFinite(flat) && flat !== 0) exprParts.push(String(flat))
-      if (exprParts.length === 0) continue
-
-      const kind: CalcDetailKind = wantsShield ? 'shield' : 'heal'
-      const fn = wantsShield ? 'shield' : 'heal'
-      const isDotLike = /(持续|回合开始|持续治疗)/.test(h)
-      const title = wantsShield ? `${cons}命护盾量` : `${cons}命${isDotLike ? '持续' : ''}治疗量`
-
-      pushDerivedDetail({
-        title,
-        kind,
-        cons,
-        dmgExpr: `${fn}(${exprParts.join(' + ')})`
-      })
-    }
+    deriveSrConsFromBuffHints(input.buffHints, details, buffsOut)
   }
 
   // GS: If the character has clear EM/reaction hints but the plan omitted all reaction rows,
@@ -5375,20 +7182,20 @@ function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSug
   return { mainAttr, defDmgKey, details, buffs: buffsOut }
 }
 
-function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestResult): void {
-  if (input.game !== 'sr') return
-  const details = Array.isArray(plan.details) ? plan.details : []
-  const buffsArr = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as CalcSuggestBuff[]) : []
-  ;(plan as any).buffs = buffsArr
-
-  // Reuse the same safe/derived logic as validatePlan; keep it best-effort and non-throwing.
+function deriveSrConsFromBuffHints(
+  buffHints: unknown,
+  details: CalcSuggestDetail[],
+  buffs: CalcSuggestBuff[]
+): void {
   try {
-    const hints = Array.isArray(input.buffHints) ? input.buffHints : []
-    const existing = new Set<string>()
-    for (const b of buffsArr) {
+    const hints = Array.isArray(buffHints) ? (buffHints as unknown[]) : []
+    if (hints.length === 0) return
+
+    const existingKeys = new Set<string>()
+    for (const b of buffs) {
       const d = (b as any)?.data
       if (!d || typeof d !== 'object' || Array.isArray(d)) continue
-      for (const k of Object.keys(d)) existing.add(k)
+      for (const k of Object.keys(d)) existingKeys.add(k)
     }
 
     const normTitle = (s: string): string =>
@@ -5396,7 +7203,7 @@ function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestR
         .trim()
         .replace(/\s+/g, '')
         .replace(/[·!?！？…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, '')
-    const existingTitles = new Set(details.map((d) => normTitle(d.title)))
+    const existingTitles = new Set(details.map((d) => normTitle((d as any)?.title)))
     const pushDerivedDetail = (d: CalcSuggestDetail): void => {
       if (details.length >= 20) return
       const t = normTitle(d.title)
@@ -5423,26 +7230,23 @@ function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestR
         const n = Number(s)
         return Number.isFinite(n) ? n : null
       }
-      const pctToken = '[%％]'
       if (stat === 'hp') {
-        const m1 = new RegExp(
-          `([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}\\\\s*(?:生命上限|生命值上限|最大生命值|生命值)`
-        ).exec(text)
+        const m1 =
+          /([0-9]+(?:\.[0-9]+)?)\s*[%％]\s*(?:生命上限|生命值上限|最大生命值|生命值)/.exec(text)
         if (m1) return num(m1[1]!)
-        const m2 = new RegExp(
-          `(?:生命上限|生命值上限|最大生命值|生命值)(?:的)?\\\\s*([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}`
-        ).exec(text)
+        const m2 =
+          /(?:生命上限|生命值上限|最大生命值|生命值)(?:的)?\s*([0-9]+(?:\.[0-9]+)?)\s*[%％]/.exec(text)
         return m2 ? num(m2[1]!) : null
       }
       if (stat === 'def') {
-        const m1 = new RegExp(`([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}\\\\s*防御力`).exec(text)
+        const m1 = /([0-9]+(?:\.[0-9]+)?)\s*[%％]\s*防御力/.exec(text)
         if (m1) return num(m1[1]!)
-        const m2 = new RegExp(`防御力(?:的)?\\\\s*([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}`).exec(text)
+        const m2 = /防御力(?:的)?\s*([0-9]+(?:\.[0-9]+)?)\s*[%％]/.exec(text)
         return m2 ? num(m2[1]!) : null
       }
-      const m1 = new RegExp(`([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}\\\\s*(?:攻击力|攻击)`).exec(text)
+      const m1 = /([0-9]+(?:\.[0-9]+)?)\s*[%％]\s*(?:攻击力|攻击)/.exec(text)
       if (m1) return num(m1[1]!)
-      const m2 = new RegExp(`(?:攻击力|攻击)(?:的)?\\\\s*([0-9]+(?:\\\\.[0-9]+)?)\\\\s*${pctToken}`).exec(text)
+      const m2 = /(?:攻击力|攻击)(?:的)?\s*([0-9]+(?:\.[0-9]+)?)\s*[%％]/.exec(text)
       return m2 ? num(m2[1]!) : null
     }
     const pickFlat = (text: string): number | null => {
@@ -5456,7 +7260,7 @@ function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestR
       const h = normalizePromptText(h0)
       if (!h) continue
 
-      const mCons = /^(\\d+)\\s*魂[:：]/.exec(h)
+      const mCons = /^(\d+)\s*魂[:：]/.exec(h)
       if (!mCons) continue
       const cons = Number(mCons[1])
       if (!Number.isFinite(cons) || cons < 1 || cons > 6) continue
@@ -5469,17 +7273,17 @@ function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestR
           const pct = pickPct(h, stat)
           if (pct != null && Number.isFinite(pct) && pct > 0 && pct <= 2000) {
             const dataKey = `${talentKey}Plus`
-            if (!existing.has(dataKey)) {
+            if (!existingKeys.has(dataKey)) {
               const ratio = Number((pct / 100).toFixed(6))
               const statCn = stat === 'hp' ? '生命上限' : stat === 'def' ? '防御力' : '攻击力'
-              buffsArr.push({
+              buffs.push({
                 title: `推导：${cons}魂基于${statCn}的追加伤害值`,
                 cons,
                 data: {
                   [dataKey]: `calc(attr.${stat}) * ${ratio}`
                 }
               })
-              existing.add(dataKey)
+              existingKeys.add(dataKey)
             }
           }
         }
@@ -5526,6 +7330,15 @@ function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestR
   } catch {
     // Best-effort: do not block generation.
   }
+}
+
+function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestResult): void {
+  if (input.game !== 'sr') return
+  const details = Array.isArray(plan.details) ? plan.details : []
+  const buffsArr = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as CalcSuggestBuff[]) : []
+  ;(plan as any).buffs = buffsArr
+
+  deriveSrConsFromBuffHints(input.buffHints, details, buffsArr)
 }
 
 export async function suggestCalcPlan(
@@ -5613,6 +7426,43 @@ export async function suggestCalcPlan(
 }
 
 export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, createdBy: string): string {
+  // Final guardrail: ensure GS Natlan "夜魂" tag is applied consistently to dmgKey buckets.
+  // Some LLM plans mix tagged/untagged keys for the same talent, which routes buffs incorrectly and causes
+  // large regression drift. Keep this in render() as a last pass so any later plan mutations are covered.
+  if (input.game === 'gs') {
+    const details = Array.isArray(plan.details) ? (plan.details as CalcSuggestDetail[]) : []
+    const hasNightByTalent = new Set<TalentKeyGs>()
+
+    for (const d of details) {
+      const tk = (d as any)?.talent
+      if (tk !== 'a' && tk !== 'e' && tk !== 'q') continue
+      const key = typeof (d as any)?.key === 'string' ? String((d as any).key).trim().toLowerCase() : ''
+      if (key && /nightsoul/.test(key)) hasNightByTalent.add(tk)
+    }
+
+    if (hasNightByTalent.size) {
+      for (const d of details) {
+        const tk = (d as any)?.talent
+        if (tk !== 'a' && tk !== 'e' && tk !== 'q') continue
+        if (!hasNightByTalent.has(tk)) continue
+
+        // Do not force nightsoul buckets for lunar reaction rows (baseline uses empty dmgKey there).
+        const ele = typeof (d as any)?.ele === 'string' ? String((d as any).ele).trim() : ''
+        if (ele && /^lunar/i.test(ele)) continue
+        const kind = typeof (d as any)?.kind === 'string' ? String((d as any).kind).trim().toLowerCase() : ''
+        if (kind === 'reaction') continue
+
+        const keyRaw = typeof (d as any)?.key === 'string' ? String((d as any).key).trim() : ''
+        if (!keyRaw) {
+          ;(d as any).key = `${tk},nightsoul`
+          continue
+        }
+        if (/nightsoul/i.test(keyRaw)) continue
+        ;(d as any).key = `${keyRaw},nightsoul`
+      }
+    }
+  }
+
   const inferDmgBaseFromUnit = (unitRaw: unknown): 'hp' | 'def' | 'mastery' | null => {
     const unit = normalizePromptText(unitRaw)
     if (!unit) return null
@@ -6037,16 +7887,23 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
           continue
         }
 
-        const hasTrue = checkStrings.some((s) => new RegExp(`\\bparams\\.${escapeRegExp(k)}\\s*(?:===|==)\\s*true\\b`).test(s))
-        const hasFalse = checkStrings.some((s) => new RegExp(`\\bparams\\.${escapeRegExp(k)}\\s*(?:===|==)\\s*false\\b`).test(s))
-        if (hasTrue && !hasFalse) {
-          out[k] = true
-          continue
-        }
-
         if (k === 'type' || k === 'idx' || k === 'index') {
           out[k] = 0
           continue
+        }
+
+        // Boolean toggles in SR buffs (baseline often assumes "buff active" by default for showcase rows).
+        // If a buff.check explicitly requires `params.<k> === true` and no detail row sets it,
+        // default it to true so the buff isn't dead-by-default.
+        if (!/^(?:half|halfHp|lowHp|hpBelow50|hpAbove50)$/i.test(k)) {
+          const reTrue = new RegExp(`\\bparams\\.${escapeRegExp(k)}\\b\\s*={2,3}\\s*true\\b`)
+          const reFalse = new RegExp(`\\bparams\\.${escapeRegExp(k)}\\b\\s*={2,3}\\s*false\\b`)
+          const hasTrue = checkStrings.some((s) => reTrue.test(s))
+          const hasFalse = checkStrings.some((s) => reFalse.test(s))
+          if (hasTrue && !hasFalse) {
+            out[k] = true
+            continue
+          }
         }
 
         const isCountLike = /(?:layer|layers|stack|stacks|count|cnt|num|times)$/i.test(k)
@@ -6085,8 +7942,6 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       if (typeof s !== 'string') return
       if (!s) return
       if (!('Nightsoul' in out) && /夜魂/i.test(s)) out.Nightsoul = true
-      // HP threshold flags used by many baseline calcs (often assumed to be true for展示/对标).
-      if (!('half' in out) && /(半血|低血|生命值低于|生命值少于|HP\s*<\s*50%|hp\s*<\s*50%)/i.test(s)) out.half = true
       if (!('Hexenzirkel' in out) && /(魔女会|Hexenzirkel)/i.test(s)) out.Hexenzirkel = true
       // Lunar system (Moonsign) used by some characters / reactions.
       if (
@@ -6450,13 +8305,21 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     // easily mis-detect HP/DEF/EM scaling and explode damage numbers (e.g. mixed-scaling skills where only one
     // sub-table uses HP/DEF/EM).
     const hasPerTableHint = !!unitNorm || !!textNorm
-    const base =
+    const baseInferred =
       unitBase ||
       textBase ||
       ((input.game === 'gs' && !hasPerTableHint) || looksLikePlainPctUnit || looksLikePlainPctTextSample
         ? 'atk'
         : descBase) ||
       'atk'
+    // SR: allow validated plan.stat overrides for HP/DEF-scaling kits.
+    // (Tables often lack per-table unit markers; relying only on description heuristics can still miss.)
+    const statOverrideRaw = typeof (d as any).stat === 'string' ? String((d as any).stat).trim().toLowerCase() : ''
+    const statOverride =
+      input.game === 'sr' && kind === 'dmg' && (statOverrideRaw === 'hp' || statOverrideRaw === 'def' || statOverrideRaw === 'atk')
+        ? statOverrideRaw
+        : ''
+    const base = (statOverride || baseInferred) as 'atk' | 'hp' | 'def' | 'mastery'
     const useBasic = base !== 'atk'
 
 	    if (kind === 'heal' || kind === 'shield') {
@@ -6645,19 +8508,25 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	          detailsLines.push(`        return dmg.basic(calc(attr.${schema.stat}) * toRatio(sum), ${keyArg}${eleArg})`)
 	        }
 	      } else if (schema?.kind === 'statFlat') {
-	        detailsLines.push(
-	          `        return dmg.basic(calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
-	        )
+          // Prefer passing ATK-scaling arrays through to miao-plugin `dmg()`:
+          // - avoids mis-interpreting per-level arrays as [pct, flat]
+          // - keeps behavior closer to baseline calc.js which often calls `dmg(talent.xx[table], key)` directly
+          if (schema.stat === 'atk' && !useBasic) {
+            detailsLines.push(`        return dmg(t, ${keyArg}${eleArg})`)
+          } else {
+            detailsLines.push(
+              `        return dmg.basic(calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
+            )
+          }
 	      } else if (useBasic) {
 	        detailsLines.push(`        const base = calc(attr.${base})`)
 	        detailsLines.push(
 	          `        return dmg.basic(base * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
 	        )
 	      } else {
-	        detailsLines.push(`        const base = calc(attr.atk)`)
-	        detailsLines.push(
-	          `        return dmg.basic(base * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
-	        )
+          // ATK-scaling array tables are ambiguous (per-level arrays / [pct,flat] / multi-hit lists).
+          // Defer to miao-plugin `dmg()` which already implements the baseline semantics for these shapes.
+          detailsLines.push(`        return dmg(t, ${keyArg}${eleArg})`)
 	      }
 	    }
 	    detailsLines.push(`      }`)

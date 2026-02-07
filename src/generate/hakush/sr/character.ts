@@ -554,7 +554,7 @@ function formatConstParam(value: number, format: string, pct: string, opts?: { c
 function renderSrTextWithParams(rawDesc: unknown, paramList: unknown, opts?: { charId?: number }): string {
   const desc = typeof rawDesc === 'string' ? rawDesc : ''
   const params = Array.isArray(paramList) ? (paramList as Array<unknown>) : []
-  const replaced = desc.replace(/#(\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
+  const replaced = desc.replace(/[#$](\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
     const idx = Number(idxStr) - 1
     if (!Number.isFinite(idx) || idx < 0) return m
     const v = toNum(params[idx])
@@ -594,8 +594,11 @@ function guessSrParamName(opts: {
   const { descSrc, descPlain, charId, varCount, outIdx, origIdx, tagCn } = opts
 
   const idx1 = origIdx + 1
-  const needle = `#${idx1}[`
-  const pos = descPlain.indexOf(needle)
+  const needleHash = `#${idx1}[`
+  const needleDollar = `$${idx1}[`
+  const posHash = descPlain.indexOf(needleHash)
+  const posDollar = posHash >= 0 ? -1 : descPlain.indexOf(needleDollar)
+  const pos = posHash >= 0 ? posHash : posDollar
   const before = pos >= 0 ? descPlain.slice(Math.max(0, pos - 80), pos) : ''
   const after = pos >= 0 ? descPlain.slice(pos, Math.min(descPlain.length, pos + 80)) : ''
   const around = `${before}${after}`
@@ -604,8 +607,9 @@ function guessSrParamName(opts: {
   const beforeSeg = (beforeTrim.split(/[，。,;；、：:]/).pop() || beforeTrim).trim()
   const afterClause = (after.split(/[，。,;；。！？]/)[0] || after).trim()
   const local = `${beforeSeg}${afterClause}`
+  const afterNoVar = afterClause.replace(/^[#$]\d+\[(?:i|f1|f2)]%?/, '').trim()
 
-  const isPercent = new RegExp(`#${idx1}\\[(?:i|f1|f2)]%`).test(descSrc)
+  const isPercent = new RegExp(`[#$]${idx1}\\[(?:i|f1|f2)]%`).test(descSrc)
   const hasDamage = /伤害/.test(descPlain)
   const isShieldParam = local.includes('护盾')
   const isHealParam = /(治疗|回复|恢复)/.test(local) && /生命上限|生命值/.test(local)
@@ -621,7 +625,7 @@ function guessSrParamName(opts: {
   const isAdjacentDamage = /相邻目标|相邻敌方|相邻/.test(before) && /伤害/.test(around)
   const isCounterDamage = before.includes('反击') && /伤害/.test(around)
   const isFollowUpDamage = before.includes('追加攻击') && /伤害/.test(around)
-  const isExtraDamage = /(额外|附加)/.test(before) && /伤害/.test(around)
+  const isExtraDamage = /(额外|附加)/.test(local) && /伤害/.test(local)
 
   const stat =
     around.includes('攻击力') ? 'atk' : around.includes('防御力') ? 'def' : /生命上限|生命值/.test(around) ? 'hp' : ''
@@ -645,6 +649,18 @@ function guessSrParamName(opts: {
   if (/天赋.*伤害.*(提高|增加)$/.test(beforeSeg)) return '天赋伤害提高'
   if (/伤害.*(提高|增加)$/.test(beforeSeg)) return '伤害提高'
 
+  // Common non-damage mechanics (often appear in mixed skills with damage).
+  // Base chance: `$n% 的基础概率 ...`
+  if (/^(?:的)?(?:基础概率|基础几率|概率|几率)/.test(afterNoVar) && !/暴击率/.test(afterNoVar)) return '基础概率'
+  if (/全属性抗性/.test(beforeSeg) && /(降低|减少)/.test(beforeSeg)) return '全属性抗性降低'
+  if (/(对应属性|该属性)/.test(beforeSeg) && /抗性/.test(beforeSeg) && /(降低|减少)/.test(beforeSeg)) return '对应属性抗性降低'
+  if (/抗性/.test(beforeSeg) && /(降低|减少)/.test(beforeSeg) && !/(效果抵抗|效果抗性|抗性穿透)/.test(beforeSeg)) return '抗性降低'
+  if (/防御力/.test(beforeSeg) && /(降低|减少|下降)/.test(beforeSeg) && !/(提高|提升|增加)/.test(beforeSeg)) return '防御力降低'
+  if (/攻击力/.test(beforeSeg) && /(降低|减少|下降)/.test(beforeSeg) && !/(提高|提升|增加)/.test(beforeSeg)) return '攻击力降低'
+  if (/速度/.test(beforeSeg) && /(降低|减少|下降)/.test(beforeSeg) && !/(提高|提升|增加)/.test(beforeSeg)) return '速度降低'
+  if (/受到/.test(beforeSeg) && /伤害/.test(beforeSeg) && /(降低|减少)/.test(beforeSeg)) return '受到伤害降低'
+  if (!/受到/.test(beforeSeg) && /伤害/.test(beforeSeg) && /(降低|减少)/.test(beforeSeg)) return '伤害降低'
+
   // Common non-heal stat-up params (HP/ATK/DEF). These are frequently shown alongside heals/buffs and should not
   // fall back to generic "参数1/2", otherwise LLMs may accidentally use them as heal multipliers.
   if (isHpUpParam) return isPercent ? '生命提高·百分比生命' : '生命提高·固定值'
@@ -663,7 +679,7 @@ function guessSrParamName(opts: {
   }
 
   // Damage params (including mixed skills): infer special cases from local context.
-  if (/伤害/.test(around)) {
+  if (/伤害/.test(local)) {
     // Break / Super-break damage ratios.
     // These are not regular "技能伤害" multipliers and should be named explicitly so downstream calc.js
     // can model them via `reaction("<elem>Break"/"superBreak")` and related buffs.
@@ -735,7 +751,7 @@ function guessSrParamName(opts: {
     return `${prefix}固定值`
   }
 
-  return guessPrimaryParamName(descPlain, outIdx)
+  return guessPrimaryParamName(local || descPlain, outIdx)
 }
 
 function skillDescAndTables(
@@ -776,7 +792,12 @@ function skillDescAndTables(
 
   const paramCount = Math.max(...paramLists.map((a) => a.length))
   const isPercentParam = (idx: number): boolean =>
-    descSrc.includes(`#${idx + 1}[i]%`) || descSrc.includes(`#${idx + 1}[f1]%`) || descSrc.includes(`#${idx + 1}[f2]%`)
+    descSrc.includes(`#${idx + 1}[i]%`) ||
+    descSrc.includes(`#${idx + 1}[f1]%`) ||
+    descSrc.includes(`#${idx + 1}[f2]%`) ||
+    descSrc.includes(`$${idx + 1}[i]%`) ||
+    descSrc.includes(`$${idx + 1}[f1]%`) ||
+    descSrc.includes(`$${idx + 1}[f2]%`)
 
   // Determine constant vs variable params (with a tiny tolerance).
   const isConst: boolean[] = []
@@ -800,7 +821,7 @@ function skillDescAndTables(
     varMap.set(origIdx, varIdx)
   }
 
-  for (const m of descSrc.matchAll(/#(\d+)\[(i|f1|f2)]%?/g)) {
+  for (const m of descSrc.matchAll(/[#$](\d+)\[(i|f1|f2)]%?/g)) {
     const origIdx = Number(m[1]) - 1
     if (!Number.isFinite(origIdx)) continue
     ensureVar(origIdx)
@@ -825,7 +846,7 @@ function skillDescAndTables(
   // Replace placeholders:
   // - constants => literal numbers (keep <nobr> wrapper if upstream had it)
   // - variables => $k[i]/$k[f1] etc
-  const replaced = descSrc.replace(/#(\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
+  const replaced = descSrc.replace(/[#$](\d+)\[(i|f1|f2)](%?)/g, (m, idxStr: string, fmt: string, pct: string) => {
     const origIdx = Number(idxStr) - 1
     if (!Number.isFinite(origIdx) || origIdx < 0) return m
       if (isConst[origIdx]) {
