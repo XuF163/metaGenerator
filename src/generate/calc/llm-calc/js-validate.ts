@@ -461,10 +461,12 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
     const validateBuffNumber = (keyRaw: unknown, ret: number): void => {
       if (!Number.isFinite(ret)) throw new Error(`buff.data() returned non-finite number`)
       const key = String(keyRaw || '')
+      const isBigDmgKey = key === 'dmg' || /Dmg$/.test(key)
       if (isCritRateKey(key) && Math.abs(ret) > 100) {
         throw new Error(`buff.data() returned unreasonable cpct-like value: ${key}=${ret}`)
       }
-      if (isPercentLikeKey(key) && Math.abs(ret) > 500) {
+      const maxPercentLike = game === 'sr' ? (isBigDmgKey ? 5000 : 500) : 500
+      if (isPercentLikeKey(key) && Math.abs(ret) > maxPercentLike) {
         throw new Error(`buff.data() returned unreasonable percent-like value: ${key}=${ret}`)
       }
       // SR: tighten sanity bounds for common debuff buckets.

@@ -181,7 +181,7 @@ function tryBuildEnergyCapBuff(text: string): { expr: string; usedIdx: number } 
   // Example (Hakush):
   // - "根据装备者的能量上限，提高装备者造成的伤害：每点能量提高$1[i]%，最多计入160点。"
   // Baseline convention: model as dmg% = tables[idx] * min(attr.sp, cap)
-  const mIdx = text.match(/每点能量提高\s*\$(\d+)\[i]\s*%/)
+  const mIdx = text.match(/每点能量提高\s*\$(\d+)\[(?:i|f1|f2)]\s*%/)
   if (!mIdx) return null
   const idx = Number(mIdx[1])
   if (!Number.isFinite(idx) || idx <= 0) return null
@@ -190,13 +190,16 @@ function tryBuildEnergyCapBuff(text: string): { expr: string; usedIdx: number } 
   const cap = mCap ? Math.trunc(Number(mCap[1])) : 160
   if (!Number.isFinite(cap) || cap <= 0 || cap > 999) return null
 
-  // Only handle generic dmg in this heuristic pass.
-  if (!/造成的伤害/.test(text)) return null
+  // Must be a damage bonus sentence (avoid misreading "受到伤害降低").
+  if (!/伤害/.test(text) || /(受到|承受).{0,8}伤害/.test(text)) return null
 
+  // Skill bucket (prefer Q when explicit).
+  const key = /终结技/.test(text) ? 'qDmg' : 'dmg'
+  const title = key === 'qDmg' ? '根据装备者的能量上限提高伤害[qDmg]%' : '根据能量上限提高伤害[dmg]%'
   const expr =
     `(tables) => ({ ` +
-    `title: "根据能量上限提高伤害[dmg]%", ` +
-    `data: { dmg: ({ attr }) => (tables[${idx}] || 0) * Math.min(attr.sp || 0, ${cap}) } ` +
+    `title: "${title}", ` +
+    `data: { ${key}: ({ attr }) => (tables[${idx}] || 0) * Math.min(attr.sp || 0, ${cap}) } ` +
     `})`
   return { expr, usedIdx: idx }
 }
@@ -267,7 +270,7 @@ export async function generateSrWeaponCalcJs(opts: {
       // These are used to match baseline-style dynamic buffs.
       const special = tryBuildEnergyCapBuff(text)
 
-      const matches = Array.from(text.matchAll(/\$(\d+)\[i]/g))
+      const matches = Array.from(text.matchAll(/\$(\d+)\[(?:i|f1|f2)]/g))
       if (!special && matches.length === 0) continue
 
       const parts: string[] = []

@@ -68,6 +68,9 @@ function parseCondition(seg: string): Condition | null {
   // Complex dual-threshold forms like "110/95" are not supported (skip to avoid wrong buffs).
   if (/\d+\/\d+/.test(seg)) return null
 
+  // Action-like triggers (no stable numeric condition): keep deterministic by omitting `check`
+  // and letting the caller decide whether to fall back to an unconditional approximation.
+
   // Speed <= N
   let m = seg.match(/\u901f\u5ea6(?:\u5c0f\u4e8e\u7b49\u4e8e|\u4e0d\u5927\u4e8e|<=|\u2264)(\d+(?:\.\d+)?)/)
   if (m) {
@@ -208,6 +211,29 @@ function parseCondition(seg: string): Condition | null {
     if (n > 0) {
       return {
         check: `({ calc, attr }) => calc(attr.effPct) > ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+
+  // Effect RES (效果抵抗) >= N%
+  m = seg.match(/\u6548\u679c\u62b5\u6297(?:\u5927\u4e8e\u7b49\u4e8e|\u4e0d\u4f4e\u4e8e|>=|\u2265)(\d+(?:\.\d+)?)%/)
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.effDef) >= ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+  // Effect RES (效果抵抗) > N%
+  m = seg.match(/\u6548\u679c\u62b5\u6297(?:\u5927\u4e8e|>|\u9ad8\u4e8e)(\d+(?:\.\d+)?)%/)
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.effDef) > ${n}`,
         effectText: splitEffectTextFromConditionalSentence(seg)
       }
     }
@@ -447,6 +473,25 @@ function parseSkillText(textRaw: string): Buff[] {
             check: cond.check,
             data
           })
+        }
+      } else {
+        // Some upstream relic bonuses use action-like "当...施放战技/终结技时..." triggers.
+        // Baseline meta often approximates these as always-on showcase buffs; keep them *only* when the
+        // trigger is action/battle-flow related (not status/threshold), to avoid wrong unconditional buffs.
+        const isActionLike =
+          /\u65bd\u653e|\u91ca\u653e|\u4f7f\u7528|\u5165\u6218|\u6218\u6597\u5f00\u59cb|\u56de\u5408\u5f00\u59cb/.test(
+            condPart
+          )
+        if (isActionLike) {
+          const effectText = splitEffectTextFromConditionalSentence(condPart)
+          const data = parseData(effectText)
+          if (Object.keys(data).length > 0) {
+            out.push({
+              title: seg,
+              ...(isStaticData(data) ? { isStatic: true } : {}),
+              data
+            })
+          }
         }
       }
       continue

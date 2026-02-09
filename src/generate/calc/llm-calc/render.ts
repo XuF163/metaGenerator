@@ -527,19 +527,9 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
           continue
         }
 
-        // Boolean toggles in SR buffs (baseline often assumes "buff active" by default for showcase rows).
-        // If a buff.check explicitly requires `params.<k> === true` and no detail row sets it,
-        // default it to true so the buff isn't dead-by-default.
-        if (!/^(?:half|halfHp|lowHp|hpBelow50|hpAbove50)$/i.test(k)) {
-          const reTrue = new RegExp(`\\bparams\\.${escapeRegExp(k)}\\b\\s*={2,3}\\s*true\\b`)
-          const reFalse = new RegExp(`\\bparams\\.${escapeRegExp(k)}\\b\\s*={2,3}\\s*false\\b`)
-          const hasTrue = checkStrings.some((s) => reTrue.test(s))
-          const hasFalse = checkStrings.some((s) => reFalse.test(s))
-          if (hasTrue && !hasFalse) {
-            out[k] = true
-            continue
-          }
-        }
+        // IMPORTANT (SR): do NOT default boolean gate params to true.
+        // Flags like `e/q/qBuff/break/...` must be enabled per-detail via `detail.params`,
+        // otherwise they inflate unrelated rows (and drift far from baseline regression).
 
         const isCountLike = /(?:layer|layers|stack|stacks|count|cnt|num|times)$/i.test(k)
         const n = numMax[k]
@@ -1020,6 +1010,22 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
           if (pctCand !== t0 && has(pctCand)) return { pctTable: pctCand, flatTable: t0 }
           const pct = pickPctByStat()
           if (pct) return { pctTable: pct, flatTable: t0 }
+        }
+
+        // Variant "(2)" tables: some SR upstream uses "X" (pct) + "X(2)" (flat) without "百分比/固定值" tokens.
+        // Keep this conservative: do not treat obvious multi-target variants (主目标/相邻目标/副目标) as pct+flat pairs.
+        const looksLikeMultiTarget = (s: string): boolean => /(主目标|相邻目标|次要|副目标)/.test(String(s || ''))
+        const m2 = /^(.*?)[（(]\s*2\s*[)）]$/.exec(t0)
+        if (m2) {
+          const base = String(m2[1] || '').trim()
+          if (base && has(base) && !looksLikeMultiTarget(base) && !looksLikeMultiTarget(t0)) {
+            return { pctTable: base, flatTable: t0 }
+          }
+        } else {
+          const cand = `${t0}(2)`
+          if (cand !== t0 && has(cand) && !looksLikeMultiTarget(t0)) return { pctTable: t0, flatTable: cand }
+          const cand2 = `${t0}（2）`
+          if (cand2 !== t0 && has(cand2) && !looksLikeMultiTarget(t0)) return { pctTable: t0, flatTable: cand2 }
         }
 
         return null

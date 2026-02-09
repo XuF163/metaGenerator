@@ -191,9 +191,13 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '  - 示例：战技伤害(主目标)、战技伤害(相邻目标)、战技伤害(完整)。',
     '  - 单目标默认直接写「普攻伤害/战技伤害/终结技伤害」，不要额外加「(单目标)」；只有需要与多目标行区分时才加。',
     '- SR 多目标合计：若描述/表名明确存在相邻目标/扩散/弹射/全体等多目标机制，请同时提供“主目标”与“完整多目标合计”两行（必要时用 dmgExpr 合计，并按描述中的重复次数/段数/弹射次数合计）。',
+    '- SR：不要把「能量恢复/攻击力提高/暴击率提高/击破特攻提高/行动延后」这类“非伤害数值展示”写进 details（基线通常用 text 或不纳入面板回归）。这些要么写进 buffs（且仅限对自身生效），要么忽略。',
+    '- SR：若可用 talent 表包含 a2/a3/e2/q2 等强化段（或 me/me2/mt/mt1/mt2 等忆灵段），details 至少覆盖每个主要段 1 行（例如「强化终结技总伤害/强化战技伤害/忆灵技伤害」）。',
+    '- SR：buffs 中不要写“仅作用于队友/指定我方目标/除自身”的增益（文案含 队友/我方目标/指定我方/其他我方/除自身/为其他），避免污染本角色面板对标。',
+    '- SR：attr 里的百分比类字段（cpct/cdmg/stance/effPct/effDef/recharge 等）已经是“百分比数值”，不要再 *100。',
  	    '- details 可选字段：dmgExpr 用于表达复杂公式（当需要多属性混合、多段合计、或多表/条件分支时）。',
  	    '  - dmgExpr: JS 表达式（不要写 function/箭头函数），必须返回 dmg(...) 的结果对象；可用变量 talent, attr, calc, params, cons, weapon, trees, dmg, toRatio；不要使用 currentTalent（detail 运行时不可用）。',
-	    '  - 重要：dmgExpr 禁止返回裸数字；必须返回 dmg(...)/dmg.basic(...)/dmg.dynamic(...)/heal(...)/shield(...)/reaction(...) 的返回值，或形如 { dmg: xxx, avg: xxx } 的对象。',
+ 	    '  - 重要：dmgExpr 禁止返回裸数字；必须返回 dmg(...)/dmg.basic(...)/dmg.dynamic(...)/heal(...)/shield(...)/reaction(...) 的返回值，或形如 { dmg: xxx, avg: xxx } 的对象。',
 	    '  - 重要：不要写 dmg.e(...)/dmg.q(...) 这类调用（dmg 不是对象）。',
  	    '  - GS: 如果 talent.<a/e/q>["表名2"] 在运行时返回数组（如 [atkPct, masteryPct] 或 [pct, flat]），请在 dmgExpr 中用 [0]/[1] 取值，不要直接把数组传给 dmg(...)。',
  	    '  - GS: 如果“表值文字样本”里出现 "*N"（例如 "57.28%*2" / "1.41%HP*5" / "80%ATK×3"），并且该表的样本值形如 [x, N]，表示“多段/次数倍率”，应使用乘法：base * x/100 * N（不要写成 + N）。',
@@ -230,7 +234,7 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
 	    '  - 击破/超击破：如果描述/表名出现「击破/超击破/击破伤害比例/超击破伤害比例」，请至少输出 1~2 条击破展示行。',
 	    '    - 可用 kind=reaction + reaction=\"<元素>Break|superBreak\"，并可用 dmgExpr 叠乘表倍率：{ dmg: reaction(\"iceBreak\").dmg * toRatio(talent.q[\"击破伤害比例\"]), avg: reaction(\"iceBreak\").avg * toRatio(talent.q[\"击破伤害比例\"]) }。',
 	    '    - 元素->Break 映射：物理 physicalBreak；火 fireBreak；冰 iceBreak；雷 lightningBreak；风 windBreak；量子 quantumBreak；虚数 imaginaryBreak；超击破 superBreak。',
-	    '  - SR 超击破（很容易漏）：超击破伤害通常与“削韧(韧性伤害/次数)”线性相关。若要对标基线，建议在超击破展示行用 dmgExpr 缩放：({ avg: (reaction(\"superBreak\").avg || 0) / 0.9 * (talent.<a/e/...>[\"削韧\"] || 1) })（削韧是常量表，可直接引用）。',
+	    '  - SR 超击破（很容易漏）：超击破展示行建议用 kind=reaction + reaction=\"superBreak\"；必要时可按“触发次数/削韧单位(通常是1/2/3…)”线性缩放，例如：({ avg: (reaction(\"superBreak\").avg || 0) / 0.9 * (talent.e[\"削韧\"] || 1) })。',
 	    '  - SR 行迹(树)条件：来自「行迹N」的增益必须写入 buffs，并设置 buffs[i].tree=N 作为解锁门槛（不要手写 trees[\"101\"] 这类判断，更不要常驻生效）。',
 	    '  - SR 固定暴击：若文案出现「暴击率固定为X%」「暴击伤害固定为Y%」「该伤害必定暴击」且作用于“附加伤害/追加伤害”，请用 dmgExpr + skillDot：({ avg: (dmg(talent.q[\"附加伤害\"], \"\", \"skillDot\").avg || 0) * (1 + (X/100) * (Y/100)) })；必要时结合 cons 分支（例如 cons>=6 时固定暴伤提高）。',
  	    '- 如果这个“追加伤害值”只对某个特定招式/特定表名生效（而不是所有 E/Q/普攻都生效），不要用全局 ePlus/qPlus/aPlus；请在对应 detail 用 dmgExpr 把 extra 直接加到 dmg/avg 上（dmgExpr 只能是表达式，不能写 const/return/function/箭头函数）。可用这种写法（允许重复调用 dmg）：{ dmg: dmg(...).dmg + extra, avg: dmg(...).avg + extra }。',
@@ -244,6 +248,7 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '- buffs 中如果需要引用天赋数值：只能使用 talent.<talentKey>["<表名>"]，其中 talentKey 必须来自下方“可用表名”列表；禁止使用 talent.talent / 动态索引 / 乱写字段。',
     ...(input.game === 'sr'
       ? [
+          '- SR：若“可用表名”里包含 a2/a3/e2/q2 等（强化/二段），details 应覆盖这些表（至少输出 1 条强化/总伤害行）。',
           '- SR：若“可用表名”里包含 me/mt/me2/mt1/mt2 等（忆灵相关），details 应覆盖这些表（至少输出 1-2 条忆灵伤害/机制行）。',
           '- SR：秘技（z）多为开战前一次性效果；不要把“造成100%攻击力伤害”误写成 “攻击力提高100%/atkPct=100”。只有明确写“提高/降低…属性/受到伤害提高”才生成 buffs。'
         ]
@@ -306,6 +311,10 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
           '- SR 标题：多目标用「主目标/相邻目标/完整」等常用词；单目标通常不写「(单目标)」；避免「单体/群体」。',
           '- SR 多目标：若描述/表名出现相邻目标/扩散/弹射/全体等机制，请输出“主目标”与“完整多目标合计”两行（必要时用 dmgExpr 合计）。',
           '- SR 击破/超击破：用 kind=reaction + reaction="<元素>Break|superBreak"；需要表倍率时用 dmgExpr 叠乘（reaction("iceBreak")...）。',
+          '- SR：不要在 details 里输出 能量恢复/攻击力提高/暴击率提高/击破特攻提高/行动延后 等“文本展示类数值”；这些放 buffs（仅自用）或忽略。',
+          '- SR：若存在 a2/a3/e2/q2/me/me2/mt/mt1/mt2 等额外 talent block，details 至少覆盖每个主要 block 1 行。',
+          '- SR：buffs 不要写仅作用于队友/指定我方目标/除自身 的效果（队友/我方目标/指定我方/其他我方/除自身/为其他）。',
+          '- SR：attr 里的百分比字段本身已是百分比数值（例如 stance/cpct/cdmg/effPct/recharge），不要再 *100。',
           '- SR buffs：若 buff 来源于「行迹N」，必须写 tree:N；若来源于「N魂」，必须写 cons:N（否则会常驻导致面板对标离群）。',
           '- SR buffs：技能专属增益优先用 aDmg/eDmg/qDmg/tDmg、qCpct/qCdmg 等；无视防御用 ignore；防御降低用 enemyDef；不要输出“受到伤害降低/减伤”。',
           '- SR dmgExpr：dmg(x,key) 默认按攻击力倍率；若该表/招式是生命/防御缩放，必须写 dmg.basic(calc(attr.hp/def) * toRatio(x), key)（不要用 dmg(x,key)）。'
