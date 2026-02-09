@@ -42,29 +42,128 @@ function extractClause(text: string, pos: number): { clause: string; before: str
   return { clause, before }
 }
 
-function mapKeyFromClause(clause: string): string | null {
-  // Damage-specific first (avoid mapping to generic dmg too early)
-  if (clause.includes('终结技')) return 'qDmg'
-  if (clause.includes('战技')) return 'eDmg'
-  if (clause.includes('追加攻击')) return 'tDmg'
-  if (clause.includes('普攻') || clause.includes('普通攻击')) return 'aDmg'
+const STATIC_ATTR_KEYS = new Set([
+  // Base attrs / rates (supported by miao-plugin AttrData.addAttr)
+  'atkPct',
+  'hpPct',
+  'defPct',
+  'atkPlus',
+  'hpPlus',
+  'defPlus',
+  'speedPct',
+  'speed',
+  'cpct',
+  'cdmg',
+  'recharge',
+  'heal',
+  'shield',
+  'stance',
+  'effPct',
+  'effDef',
+  // Generic dmg%
+  'dmg'
+])
 
-  // Generic damage
-  if (clause.includes('造成的伤害') || clause.includes('伤害提高') || clause.includes('伤害提升')) return 'dmg'
+type KeyIdxSpec = { kind: 'keyIdx'; title: string; key: string; idx: number } | { kind: 'keyIdxMap'; title: string; map: Record<string, number> }
+type StaticSpec = { kind: 'staticIdx'; key: string; idx: number }
+type BuffSpec = KeyIdxSpec | StaticSpec
 
-  // Base stats / rates
-  if (clause.includes('攻击力')) return 'atkPct'
-  if (clause.includes('生命值') || clause.includes('生命上限')) return 'hpPct'
-  if (clause.includes('防御力')) return 'defPct'
-  if (clause.includes('速度')) return clause.includes('%') ? 'speedPct' : 'speed'
-  if (clause.includes('暴击率')) return 'cpct'
-  if (clause.includes('暴击伤害')) return 'cdmg'
-  if (clause.includes('效果命中')) return 'effPct'
-  if (clause.includes('效果抵抗')) return 'effDef'
-  if (clause.includes('击破特攻')) return 'stance'
-  if (clause.includes('能量恢复') || clause.includes('能量回复')) return 'recharge'
+function inferKeysFromText(text: string): string[] {
+  const s = String(text || '').trim()
+  if (!s) return []
 
-  return null
+  // Enemy DEF ignore (e.g. "无视目标50%的防御力"). Must be checked before the generic "防御力" stat branch.
+  if ((s.includes('无视') || s.toLowerCase().includes('ignore')) && s.includes('防御')) return ['ignore']
+
+  // Prefer the most local + specific signal.
+  if (s.includes('暴击率')) return ['cpct']
+  if (s.includes('暴击伤害')) return ['cdmg']
+  if (s.includes('效果命中')) return ['effPct']
+  if (s.includes('效果抵抗')) return ['effDef']
+  if (s.includes('击破特攻')) return ['stance']
+  if (s.includes('能量恢复') || s.includes('能量回复') || s.includes('点能量') || (s.includes('恢复') && s.includes('能量'))) {
+    return ['recharge']
+  }
+  if (s.includes('速度')) return s.includes('%') ? ['speedPct'] : ['speed']
+  if (s.includes('生命上限') || s.includes('生命值')) return ['hpPct']
+  if (s.includes('防御力')) return ['defPct']
+  if (s.includes('攻击力')) return ['atkPct']
+
+  // Damage-related (SR: skill buckets are not valid static keys; must use keyIdx)
+  const dmgLike = s.includes('伤害') || s.includes('增伤') || s.includes('造成的伤害')
+  if (dmgLike) {
+    const hasE = s.includes('战技')
+    const hasQ = s.includes('终结技')
+    const hasT = s.includes('追加攻击') || s.includes('追击')
+    const hasA = s.includes('普攻') || s.includes('普通攻击')
+
+    if ((hasE && hasQ) || s.includes('战技和终结技')) return ['eDmg', 'qDmg']
+    if ((hasQ && hasT) || s.includes('终结技和追加攻击') || s.includes('终结技和追击')) return ['qDmg', 'tDmg']
+    if ((hasE && hasT) || s.includes('战技和追加攻击') || s.includes('战技和追击')) return ['eDmg', 'tDmg']
+    if (hasQ) return ['qDmg']
+    if (hasE) return ['eDmg']
+    if (hasT) return ['tDmg']
+    if (hasA) return ['aDmg']
+    return ['dmg']
+  }
+
+  // Fallback: generic dmg%
+  if (s.includes('造成的伤害') || s.includes('伤害提高') || s.includes('伤害提升')) return ['dmg']
+
+  return []
+}
+
+function defaultTitleForKeys(keys: string[]): string {
+  const has = (k: string) => keys.includes(k)
+  if (has('eDmg') && has('qDmg')) return '战技和终结技造成的伤害提高[eDmg]%'
+  if (has('qDmg') && has('tDmg')) return '终结技和追加攻击造成的伤害提高[qDmg]%'
+  if (has('eDmg') && has('tDmg')) return '战技和追加攻击造成的伤害提高[eDmg]%'
+  const k = keys[0] || ''
+  if (k === 'qDmg') return '终结技造成的伤害提高[qDmg]%'
+  if (k === 'eDmg') return '战技造成的伤害提高[eDmg]%'
+  if (k === 'tDmg') return '追加攻击造成的伤害提高[tDmg]%'
+  if (k === 'aDmg') return '普攻造成的伤害提高[aDmg]%'
+  if (k === 'dmg') return '造成的伤害提高[dmg]%'
+  if (k === 'cpct') return '暴击率提高[cpct]%'
+  if (k === 'cdmg') return '暴击伤害提高[cdmg]%'
+  if (k === 'atkPct') return '攻击力提高[atkPct]%'
+  if (k === 'hpPct') return '生命值上限提高[hpPct]%'
+  if (k === 'defPct') return '防御力提高[defPct]%'
+  if (k === 'speedPct') return '速度提高[speedPct]%'
+  if (k === 'speed') return '速度提高[speed]点'
+  if (k === 'recharge') return '能量恢复效率提高[recharge]%'
+  if (k === 'effPct') return '效果命中提高[effPct]%'
+  if (k === 'effDef') return '效果抵抗提高[effDef]%'
+  if (k === 'stance') return '击破特攻提高[stance]%'
+  if (k === 'ignore') return '无视目标[ignore]%的防御力'
+  return `被动：${k || 'buff'}`
+}
+
+function buildSpecForPlaceholder(opts: { text: string; clause: string; before: string; idx: number; pos: number }): BuffSpec | null {
+  const { text, clause, before, idx, pos } = opts
+  // Prefer a tight window within the clause; avoid bleeding into previous sentences
+  // (e.g. "$2" being misread as "暴击率" due to "$1" sentence nearby).
+  const localPos = Math.max(0, before.length)
+  const near = clause.slice(Math.max(0, localPos - 24), Math.min(clause.length, localPos + 24))
+  const nearWide = clause.slice(Math.max(0, localPos - 48), Math.min(clause.length, localPos + 48))
+
+  let keys = inferKeysFromText(near)
+  if (!keys.length) keys = inferKeysFromText(nearWide)
+  if (!keys || keys.length === 0) return null
+
+  // Static buffs are only meaningful for base attrs (AttrData does NOT support skill-bucket keys like qDmg/eDmg).
+  if (keys.length === 1 && STATIC_ATTR_KEYS.has(keys[0]!) && guessIsStatic(before)) {
+    return { kind: 'staticIdx', idx, key: keys[0]! }
+  }
+
+  const title = defaultTitleForKeys(keys)
+  if (keys.length === 1) {
+    return { kind: 'keyIdx', title, key: keys[0]!, idx }
+  }
+
+  const map: Record<string, number> = {}
+  for (const k of keys) map[k] = idx
+  return { kind: 'keyIdxMap', title, map }
 }
 
 function guessIsStatic(before: string): boolean {
@@ -76,6 +175,30 @@ function guessIsStatic(before: string): boolean {
     if (before.includes(w)) return false
   }
   return true
+}
+
+function tryBuildEnergyCapBuff(text: string): { expr: string; usedIdx: number } | null {
+  // Example (Hakush):
+  // - "根据装备者的能量上限，提高装备者造成的伤害：每点能量提高$1[i]%，最多计入160点。"
+  // Baseline convention: model as dmg% = tables[idx] * min(attr.sp, cap)
+  const mIdx = text.match(/每点能量提高\s*\$(\d+)\[i]\s*%/)
+  if (!mIdx) return null
+  const idx = Number(mIdx[1])
+  if (!Number.isFinite(idx) || idx <= 0) return null
+
+  const mCap = text.match(/最多计入\s*(\d{2,3})\s*点/)
+  const cap = mCap ? Math.trunc(Number(mCap[1])) : 160
+  if (!Number.isFinite(cap) || cap <= 0 || cap > 999) return null
+
+  // Only handle generic dmg in this heuristic pass.
+  if (!/造成的伤害/.test(text)) return null
+
+  const expr =
+    `(tables) => ({ ` +
+    `title: "根据能量上限提高伤害[dmg]%", ` +
+    `data: { dmg: ({ attr }) => (tables[${idx}] || 0) * Math.min(attr.sp || 0, ${cap}) } ` +
+    `})`
+  return { expr, usedIdx: idx }
 }
 
 function renderTypeCalcJs(entries: Array<{ name: string; expr: string }>): string {
@@ -139,29 +262,40 @@ export async function generateSrWeaponCalcJs(opts: {
       if (!descRaw) continue
 
       const text = stripHtml(descRaw)
+
+      // Special deterministic patterns (must come before generic placeholder mapping).
+      // These are used to match baseline-style dynamic buffs.
+      const special = tryBuildEnergyCapBuff(text)
+
       const matches = Array.from(text.matchAll(/\$(\d+)\[i]/g))
-      if (matches.length === 0) continue
+      if (!special && matches.length === 0) continue
 
       const parts: string[] = []
+      const usedIdx = new Set<number>()
+      if (special) {
+        parts.push(special.expr)
+        usedIdx.add(special.usedIdx)
+      }
       for (const m of matches) {
         const idxStr = m[1]
         const idx = Number(idxStr)
         if (!Number.isFinite(idx) || idx <= 0) continue
+        if (usedIdx.has(idx)) continue
         const pos = typeof m.index === 'number' ? m.index : -1
         if (pos < 0) continue
 
         const { clause, before } = extractClause(text, pos)
-        const key = mapKeyFromClause(clause)
-        if (!key) continue
-
-        const isStatic = guessIsStatic(before)
-        if (isStatic) {
-          parts.push(`staticIdx(${idx}, ${JSON.stringify(key)})`)
-        } else {
-          // Keep title short to fit weak/slow renderers; the full desc is still in data.json.
-          const title = `被动：${key}`
-          parts.push(`keyIdx(${JSON.stringify(title)}, ${JSON.stringify(key)}, ${idx})`)
+        const spec = buildSpecForPlaceholder({ text, clause, before, idx, pos })
+        if (!spec) continue
+        if (spec.kind === 'staticIdx') {
+          parts.push(`staticIdx(${idx}, ${JSON.stringify(spec.key)})`)
+          continue
         }
+        if (spec.kind === 'keyIdx') {
+          parts.push(`keyIdx(${JSON.stringify(spec.title)}, ${JSON.stringify(spec.key)}, ${idx})`)
+          continue
+        }
+        parts.push(`keyIdx(${JSON.stringify(spec.title)}, ${JSON.stringify(spec.map)})`)
       }
 
       if (parts.length === 0) continue

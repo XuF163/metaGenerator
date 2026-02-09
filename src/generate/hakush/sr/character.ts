@@ -870,7 +870,34 @@ function skillDescAndTables(
   const stanceVals = stanceArr
     .map((v) => toNum(v))
     .filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
-  const stanceRaw = stanceVals.length ? Math.max(...stanceVals) : null
+  // Hakush `ShowStanceList` is per-hit/per-part stance damage. Use sum for total toughness cost,
+  // and keep a separate per-hit max to support super-break modeling (some traces/cons modify the 1st hit only).
+  let stanceSumRaw = stanceVals.length ? stanceVals.reduce((a, b) => a + b, 0) : null
+  const stanceMaxRaw = stanceVals.length ? Math.max(...stanceVals) : null
+
+  // Some multi-hit skills (esp. bounce/extra-hit descriptions) use a compact stance list where:
+  // - stanceVals[0] is the 1st hit stance dmg
+  // - stanceVals[1..] is a repeating cycle for subsequent hits
+  // To better approximate baseline-style “单怪全段命中” assumptions, expand by hit count when it is explicitly stated.
+  if (stanceSumRaw != null && stanceVals.length >= 2) {
+    const extraHitM = descPlain.match(/额外造成\s*(\d{1,2})\s*次伤害/)
+    const totalHitM = descPlain.match(/共(?:弹射|造成)\s*(\d{1,2})\s*次/)
+    const extraHits = extraHitM ? Math.trunc(Number(extraHitM[1])) : 0
+    const totalHits = totalHitM ? Math.trunc(Number(totalHitM[1])) : 0
+    const hits = extraHits > 0 ? 1 + extraHits : totalHits > 1 ? totalHits : 0
+    const hitOk = Number.isFinite(hits) && hits >= 2 && hits <= 20
+    if (hitOk) {
+      const first = stanceVals[0] ?? 0
+      const cycle = stanceVals.slice(1)
+      if (cycle.length) {
+        let sum = first
+        for (let i = 0; i < hits - 1; i++) {
+          sum += cycle[i % cycle.length] ?? 0
+        }
+        if (Number.isFinite(sum) && sum > 0) stanceSumRaw = sum
+      }
+    }
+  }
   const levelLen = Math.max(1, paramLists.length)
   const compactConstTables = Boolean(opts?.charId && srConstTablesCompactIds.has(String(opts.charId)))
   let nextIdx = varIdx
@@ -884,11 +911,21 @@ function skillDescAndTables(
     }
   }
 
-  if (stanceRaw != null && stanceRaw > 0) {
+  if (stanceSumRaw != null && stanceSumRaw > 0) {
     nextIdx++
-    const stance = stanceRaw / 30
+    const stance = stanceSumRaw / 30
     tables[String(nextIdx)] = {
       name: '削韧',
+      isSame: true,
+      values: compactConstTables ? [stance] : Array.from({ length: levelLen }, () => stance)
+    }
+  }
+
+  if (stanceMaxRaw != null && stanceMaxRaw > 0 && stanceSumRaw != null && stanceSumRaw > stanceMaxRaw + 1e-12) {
+    nextIdx++
+    const stance = stanceMaxRaw / 30
+    tables[String(nextIdx)] = {
+      name: '削韧(单次)',
       isSame: true,
       values: compactConstTables ? [stance] : Array.from({ length: levelLen }, () => stance)
     }

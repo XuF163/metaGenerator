@@ -68,8 +68,31 @@ function parseCondition(seg: string): Condition | null {
   // Complex dual-threshold forms like "110/95" are not supported (skip to avoid wrong buffs).
   if (/\d+\/\d+/.test(seg)) return null
 
+  // Speed <= N
+  let m = seg.match(/\u901f\u5ea6(?:\u5c0f\u4e8e\u7b49\u4e8e|\u4e0d\u5927\u4e8e|<=|\u2264)(\d+(?:\.\d+)?)/)
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.speed) <= ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+  // Speed < N
+  m = seg.match(/\u901f\u5ea6(?:\u5c0f\u4e8e|<|\u4f4e\u4e8e)(\d+(?:\.\d+)?)/)
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.speed) < ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+
   // Speed >= N
-  let m = seg.match(/\u901f\u5ea6(?:\u5927\u4e8e\u7b49\u4e8e|\u4e0d\u4f4e\u4e8e|>=|\u2265)(\d+(?:\.\d+)?)/)
+  m = seg.match(/\u901f\u5ea6(?:\u5927\u4e8e\u7b49\u4e8e|\u4e0d\u4f4e\u4e8e|>=|\u2265)(\d+(?:\.\d+)?)/)
   if (m) {
     const n = num(m[1])
     if (n > 0) {
@@ -86,6 +109,59 @@ function parseCondition(seg: string): Condition | null {
     if (n > 0) {
       return {
         check: `({ calc, attr }) => calc(attr.speed) > ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+
+  // HP >= N (points)
+  m = seg.match(
+    /\u751f\u547d(?:\u4e0a\u9650|\u503c\u4e0a\u9650)(?:\u5927\u4e8e\u7b49\u4e8e|\u4e0d\u4f4e\u4e8e|>=|\u2265)(\d+(?:\.\d+)?)(?:\u70b9)?/
+  )
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.hp) >= ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+  // HP > N (points)
+  m = seg.match(
+    /\u751f\u547d(?:\u4e0a\u9650|\u503c\u4e0a\u9650)(?:\u5927\u4e8e|>|\u8d85\u8fc7)(\d+(?:\.\d+)?)(?:\u70b9)?/
+  )
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.hp) > ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+  // HP <= N (points)
+  m = seg.match(
+    /\u751f\u547d(?:\u4e0a\u9650|\u503c\u4e0a\u9650)(?:\u5c0f\u4e8e\u7b49\u4e8e|\u4e0d\u5927\u4e8e|<=|\u2264)(\d+(?:\.\d+)?)(?:\u70b9)?/
+  )
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.hp) <= ${n}`,
+        effectText: splitEffectTextFromConditionalSentence(seg)
+      }
+    }
+  }
+  // HP < N (points)
+  m = seg.match(
+    /\u751f\u547d(?:\u4e0a\u9650|\u503c\u4e0a\u9650)(?:\u5c0f\u4e8e|<|\u4f4e\u4e8e)(\d+(?:\.\d+)?)(?:\u70b9)?/
+  )
+  if (m) {
+    const n = num(m[1])
+    if (n > 0) {
+      return {
+        check: `({ calc, attr }) => calc(attr.hp) < ${n}`,
         effectText: splitEffectTextFromConditionalSentence(seg)
       }
     }
@@ -215,6 +291,11 @@ function parseData(segRaw: string): Record<string, number> {
     data[k] = v
   }
 
+  const addSum = (k: string, v: number): void => {
+    if (!(v > 0)) return
+    data[k] = (data[k] || 0) + v
+  }
+
   // Base stats
   let m = seg.match(new RegExp(`\\u653b\\u51fb\\u529b${inc}(\\d+(?:\\.\\d+)?)%`))
   if (m) add('atkPct', num(m[1]))
@@ -252,30 +333,65 @@ function parseData(segRaw: string): Record<string, number> {
 
   // Damage bonuses (SR)
   // - 普攻/战技/终结技/追击(追加攻击)
+  let hasSkillSpecificDmgBonus = false
+
   m = seg.match(new RegExp(`(?:\\u666e\\u901a\\u653b\\u51fb|\\u666e\\u653b)\\u548c\\u6218\\u6280(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
   if (m) {
     const v = num(m[1])
     add('aDmg', v)
     add('eDmg', v)
+    hasSkillSpecificDmgBonus = true
+  }
+  m = seg.match(new RegExp(`\\u6218\\u6280(?:\\u4e0e|\\u548c)\\u7ec8\\u7ed3\\u6280(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
+  if (m) {
+    const v = num(m[1])
+    add('eDmg', v)
+    add('qDmg', v)
+    hasSkillSpecificDmgBonus = true
   }
   m = seg.match(new RegExp(`\\u7ec8\\u7ed3\\u6280(?:\\u4e0e|\\u548c)(?:\\u8ffd\\u51fb|\\u8ffd\\u52a0\\u653b\\u51fb)(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
   if (m) {
     const v = num(m[1])
     add('qDmg', v)
     add('tDmg', v)
+    hasSkillSpecificDmgBonus = true
+  }
+
+  // Baseline-style approximation: treat “after ult, next skill extra dmg%” as always-on for E.
+  // Example: “战技和终结技造成的伤害提高20%，施放终结技后，下一次施放战技时造成的伤害额外提高25%”
+  m = seg.match(
+    new RegExp(
+      `\\u65bd\\u653e\\u7ec8\\u7ed3\\u6280\\u540e[^\\u3002;]*?\\u4e0b\\u4e00\\u6b21\\u65bd\\u653e\\u6218\\u6280[^\\u3002;]*?\\u4f24\\u5bb3(?:\\u989d\\u5916)?${inc}(\\d+(?:\\.\\d+)?)%`
+    )
+  )
+  if (m) {
+    addSum('eDmg', num(m[1]))
+    hasSkillSpecificDmgBonus = true
   }
   m = seg.match(new RegExp(`(?:\\u666e\\u901a\\u653b\\u51fb|\\u666e\\u653b)(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
-  if (m) add('aDmg', num(m[1]))
+  if (m) {
+    add('aDmg', num(m[1]))
+    hasSkillSpecificDmgBonus = true
+  }
   m = seg.match(new RegExp(`\\u6218\\u6280(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
-  if (m) add('eDmg', num(m[1]))
+  if (m) {
+    add('eDmg', num(m[1]))
+    hasSkillSpecificDmgBonus = true
+  }
   m = seg.match(new RegExp(`\\u7ec8\\u7ed3\\u6280(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
-  if (m) add('qDmg', num(m[1]))
+  if (m) {
+    add('qDmg', num(m[1]))
+    hasSkillSpecificDmgBonus = true
+  }
   m = seg.match(new RegExp(`(?:\\u8ffd\\u51fb|\\u8ffd\\u52a0\\u653b\\u51fb)(?:\\u9020\\u6210\\u7684)?\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
-  if (m) add('tDmg', num(m[1]))
+  if (m) {
+    add('tDmg', num(m[1]))
+    hasSkillSpecificDmgBonus = true
+  }
 
   // Generic dmg% (ambiguous, keep as dmg)
   m = seg.match(new RegExp(`\\u9020\\u6210\\u7684\\u4f24\\u5bb3${inc}(\\d+(?:\\.\\d+)?)%`))
-  if (m) add('dmg', num(m[1]))
+  if (m && !hasSkillSpecificDmgBonus) add('dmg', num(m[1]))
 
   // Ignore DEF
   m = seg.match(/(?:\u65e0\u89c6|ignore).*?(\d+(?:\.\d+)?)%.*?\u9632\u5fa1/)

@@ -56,6 +56,21 @@ node circaltest/panel-regression.mjs --uid 147962990 --proxy http://127.0.0.1:10
 # - diff/gs/<uid>.json            # 结构化 diff
 ```
 
+## 全角色覆盖回归（优先覆盖全角色，尽量少 UID）
+
+说明：从 `testData/{gs|sr}/*.json` 中用贪心覆盖算法选取**最少 UID**，使得面板回归可以覆盖尽可能多的角色（避免“全 UID 覆盖”）。
+
+```powershell
+# GS + SR（推荐）
+node circaltest/panel-regression-cover.mjs --game both
+
+# 仅 GS / 仅 SR
+node circaltest/panel-regression-cover.mjs --game gs
+node circaltest/panel-regression-cover.mjs --game sr
+
+# 产物：circaltest/evidence/<timestamp>-cover/summary/{gs|sr}.md
+```
+
 ## calc.js 批量迭代（LLM）
 
 当面板回归发现某些角色偏差较大时，可根据 diff.json 自动挑选 Top N 角色批量重生成 `calc.js`：

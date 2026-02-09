@@ -168,6 +168,10 @@ function diffRuns(baseline, generated) {
     if (game === "sr") t = t.replace(/[EQATZ]/g, "")
     return t
   }
+  const extractCat = (t) => {
+    const m = /^([EQATZ])/.exec(String(t || ""))
+    return m ? m[1] : ""
+  }
 
   const baseById = new Map((baseline.avatars || []).map((a) => [String(a.id), a]))
   const genById = new Map((generated.avatars || []).map((a) => [String(a.id), a]))
@@ -228,11 +232,14 @@ function diffRuns(baseline, generated) {
 
     const gRows = gRet.map((gr0, gi) => {
       const gr = gr0 || null
+      const strict = normTitle(gr?.title)
+      const loose = normTitleLoose(gr?.title)
       return {
         gi,
         gr,
-        strict: normTitle(gr?.title),
-        loose: normTitleLoose(gr?.title),
+        strict,
+        loose,
+        cat: extractCat(strict),
         avg: toFiniteNumOrNull(gr?.avg),
         dmg: toFiniteNumOrNull(gr?.dmg)
       }
@@ -257,6 +264,7 @@ function diffRuns(baseline, generated) {
     const pickBest = (br, bi) => {
       const bStrict = normTitle(br?.title)
       const bLoose = normTitleLoose(br?.title)
+      const bCat = extractCat(bStrict)
       const bAvg = toFiniteNumOrNull(br?.avg)
 
       const cand = new Set()
@@ -275,6 +283,7 @@ function diffRuns(baseline, generated) {
       for (const gi of cand) {
         const row = gRows[gi]
         if (!row) continue
+        if (bCat && row.cat && row.cat !== bCat) continue
 
         const isStrict = !!bStrict && row.strict === bStrict
         const match = isStrict ? "strict" : "loose"
@@ -518,7 +527,8 @@ async function main() {
     "" // optional
   const userAgent = String(args.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").trim()
 
-  const evidenceRoot = path.join(repoRoot, "circaltest", "evidence", nowStamp())
+  const evidenceRootArg = String(args.evidenceRoot || "").trim()
+  const evidenceRoot = evidenceRootArg ? toAbs(repoRoot, evidenceRootArg) : path.join(repoRoot, "circaltest", "evidence", nowStamp())
 
   const testdataRoot = toAbs(repoRoot, args.testdataRoot || "testData")
   const useTestdata = !!args.useTestdata || !!args.testdata

@@ -376,7 +376,8 @@ function pickNamesFromDiff(diffJsonPathAbs, { top, minDev }) {
   const rows = []
   for (const d of diffs) {
     const name = typeof d?.name === "string" ? d.name : ""
-    const ratio = Number(d?.worst?.ratio)
+    // Prefer matched-rows ratio when available; fall back to maxAvg ratio so "matched=0" cases still surface.
+    const ratio = Number(d?.maxAvgMatched?.ratio ?? d?.maxAvg?.ratio ?? d?.worst?.ratio)
     const abs = Number(d?.worst?.abs || 0)
     if (!name) continue
     if (!Number.isFinite(ratio)) continue
