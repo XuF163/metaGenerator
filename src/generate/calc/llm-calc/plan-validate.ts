@@ -19,6 +19,9 @@ import {
   uniq
 } from './utils.js'
 import { pickDamageTable } from './heuristic.js'
+import { applyGsPostprocess } from './plan-validate/gs-postprocess.js'
+import { normalizeKind, normalizeStat } from './plan-validate/normalize.js'
+import { applySrPostprocess } from './plan-validate/sr-postprocess.js'
 
 export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSuggestResult {
   const tables: Record<string, string[]> = {}
@@ -30,23 +33,9 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   const okTalents = new Set<string>(Object.keys(tables))
   const qTables = tables.q || []
 
-  const mainAttr = typeof plan.mainAttr === 'string' ? plan.mainAttr.trim() : ''
+  let mainAttr = typeof plan.mainAttr === 'string' ? plan.mainAttr.trim() : ''
   if (!mainAttr) {
     throw new Error(`[meta-gen] invalid LLM plan: mainAttr is empty`)
-  }
-
-  const normalizeKind = (v: unknown): CalcDetailKind => {
-    const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
-    if (t === 'dmg' || t === 'heal' || t === 'shield' || t === 'reaction') return t
-    return 'dmg'
-  }
-
-  const normalizeStat = (v: unknown): CalcScaleStat | undefined => {
-    const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
-    if (!t) return undefined
-    if (t === 'em' || t === 'elementalmastery') return 'mastery'
-    if (t === 'atk' || t === 'hp' || t === 'def' || t === 'mastery') return t
-    return undefined
   }
 
   const gsReactionCanon: Record<string, string> = {
@@ -3134,8 +3123,20 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   )
   const defDmgKey = defDmgKeyRaw && validDmgKeys.has(defDmgKeyRaw) ? defDmgKeyRaw : undefined
 
+  const gsBuffIdsOut = new Set<string>()
+
   const buffsOut: CalcSuggestBuff[] = []
   const buffsRaw = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as Array<unknown>) : []
+  if (input.game === 'gs') {
+    const ok = new Set(['vaporize', 'melt', 'aggravate', 'spread'])
+    for (const b of buffsRaw) {
+      if (typeof b !== 'string') continue
+      const id = b.trim()
+      if (!id) continue
+      const canon = id.toLowerCase()
+      if (ok.has(canon)) gsBuffIdsOut.add(canon)
+    }
+  }
   const gsElemKeys = new Set(['anemo', 'geo', 'electro', 'dendro', 'hydro', 'pyro', 'cryo'])
   const isBuffDataKey = (s: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s)
   const gsMultiToDmgKey: Record<string, string> = {
@@ -6795,539 +6796,47 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   // add a single representative transformative reaction row to avoid "too-low maxAvg" regressions
   // (e.g. electro EM triggers commonly benchmarked by hyperBloom).
   if (input.game === 'gs') {
-    // Auto-add missing heal/shield showcase rows when the LLM plan is too sparse.
-    // Derived purely from official talent table names + unit texts (no baseline code reuse).
-    const gsHasKindForTalent = (kind: CalcDetailKind, talent: TalentKeyGs): boolean =>
-      details.some((d) => normalizeKind(d.kind) === kind && d.talent === talent)
-
-    const gsHasDetail = (q: Partial<CalcSuggestDetail>): boolean =>
-      details.some((d) => {
-        if (q.kind && normalizeKind(d.kind) !== q.kind) return false
-        if (q.talent && d.talent !== q.talent) return false
-        if (q.table && d.table !== q.table) return false
-        if (q.key && d.key !== q.key) return false
-        if (q.ele && d.ele !== q.ele) return false
-        return true
-      })
-
-    const gsUnitOf = (talent: TalentKeyGs, table: string): string => {
-      const u =
-        (input.tableUnits as any)?.[talent]?.[table] ??
-        (input.tableUnits as any)?.[talent]?.[table.endsWith('2') ? table.slice(0, -1) : table] ??
-        ''
-      return normalizePromptText(u)
-    }
-
-    const gsInferStatFromUnit = (unitRaw: unknown, fallback: CalcScaleStat): CalcScaleStat => {
-      const unit = normalizePromptText(unitRaw)
-      if (/(元素精通|精通|mastery|elemental mastery|\bem\b)/i.test(unit)) return 'mastery'
-      if (/(生命值上限|最大生命值|生命值|\bhp\b)/i.test(unit)) return 'hp'
-      if (/(防御力|防御|\bdef\b)/i.test(unit)) return 'def'
-      if (/(攻击力|攻击|\batk\b)/i.test(unit)) return 'atk'
-      return fallback
-    }
-
-    const gsCleanHealShieldTitle = (table: string): string => {
-      let t = String(table || '').trim()
-      t = t.replace(/2$/, '')
-      t = t.replace(/治疗量/g, '治疗').replace(/回复量/g, '回复')
-      // Prefer baseline-like wording for shields.
-      t = t.replace(/护盾吸收量/g, '护盾量').replace(/吸收量/g, '护盾量')
-      return t
-    }
-
-    const gsPushDetail = (d: CalcSuggestDetail): void => {
-      if (details.length >= 20) return
-      if (!d.talent || !d.table) return
-      const kind = normalizeKind(d.kind)
-      if (!['dmg', 'heal', 'shield', 'reaction'].includes(kind)) return
-      // De-dup by (kind,talent,table,ele). Avoid treating different `key` values as distinct rows.
-      if (gsHasDetail({ kind, talent: d.talent as any, table: d.table, ele: d.ele })) return
-      details.push(d)
-    }
-
-    const gsPickPrefer2 = (arr: string[]): string | undefined => {
-      const list = normalizeTableList(arr)
-      return list.find((t) => t.endsWith('2')) || list[0]
-    }
-
-    const addGsHealOrShield = (talent: TalentKeyGs, kind: 'heal' | 'shield'): void => {
-      if (gsHasKindForTalent(kind, talent)) return
-      const list = normalizeTableList((tables as any)[talent] || [])
-      const re = kind === 'heal' ? /(治疗|回复)/ : /(护盾|吸收量|盾)/
-      const candidates = list.filter((t) => re.test(t))
-      if (!candidates.length) return
-
-      // Prefer the structured "2" table which usually yields [pct, flat].
-      const table = gsPickPrefer2(candidates)
-      if (!table) return
-
-      const stat = gsInferStatFromUnit(gsUnitOf(talent, table), kind === 'heal' ? 'hp' : 'def')
-      const prefix = talent === 'a' ? 'A' : talent === 'e' ? 'E' : 'Q'
-      const title = `${prefix}${gsCleanHealShieldTitle(table)}`
-      gsPushDetail({ title, kind, talent, table, stat, key: talent })
-    }
-
-    addGsHealOrShield('e', 'heal')
-    addGsHealOrShield('q', 'heal')
-    addGsHealOrShield('e', 'shield')
-    addGsHealOrShield('q', 'shield')
-
-    // Enrich overly-generic GS plans: include a few more high-signal dmg tables and common reaction variants.
-    // This keeps output closer to baseline "detail level" even when LLM under-produces.
-    const gsElemRaw = String(input.elem || '').trim()
-    const gsElemLower = gsElemRaw.toLowerCase()
-    const gsIsElem = (...keys: string[]): boolean => keys.includes(gsElemRaw) || keys.includes(gsElemLower)
-
-    // 1) Core A variants: charged attack is frequently shown in baseline profiles.
-    const aTables = normalizeTableList(tables.a || [])
-    const chargedTable =
-      aTables.find((t) => t === '重击伤害') ||
-      aTables.find((t) => t === '重击伤害2') ||
-      aTables.find((t) => /重击/.test(t) && /伤害/.test(t))
-    if (chargedTable && details.length < 20) {
-      // Prefer key=a2 so buffs gated by currentTalent can distinguish it.
-      if (!gsHasDetail({ kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })) {
-        gsPushDetail({ title: '重击伤害', kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })
-      }
-    }
-
-    // 2) Add a small number of extra E/Q damage tables when available.
-    const gsIsDamageTableName = (t: string): boolean => {
-      if (!t) return false
-      if (!/伤害/.test(t)) return false
-      if (/(冷却|持续时间|消耗|能量|回复|恢复|治疗|护盾|吸收量)/.test(t)) return false
-      return true
-    }
-    const gsScoreDamageTableName = (t: string): number => {
-      let s = 0
-      if (/总/.test(t)) s += 60
-      if (/(爆裂|爆发)/.test(t)) s += 55
-      if (/召唤/.test(t)) s += 45
-      if (/(协同|共鸣|连携|联动|追击|反击)/.test(t)) s += 40
-      if (/持续/.test(t)) s += 35
-      if (/每跳/.test(t)) s += 30
-      if (/释放/.test(t)) s += 25
-      if (/(单次|单段)/.test(t)) s += 18
-      if (/(一段|二段|三段|四段|五段|六段|七段|八段|九段|十段)/.test(t)) s += 10
-      if (t.length >= 6) s += 5
-      return s
-    }
-    const gsAddExtraDmgTables = (talent: TalentKeyGs, maxAdd: number): void => {
-      if (details.length >= 20) return
-      const list = normalizeTableList((tables as any)[talent] || [])
-      const candidates = list.filter(gsIsDamageTableName)
-      candidates.sort((a, b) => gsScoreDamageTableName(b) - gsScoreDamageTableName(a))
-      let added = 0
-      for (const table of candidates) {
-        if (details.length >= 20) break
-        if (added >= maxAdd) break
-        if (gsHasDetail({ kind: 'dmg', talent, table })) continue
-        const prefix = talent === 'e' ? 'E' : talent === 'q' ? 'Q' : ''
-        const title = prefix ? `${prefix}${table}` : table
-        gsPushDetail({ title, kind: 'dmg', talent, table, key: talent })
-        added++
-      }
-    }
-    gsAddExtraDmgTables('e', 2)
-    gsAddExtraDmgTables('q', 2)
-
-    // 3) Elemental reaction variants (amp / catalyze) for key hits.
-    const gsEleVariant:
-      | { id: 'vaporize' | 'melt' | 'aggravate' | 'spread'; suffix: string; maxE: number; maxQ: number }
-      | null =
-      gsIsElem('火', 'pyro') || gsIsElem('水', 'hydro')
-        ? { id: 'vaporize', suffix: '蒸发', maxE: 2, maxQ: 1 }
-        : gsIsElem('冰', 'cryo')
-          ? { id: 'melt', suffix: '融化', maxE: 2, maxQ: 1 }
-          : gsIsElem('雷', 'electro')
-            ? { id: 'aggravate', suffix: '激化', maxE: 2, maxQ: 2 }
-            : gsIsElem('草', 'dendro')
-              ? { id: 'spread', suffix: '蔓激化', maxE: 2, maxQ: 2 }
-              : null
-
-    const gsMakeEleTitle = (titleRaw: string, suffix: string): string => {
-      const title = String(titleRaw || '').trim()
-      if (!title) return title
-      if (title.includes(suffix)) return title
-      if (/伤害$/.test(title)) return title.replace(/伤害$/, suffix)
-      return `${title}${suffix}`
-    }
-
-    const gsIsEleVariantBase = (d: CalcSuggestDetail): boolean => {
-      if (!d || typeof d !== 'object') return false
-      if (normalizeKind(d.kind) !== 'dmg') return false
-      if (!d.talent || !d.table) return false
-      if (typeof d.dmgExpr === 'string' && d.dmgExpr.trim()) return false
-      const ele = typeof d.ele === 'string' ? d.ele.trim() : ''
-      // Physical rows don't participate in reactions.
-      if (ele === 'phy') return false
-      // Only derive when base row has no ele.
-      if (ele) return false
-      return true
-    }
-
-    const gsTryAddEleVariant = (base: CalcSuggestDetail, variant: NonNullable<typeof gsEleVariant>): void => {
-      if (details.length >= 20) return
-      if (!base.talent || !base.table) return
-      const out: CalcSuggestDetail = {
-        ...base,
-        title: gsMakeEleTitle(base.title, variant.suffix),
-        kind: 'dmg',
-        ele: variant.id
-      }
-      gsPushDetail(out)
-    }
-
-    if (gsEleVariant) {
-      const bases = details.filter(gsIsEleVariantBase)
-
-      // Prefer charged attack for amp showcases (蒸发/融化).
-      if (gsEleVariant.id === 'vaporize' || gsEleVariant.id === 'melt') {
-        const a2 = bases.find((d) => d.talent === 'a' && (d.key === 'a2' || /重击/.test(d.title)))
-        if (a2) gsTryAddEleVariant(a2, gsEleVariant)
-      }
-
-      let eAdded = 0
-      for (const d of bases) {
-        if (d.talent !== 'e') continue
-        if (eAdded >= gsEleVariant.maxE) break
-        gsTryAddEleVariant(d, gsEleVariant)
-        eAdded++
-      }
-
-      let qAdded = 0
-      for (const d of bases) {
-        if (d.talent !== 'q') continue
-        if (qAdded >= gsEleVariant.maxQ) break
-        gsTryAddEleVariant(d, gsEleVariant)
-        qAdded++
-      }
-    }
-
-    const hasReaction = details.some((d) => normalizeKind(d.kind) === 'reaction')
-    if (!hasReaction && details.length < 20) {
-      const hintText = [
-        ...(Array.isArray(input.buffHints) ? input.buffHints : []),
-        ...Object.values(input.talentDesc || {})
-      ]
-        .map((s) => String(s || ''))
-        .join('\n')
-
-      const hasEmOrReactionHint =
-        /(元素精通|精通|mastery|\bem\b)/i.test(hintText) ||
-        /(反应|绽放|超绽放|烈绽放|月绽放|扩散|结晶|燃烧|超载|感电|超导|碎冰)/.test(hintText)
-
-      if (hasEmOrReactionHint) {
-        const elemRaw = String(input.elem || '').trim()
-        const elemLower = elemRaw.toLowerCase()
-        const isElem = (...keys: string[]): boolean => keys.includes(elemRaw) || keys.includes(elemLower)
-        const pick =
-          isElem('风', 'anemo')
-            ? 'swirl'
-            : isElem('岩', 'geo')
-              ? 'crystallize'
-              : isElem('草', 'dendro')
-                ? 'bloom'
-                : isElem('水', 'hydro')
-                  ? 'bloom'
-                  : isElem('雷', 'electro')
-                    ? 'hyperBloom'
-                    : isElem('火', 'pyro')
-                      ? 'burgeon'
-                      : isElem('冰', 'cryo')
-                        ? 'shatter'
-                        : null
-        if (pick && (!okReactions.size || okReactions.has(pick))) {
-          const titleByReaction: Record<string, string> = {
-            hyperBloom: '超绽放伤害',
-            burgeon: '烈绽放伤害',
-            bloom: '绽放伤害',
-            swirl: '扩散反应伤害',
-            crystallize: '结晶反应伤害',
-            shatter: '碎冰反应伤害'
-          }
-          const title = titleByReaction[pick] || '反应伤害'
-          details.push({ title, kind: 'reaction', reaction: pick })
-        }
-      }
-    }
+    applyGsPostprocess({ input, tables, details, okReactions, gsBuffIdsOut })
   }
 
   // SR: normalize multi-target titles and fill a few baseline-like showcase rows (generic, no per-character hardcode).
   if (input.game === 'sr') {
-    const norm = (s: unknown): string => normalizePromptText(s)
-    const normTitleKey = (s: unknown): string => norm(String(s || '')).replace(/\s+/g, '')
-    const hasTitle = (title: string): boolean =>
-      details.some((d) => normTitleKey((d as any)?.title) === normTitleKey(title))
+    applySrPostprocess({ input, tables, details })
+  }
 
-    const baseOf = (t: string): string =>
-      String(t || '')
-        .replace(/\(主目标\)/g, '')
-        .replace(/\(相邻目标\)/g, '')
-        .replace(/\(完整[^)]*\)/g, '')
-        .trim()
-
-    const isDmg = (d: CalcSuggestDetail): boolean => normalizeKind((d as any)?.kind) === 'dmg'
-    const isAdjTitle = (t: string): boolean => /相邻目标/.test(norm(t))
-    const isMainTitle = (t: string): boolean => /(主目标|主目標)/.test(norm(t))
-    const isFullTitle = (t: string): boolean => /完整/.test(norm(t))
-
-    const makeRatioExpr = (tk: string, table: string): string => {
-      const acc = `talent.${tk}[${jsString(table)}]`
-      return `toRatio(Array.isArray(${acc}) ? ${acc}[0] : ${acc})`
-    }
-
-    const makeDmgCallExpr = (d: CalcSuggestDetail): string | null => {
-      const tk = typeof d.talent === 'string' ? String(d.talent).trim() : ''
-      const table = typeof d.table === 'string' ? String(d.table).trim() : ''
-      if (!tk || !table) return null
-      const key = typeof d.key === 'string' && d.key.trim() ? d.key.trim() : tk
-      const ele = typeof d.ele === 'string' && d.ele.trim() ? `, ${jsString(d.ele.trim())}` : ''
-      const stat = typeof (d as any).stat === 'string' ? String((d as any).stat).trim() : ''
-      if (!stat || stat === 'atk') return `dmg(talent.${tk}[${jsString(table)}], ${jsString(key)}${ele})`
-      if (stat === 'hp' || stat === 'def' || stat === 'mastery') {
-        return `dmg.basic(calc(attr.${stat}) * (${makeRatioExpr(tk, table)}), ${jsString(key)}${ele})`
-      }
-      return `dmg(talent.${tk}[${jsString(table)}], ${jsString(key)}${ele})`
-    }
-
-    // 1) Drop adjacent-target rows when the official talent description has no adjacent-target wording and
-    // the talent tables also provide no adjacent variant table. This avoids hallucinated "blast split" rows.
-    try {
-      const descByTalent = (input.talentDesc || {}) as Record<string, unknown>
-      const descOf = (tk: string): string => norm((descByTalent as any)[tk])
-
-      for (let i = details.length - 1; i >= 0; i--) {
-        const d: any = details[i]
-        if (!d || typeof d !== 'object') continue
-        if (normalizeKind(d.kind) !== 'dmg') continue
-        const titleN = norm(d.title)
-        if (!/相邻目标/.test(titleN)) continue
-        const tk = typeof d.talent === 'string' ? String(d.talent).trim() : ''
-        if (!tk) continue
-        const desc = descOf(tk)
-        if (/相邻目标/.test(desc)) continue
-
-        const allowed = (tables as any)?.[tk]
-        const hasAdjTable =
-          Array.isArray(allowed) &&
-          allowed.some(
-            (t: string) =>
-              /相邻目标/.test(String(t || '')) || /[（(]\s*2\s*[)）]/.test(String(t || ''))
-          )
-        if (hasAdjTable) continue
-
-        details.splice(i, 1)
-      }
-    } catch {
-      // Best-effort: do not block generation.
-    }
-
-    // 2) Blast-style rows: if we have both main + adjacent rows, normalize the main title and derive a "(完整)" row.
-    try {
-      const byBase = new Map<string, CalcSuggestDetail[]>()
-      for (const d of details) {
-        if (!d || typeof d !== 'object') continue
-        if (!isDmg(d)) continue
-        const title = String((d as any).title || '').trim()
-        if (!title) continue
-        const base = baseOf(title)
-        if (!base) continue
-        const list = byBase.get(base) || []
-        list.push(d)
-        byBase.set(base, list)
-      }
-
-      for (const [base, list] of byBase.entries()) {
-        const adj = list.find((d) => isAdjTitle(String((d as any).title || ''))) || null
-        if (!adj) continue
-        const hasFull = list.some((d) => isFullTitle(String((d as any).title || '')))
-        if (hasFull) continue
-
-        const main =
-          list.find((d) => isMainTitle(String((d as any).title || ''))) ||
-          list.find((d) => {
-            const t = String((d as any).title || '')
-            return !isAdjTitle(t) && !isFullTitle(t)
-          }) ||
-          null
-        if (!main) continue
-
-        // Normalize main title for matching.
-        if (!/\(主目标\)/.test(String((main as any).title || ''))) {
-          ;(main as any).title = `${base}(主目标)`
-        }
-
-        const titleFull = `${base}(完整)`
-        if (hasTitle(titleFull)) continue
-
-        const callMain = makeDmgCallExpr(main)
-        const callAdj = makeDmgCallExpr(adj)
-        if (!callMain || !callAdj) continue
-
-        const full: CalcSuggestDetail = {
-          title: titleFull,
-          kind: 'dmg',
-          talent: main.talent,
-          table: main.table,
-          key: main.key,
-          ele: main.ele,
-          stat: (main as any).stat,
-          cons: main.cons,
-          params: main.params,
-          check: main.check,
-          dmgExpr: `({ dmg: (${callMain}).dmg + (${callAdj}).dmg * 2, avg: (${callMain}).avg + (${callAdj}).avg * 2 })`
-        } as any
-
-        if (details.length >= 20) {
-          // Replace the adjacent row to stay within the cap.
-          const idx = details.indexOf(adj)
-          if (idx >= 0) details.splice(idx, 1, full)
-        } else {
-          details.push(full)
-        }
-      }
-    } catch {
-      // Best-effort: do not block generation.
-    }
-
-    // 3) Multi-hit segment showcase: when the official talent desc exposes a hard cap like
-    // "【XXX】最多累计10段攻击段数", add an aggregated "10层XXX单体伤害" row.
-    try {
-      const hintLines = (Array.isArray(input.buffHints) ? input.buffHints : [])
-        .map((h) => norm(h))
-        .filter(Boolean) as string[]
-      const descByTalent = (input.talentDesc || {}) as Record<string, unknown>
-
-      const parseMaxSegments = (descRaw: unknown): { name: string; hits: number } | null => {
-        const desc = norm(descRaw)
-        if (!desc) return null
-        let m = /【([^】]{1,12})】[^。\n]{0,160}?最多(?:累计)?\s*(\d+)\s*段攻击段数/.exec(desc)
-        if (!m) {
-          m = /【([^】]{1,12})】[^。\n]{0,160}?(?:攻击段数).{0,16}?(?:上限|最多)\s*(\d+)\s*段/.exec(desc)
-        }
-        if (!m) return null
-        const name = String(m[1] || '').trim()
-        const n = Math.trunc(Number(m[2]))
-        if (!name || !Number.isFinite(n) || n < 2 || n > 30) return null
-        return { name, hits: n }
-      }
-
-      const pickMaxPct = (text: string): number | null => {
-        const out: number[] = []
-        const re = /(\d+(?:\.\d+)?)\s*[%％]/g
-        let m: RegExpExecArray | null
-        while ((m = re.exec(text))) {
-          const n = Number(m[1])
-          if (!Number.isFinite(n) || n <= 0 || n > 2000) continue
-          out.push(n)
-        }
-        return out.length ? Math.max(...out) : null
-      }
-
-      const sumMin = (hits: number, maxStacks: number): number => {
-        const n = Math.trunc(hits)
-        const s = Math.trunc(maxStacks)
-        if (!(n > 1) || !(s >= 1)) return 0
-        const maxI = n - 1
-        if (maxI <= s) return (maxI * (maxI + 1)) / 2
-        return (s * (s + 1)) / 2 + s * (maxI - s)
-      }
-
-      const parsed: Array<{ tk: TalentKey; name: string; hits: number }> = []
-      for (const tk0 of Object.keys(tables)) {
-        const tk = tk0 as TalentKey
-        const p = parseMaxSegments((descByTalent as any)[tk])
-        if (p) parsed.push({ tk, ...p })
-      }
-
-      for (const ent of parsed) {
-        const title = `${ent.hits}层${ent.name}单体伤害`
-        if (hasTitle(title)) continue
-
-        const perHit =
-          details.find((d) => {
-            if (!isDmg(d)) return false
-            if (d.talent !== ent.tk) return false
-            const t = norm(String((d as any).title || ''))
-            if (!t || !t.includes(ent.name)) return false
-            if (isAdjTitle(t)) return false
-            if (/\d+\s*层/.test(t) || isFullTitle(t)) return false
-            return true
-          }) || null
-        if (!perHit) continue
-
-        const call = makeDmgCallExpr(perHit)
-        if (!call) continue
-
-        type Ramp = { cons: number; pct: number; stacks: number }
-        const ramps: Ramp[] = []
-        for (const h of hintLines) {
-          const mCons = /^\s*(\d)\s*魂[：:]/.exec(h)
-          if (!mCons) continue
-          const cons = Math.trunc(Number(mCons[1]))
-          if (!(cons >= 1 && cons <= 6)) continue
-          if (!h.includes(ent.name)) continue
-          if (!/每段攻击后/.test(h)) continue
-          if (!/受到.{0,10}伤害.{0,8}(提高|提升|增加)/.test(h)) continue
-          const pct = pickMaxPct(h)
-          const mStack = h.match(/(?:至多|最多)叠加\s*(\d+)\s*(?:层|次)/)
-          const stacks = mStack ? Math.trunc(Number(mStack[1])) : NaN
-          if (pct == null || !Number.isFinite(stacks) || stacks < 1) continue
-          ramps.push({ cons, pct, stacks })
-        }
-        ramps.sort((a, b) => a.cons - b.cons || b.pct - a.pct)
-        const ramp = ramps[0] || null
-
-        const mk = (factor: number, check?: string): CalcSuggestDetail =>
-          ({
-            title,
-            kind: 'dmg',
-            talent: perHit.talent,
-            table: perHit.table,
-            key: perHit.key,
-            ele: perHit.ele,
-            stat: (perHit as any).stat,
-            params: perHit.params,
-            ...(check ? { check } : {}),
-            dmgExpr: `({ dmg: (${call}).dmg * ${factor}, avg: (${call}).avg * ${factor} })`
-          }) as any
-
-        if (ramp && details.length + 2 <= 20) {
-          const sum = sumMin(ent.hits, ramp.stacks)
-          const factor0 = ent.hits
-          const factor1 = Number((ent.hits + (ramp.pct / 100) * sum).toFixed(6))
-          details.push(mk(factor0, `cons < ${ramp.cons}`))
-          details.push(mk(factor1, `cons >= ${ramp.cons}`))
-        } else if (details.length < 20) {
-          details.push(mk(ent.hits))
-        }
-      }
-    } catch {
-      // Best-effort: do not block generation.
-    }
-
-    // 4) Normalize "(主目标)" titles for single-target skills to better align with baseline naming.
-    const hasMultiTargetVariant = new Set<string>()
+  // GS: If we use any reaction variants, ensure mastery is present in mainAttr (baseline pattern).
+  if (input.game === 'gs') {
+    const ok = new Set(['vaporize', 'melt', 'aggravate', 'spread'])
     for (const d of details) {
-      const title = String((d as any)?.title || '')
-      if (!title) continue
-      const base = baseOf(title)
-      if (!base) continue
-      if (/(相邻目标|完整|全体)/.test(title)) hasMultiTargetVariant.add(base)
+      const eleRaw = typeof (d as any)?.ele === 'string' ? String((d as any).ele).trim() : ''
+      const ele = eleRaw ? eleRaw.toLowerCase() : ''
+      if (ok.has(ele)) gsBuffIdsOut.add(ele)
     }
-    for (const d of details) {
-      const title = String((d as any)?.title || '')
-      if (!/\(主目标\)/.test(title)) continue
-      const base = baseOf(title)
-      if (!base) continue
-      if (hasMultiTargetVariant.has(base)) continue
-      ;(d as any).title = base
+
+    const hasReactionLike = gsBuffIdsOut.size > 0 || details.some((d) => normalizeKind((d as any)?.kind) === 'reaction')
+    if (hasReactionLike) {
+      const parts = mainAttr
+        .split(',')
+        .map((s) => String(s || '').trim())
+        .filter(Boolean)
+      const hasMastery = parts.some((p) => {
+        const t = p.toLowerCase()
+        return t === 'mastery' || t === 'em' || t === 'elementalmastery'
+      })
+      if (!hasMastery) {
+        parts.push('mastery')
+        mainAttr = parts.join(',')
+      }
     }
   }
 
-  return { mainAttr, defDmgKey, details, buffs: buffsOut }
+  const buffsFinal: Array<CalcSuggestBuff | string> = []
+  if (input.game === 'gs') {
+    for (const id of Array.from(gsBuffIdsOut).sort()) buffsFinal.push(id)
+  }
+  buffsFinal.push(...buffsOut)
+
+  return { mainAttr, defDmgKey, details, buffs: buffsFinal }
 }
 
 function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
@@ -7923,8 +7432,20 @@ function deriveSrConsFromBuffHints(
 export function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcSuggestResult): void {
   if (input.game !== 'sr') return
   const details = Array.isArray(plan.details) ? plan.details : []
-  const buffsArr = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as CalcSuggestBuff[]) : []
-  ;(plan as any).buffs = buffsArr
+  const buffsRaw = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as Array<unknown>) : []
+  const buffStrings: string[] = []
+  const buffsArr: CalcSuggestBuff[] = []
+  for (const b of buffsRaw) {
+    if (typeof b === 'string') {
+      const t = b.trim()
+      if (t) buffStrings.push(t)
+      continue
+    }
+    if (!b || typeof b !== 'object' || Array.isArray(b)) continue
+    if (!(b as any).title) continue
+    buffsArr.push(b as CalcSuggestBuff)
+  }
+  ;(plan as any).buffs = [...buffStrings, ...buffsArr]
 
   deriveSrConsFromBuffHints(input.buffHints, details, buffsArr)
 }

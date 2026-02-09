@@ -782,12 +782,20 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
 	            const blk = (giTalent.talentData as any)?.[k]
 	            if (!blk || typeof blk !== 'object') return {}
 	            const out: Record<string, unknown> = {}
+	            const isCountLike = (name: string): boolean => /(攻击次数|命中次数|攻击段数)/.test(name)
 	            for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
 	              if (typeof name !== 'string' || !name.trim()) continue
 	              if (!Array.isArray(values) || values.length === 0) continue
 	              const sample = (values as any[])[0]
 	              if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
 	                out[name] = sample
+	                continue
+	              }
+	              // Keep a tiny set of scalar samples for count-like tables.
+	              // Used by calc post-processers to synthesize baseline-like "总伤/完整" rows without bloating prompts.
+	              if (typeof sample === 'number' && Number.isFinite(sample) && isCountLike(name)) {
+	                const n = Math.trunc(sample)
+	                if (n > 1 && n <= 60) out[name] = n
 	              }
 	            }
 	            return out
@@ -1342,12 +1350,18 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         const blk = (giTalent.talentData as any)?.[k]
         if (!blk || typeof blk !== 'object') return {}
         const out: Record<string, unknown> = {}
+        const isCountLike = (name: string): boolean => /(攻击次数|命中次数|攻击段数)/.test(name)
         for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
           if (typeof name !== 'string' || !name.trim()) continue
           if (!Array.isArray(values) || values.length === 0) continue
           const sample = (values as any[])[0]
           if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
             out[name] = sample
+            continue
+          }
+          if (typeof sample === 'number' && Number.isFinite(sample) && isCountLike(name)) {
+            const n = Math.trunc(sample)
+            if (n > 1 && n <= 60) out[name] = n
           }
         }
         return out
@@ -2241,12 +2255,18 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
 	        const blk = (giTalent.talentData as any)?.[k]
 	        if (!blk || typeof blk !== 'object') return {}
 	        const out: Record<string, unknown> = {}
+	        const isCountLike = (name: string): boolean => /(攻击次数|命中次数|攻击段数)/.test(name)
 	        for (const [name, values] of Object.entries(blk as Record<string, unknown>)) {
 	          if (typeof name !== 'string' || !name.trim()) continue
 	          if (!Array.isArray(values) || values.length === 0) continue
 	          const sample = (values as any[])[0]
 	          if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
 	            out[name] = sample
+	            continue
+	          }
+	          if (typeof sample === 'number' && Number.isFinite(sample) && isCountLike(name)) {
+	            const n = Math.trunc(sample)
+	            if (n > 1 && n <= 60) out[name] = n
 	          }
 	        }
 	        return out

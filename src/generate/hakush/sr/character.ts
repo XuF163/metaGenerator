@@ -622,9 +622,12 @@ function guessSrParamName(opts: {
     /攻击力/.test(local) && /(提高|提升|增加)/.test(local) && !/伤害/.test(local)
   const isDefUpParam =
     /防御力/.test(local) && /(提高|提升|增加)/.test(local) && !/伤害/.test(local)
-  const isAdjacentDamage = /相邻目标|相邻敌方|相邻/.test(before) && /伤害/.test(around)
-  const isCounterDamage = before.includes('反击') && /伤害/.test(around)
-  const isFollowUpDamage = before.includes('追加攻击') && /伤害/.test(around)
+  // Prefer the *local* clause around the placeholder to avoid false positives when the same skill mixes
+  // adjacent-target wording and later "all targets" hits (e.g. $1 used for blast, $2 used for AoE finisher).
+  const isAdjacentDamage = /相邻目标|相邻敌方|相邻/.test(local) && /伤害/.test(local)
+  const isAllTargetDamage = /(敌方全体|所有敌方目标|所有目标|全体)/.test(local) && /伤害/.test(local)
+  const isCounterDamage = local.includes('反击') && /伤害/.test(local)
+  const isFollowUpDamage = local.includes('追加攻击') && /伤害/.test(local)
   const isExtraDamage = /(额外|附加)/.test(local) && /伤害/.test(local)
 
   const stat =
@@ -666,6 +669,14 @@ function guessSrParamName(opts: {
   if (isHpUpParam) return isPercent ? '生命提高·百分比生命' : '生命提高·固定值'
   if (isAtkUpParam) return isPercent ? '攻击提高·攻击力百分比' : '攻击提高·固定值'
   if (isDefUpParam) return isPercent ? '防御提高·防御力百分比' : '防御提高·固定值'
+
+  // Stat-up caps: "最高不超过自身攻击力的 $n% ..."
+  // These are frequently the 2nd param in buff skills, and leaving them as 参数N makes downstream buff modeling harder.
+  if (/最高不超过/.test(around) || /上限不超过/.test(around)) {
+    if (/攻击力/.test(around)) return isPercent ? '攻击力上限比例' : '攻击力上限'
+    if (/防御力/.test(around)) return isPercent ? '防御力上限比例' : '防御力上限'
+    if (/(生命上限|生命值)/.test(around)) return isPercent ? '生命值上限比例' : '生命值上限'
+  }
 
   if (isShieldParam) {
     if (isPercent && stat === 'def') return srShieldDefPctNameCompatById[String(charId)] || '百分比防御'
@@ -713,6 +724,7 @@ function guessSrParamName(opts: {
     if (local.includes('持续伤害')) return '持续伤害'
     if (/每段/.test(around)) return '每段伤害'
     if (/每次/.test(around)) return '每次伤害'
+    if (isAllTargetDamage) return '所有目标伤害'
     if (isAdjacentDamage) return '相邻目标伤害'
     if (isCounterDamage) return '反击伤害'
     if (isFollowUpDamage) return varCount <= 1 ? '技能伤害' : '追加攻击伤害'
@@ -749,6 +761,21 @@ function guessSrParamName(opts: {
 
     // Fixed value.
     return `${prefix}固定值`
+  }
+
+  // Per-stack split multipliers: "...每层对主目标/其他目标提高 $1%/$2% ..."
+  // These often lack the "伤害" keyword in the immediate placeholder vicinity, causing a generic 参数1/2 name,
+  // which then blocks downstream calc.js generation (LLM/heuristics cannot infer main-vs-adj scaling).
+  // Prefer baseline-like naming when we can confidently detect the pattern.
+  if (
+    isPercent &&
+    /每层/.test(around) &&
+    /(主目标|主目標)/.test(around) &&
+    /(其他目标|其他目標|相邻目标|相邻目標)/.test(around) &&
+    /(伤害倍率|伤害).*(提高|提升|增加)/.test(descPlain)
+  ) {
+    if (outIdx === 1) return '主目标每层倍率'
+    if (outIdx === 2) return '相邻目标每层倍率'
   }
 
   return guessPrimaryParamName(local || descPlain, outIdx)
@@ -2348,6 +2375,10 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
     Object.assign(tc as Record<string, unknown>, tcCompat)
   }
 
+  // Persist the character index before optional slow steps (LLM calc / asset downloads),
+  // so the meta remains loadable even if those steps fail or are interrupted.
+  writeJsonFile(indexPath, sortRecordByKey(index))
+
   // Batch-generate calc.js via LLM with concurrency (fast path for `gen --force`).
   if (opts.llm && calcJobs.length > 0) {
     const CALC_CONCURRENCY = Math.max(1, opts.llm.maxConcurrency)
@@ -2375,8 +2406,6 @@ export async function generateSrCharacters(opts: GenerateSrCharacterOptions): Pr
       }
     })
   }
-
-  writeJsonFile(indexPath, sortRecordByKey(index))
 
   const ASSET_CONCURRENCY = 12
   let assetDone = 0

@@ -150,6 +150,10 @@ export interface CalcSuggestResult {
   mainAttr: string
   defDmgKey?: string
   details: CalcSuggestDetail[]
-  buffs?: CalcSuggestBuff[]
+  /**
+   * Buff list:
+   * - object: normal miao-plugin buff entry
+   * - string: builtin buff id used by baseline meta (e.g. "vaporize"/"melt"/"spread"/"aggravate")
+   */
+  buffs?: Array<CalcSuggestBuff | string>
 }
-
