@@ -32,7 +32,7 @@ export type {
   CalcSuggestResult
 } from './llm-calc/types.js'
 
-export const CALC_CREATED_BY = 'awesome-gpt5.2-xhigh.llm-calc.v13'
+export const CALC_CREATED_BY = 'awesome-gpt5.2-xhigh.llm-calc.v23'
 
 // Requirement: generated calc.js should have a consistent signature.
 const DEFAULT_CREATED_BY = CALC_CREATED_BY

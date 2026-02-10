@@ -124,6 +124,29 @@ function inferTimesFromDesc(descRaw: unknown, tokenRaw: string): number | null {
   return null
 }
 
+function inferMaxCountFromDesc(descRaw: unknown): number | null {
+  const desc = normalizePromptText(descRaw).replace(/\s+/g, '')
+  if (!desc) return null
+
+  const picks: RegExp[] = [
+    /拥有\s*(\d{1,2})\s*次可使用次数/,
+    /可使用次数\s*[:：]\s*(\d{1,2})/,
+    /最多(?:可以)?(?:同时)?存在\s*(\d{1,2})\s*[个枚层次]/,
+    /至多(?:可以)?(?:同时)?存在\s*(\d{1,2})\s*[个枚层次]/,
+    /最多(?:可以)?(?:同时)?拥有\s*(\d{1,2})\s*[个枚层次]/,
+    /至多(?:可以)?(?:同时)?拥有\s*(\d{1,2})\s*[个枚层次]/
+  ]
+
+  for (const re of picks) {
+    const m = desc.match(re)
+    if (!m) continue
+    const n = Math.trunc(Number(m[1]))
+    if (Number.isFinite(n) && n >= 2 && n <= 10) return n
+  }
+
+  return null
+}
+
 export function applyGsDerivedTotals(opts: {
   input: CalcSuggestInput
   tables: Record<string, string[]>
@@ -147,11 +170,42 @@ export function applyGsDerivedTotals(opts: {
       if (normalizeKind(d.kind) !== 'dmg') continue
       const tk = String(d.talent || '')
       if (tk !== 'a') continue
+      const key = typeof d.key === 'string' ? String(d.key).trim() : ''
       const title = normalizePromptText(d.title)
       const table = normalizePromptText(d.table)
       const s = `${title} ${table}`
       if (/(单次|每段|每跳|每次|总伤|总计|合计|一轮)/.test(s)) continue
+      // Prefer dropping segmented NA rows first.
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
       if (/(一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(s)) return i
+    }
+    // Fallback: any plain NA dmg row (excluding charged/plunge/aimed).
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d: any = details[i]
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      const tk = String(d.talent || '')
+      if (tk !== 'a') continue
+      const key = typeof d.key === 'string' ? String(d.key).trim() : ''
+      const title = normalizePromptText(d.title)
+      const table = normalizePromptText(d.table)
+      const s = `${title} ${table}`
+      if (/(单次|每段|每跳|每次|总伤|总计|合计|一轮)/.test(s)) continue
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
+      return i
+    }
+    // Final fallback: allow replacing charged/plunge/aimed rows when the plan is capped.
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d: any = details[i]
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      const tk = String(d.talent || '')
+      if (tk !== 'a') continue
+      const title = normalizePromptText(d.title)
+      const table = normalizePromptText(d.table)
+      const s = `${title} ${table}`
+      if (/(单次|每段|每跳|每次|总伤|总计|合计|一轮)/.test(s)) continue
+      if (/(重击|下落|坠地|瞄准)/.test(s)) return i
     }
     return -1
   }
@@ -218,6 +272,7 @@ export function applyGsDerivedTotals(opts: {
   }
 
   const descQ = (input.talentDesc as any)?.q
+  const descE = (input.talentDesc as any)?.e
 
   const addTotalByCountTable = (): void => {
     const bestCount = pickMaxCountTable()
@@ -277,9 +332,26 @@ export function applyGsDerivedTotals(opts: {
     if (uniqTables.length === 0) return
 
     const timesByTable = new Map<string, number>()
+    const descQNorm = normalizePromptText(descQ).replace(/\s+/g, '')
+    const maxCount = inferMaxCountFromDesc(descE) ?? inferMaxCountFromDesc(descQ)
+    const inferImplicitRepeat = (token: string): number | null => {
+      if (!maxCount || maxCount < 2) return null
+      if (!descQNorm || !token || token.length < 2) return null
+      if (!descQNorm.includes(token)) return null
+      const esc = escapeRegExp(token)
+      // e.g. "每...摧毁一...就能...<token>"
+      const re1 = new RegExp(`每[^\\n]{0,28}?(?:摧毁|消耗|存在|生成|引爆|解放|转化|触发)[^\\n]{0,28}?(?:一|1)[^\\n]{0,28}?${esc}`)
+      if (re1.test(descQNorm)) return maxCount
+      // e.g. "<token>...每...摧毁/消耗/存在一..."
+      const re2 = new RegExp(`${esc}[^\\n]{0,36}?(?:每|每当|每次)[^\\n]{0,36}?(?:摧毁|消耗|存在|触发)[^\\n]{0,36}?(?:一|1)`)
+      if (re2.test(descQNorm)) return maxCount
+      return null
+    }
+
     for (const table of uniqTables) {
       const token = table.replace(/2$/, '').replace(/伤害/g, '').replace(/\s+/g, '').trim()
-      const times = inferTimesFromDesc(descQ, token)
+      const times0 = inferTimesFromDesc(descQ, token)
+      const times = times0 && times0 >= 2 ? times0 : inferImplicitRepeat(token)
       if (times && times >= 2) timesByTable.set(table, times)
     }
     if (timesByTable.size === 0) return
@@ -295,23 +367,41 @@ export function applyGsDerivedTotals(opts: {
       return k
     }
 
-    const baseTerms: Array<{ call: string; times: number }> = []
+    const baseTerms: Array<{ table: string; call: string; times: number }> = []
     const catTerms: Array<{ base: string; cat: string; times: number }> = []
-    for (const [table, times] of picked) {
+
+    const pushTerm = (table: string, times: number): void => {
       const key = buildKeyForTable(table)
       const call = makeDmgCallExpr(input, { talent: 'q', table, key })
-      if (!call) continue
-      baseTerms.push({ call, times })
-
+      if (!call) return
+      baseTerms.push({ table, call, times })
       if (catalyzeId) {
         const callCat = makeDmgCallExpr(input, { talent: 'q', table, key, ele: catalyzeId })
         if (callCat) catTerms.push({ base: call, cat: callCat, times })
       }
     }
+
+    for (const [table, times] of picked) pushTerm(table, times)
+
+    // Also include a single "base" hit once when the kit has a clear cast-damage table,
+    // e.g. "技能伤害/释放伤害" + "额外X伤害 * N". This is common in baseline totals.
+    const otherTables = uniqTables.filter((t) => !timesByTable.has(t))
+    const basePick =
+      otherTables.find((t) => /(技能伤害|释放伤害|点按伤害|长按伤害)/.test(t)) ||
+      (otherTables.length === 1 ? otherTables[0] : null)
+    if (basePick) pushTerm(basePick, 1)
+
     if (baseTerms.length === 0) return
 
     const sumExpr = (terms: Array<{ call: string; times: number }>, prop: 'dmg' | 'avg'): string =>
       terms.map((t) => `(${t.call}).${prop} * ${t.times}`).join(' + ')
+
+    const totalHits = baseTerms.reduce((acc, t) => acc + (Number.isFinite(t.times) ? t.times : 0), 0)
+    const numToCn = (n: number): string => {
+      const map: Record<number, string> = { 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六', 7: '七', 8: '八', 9: '九', 10: '十' }
+      return map[n] || String(n)
+    }
+    const hitTitle = totalHits >= 2 && totalHits <= 10 ? `${numToCn(totalHits)}段Q总伤害` : ''
 
     const titleBase = `Q总伤害`
     if (!hasTitle(titleBase)) {
@@ -319,7 +409,18 @@ export function applyGsDerivedTotals(opts: {
         title: titleBase,
         kind: 'dmg',
         talent: 'q',
-        table: picked[0]![0],
+        table: baseTerms[0]!.table,
+        key: 'q',
+        params: { q: true },
+        dmgExpr: `({ dmg: ${sumExpr(baseTerms, 'dmg')}, avg: ${sumExpr(baseTerms, 'avg')} })`
+      } as any)
+    }
+    if (hitTitle && !hasTitle(hitTitle)) {
+      pushPrefer({
+        title: hitTitle,
+        kind: 'dmg',
+        talent: 'q',
+        table: baseTerms[0]!.table,
         key: 'q',
         params: { q: true },
         dmgExpr: `({ dmg: ${sumExpr(baseTerms, 'dmg')}, avg: ${sumExpr(baseTerms, 'avg')} })`
@@ -327,22 +428,30 @@ export function applyGsDerivedTotals(opts: {
     }
 
     if (catalyzeId && catTerms.length === baseTerms.length) {
+      // Baseline-style: "激化总伤害" usually assumes each hit triggers catalyze (no partial hit splitting here).
+      const catSum = (prop: 'dmg' | 'avg'): string => catTerms.map((t) => `(${t.cat}).${prop} * ${t.times}`).join(' + ')
       const titleCat = catalyzeId === 'spread' ? `Q激化总伤害` : `Q总伤害·超激化`
       if (!hasTitle(titleCat)) {
-        const catSum = (prop: 'dmg' | 'avg'): string =>
-          catTerms
-            .map((t) => {
-              const catHits = Math.max(1, Math.min(t.times, Math.ceil(t.times / 3)))
-              const normalHits = Math.max(0, t.times - catHits)
-              return `(${t.base}).${prop} * ${normalHits} + (${t.cat}).${prop} * ${catHits}`
-            })
-            .join(' + ')
         gsBuffIdsOut.add(catalyzeId)
         pushPrefer({
           title: titleCat,
           kind: 'dmg',
           talent: 'q',
-          table: picked[0]![0],
+          table: baseTerms[0]!.table,
+          key: 'q',
+          params: { q: true },
+          dmgExpr: `({ dmg: ${catSum('dmg')}, avg: ${catSum('avg')} })`
+        } as any)
+      }
+
+      const hitCatTitle = totalHits >= 2 && totalHits <= 10 ? `${numToCn(totalHits)}段Q总激化伤害` : ''
+      if (hitCatTitle && !hasTitle(hitCatTitle)) {
+        gsBuffIdsOut.add(catalyzeId)
+        pushPrefer({
+          title: hitCatTitle,
+          kind: 'dmg',
+          talent: 'q',
+          table: baseTerms[0]!.table,
           key: 'q',
           params: { q: true },
           dmgExpr: `({ dmg: ${catSum('dmg')}, avg: ${catSum('avg')} })`

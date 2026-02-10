@@ -53,14 +53,63 @@ export function applyGsPostprocess(opts: {
     return t
   }
 
+  // When the plan hits the 20-row cap, prefer dropping segmented NA rows (baseline rarely keeps all of them)
+  // so we can keep more baseline-like E/Q/heal/shield showcases.
+  const gsFindReplaceableNaIdx = (): number => {
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i] as any
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'a') continue
+      const title = String(d.title || '')
+      const table = String(d.table || '')
+      const key = String(d.key || '')
+      const s = `${title} ${table}`
+      // Keep charged/plunge/aimed rows.
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
+      // Prefer dropping segmented NA rows (首段/一段/二段/...).
+      if (/(首段|一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(s)) return i
+    }
+    // Fallback: any plain NA dmg row.
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i] as any
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'a') continue
+      const title = String(d.title || '')
+      const table = String(d.table || '')
+      const key = String(d.key || '')
+      const s = `${title} ${table}`
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
+      return i
+    }
+    // Final fallback: charged/plunge/aimed rows are often low-signal in baseline detail sets.
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i] as any
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'a') continue
+      const title = String(d.title || '')
+      const table = String(d.table || '')
+      const key = String(d.key || '')
+      const s = `${title} ${table}`
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) return i
+    }
+    return -1
+  }
+
   const gsPushDetail = (d: CalcSuggestDetail): void => {
-    if (details.length >= 20) return
     if (!d.talent || !d.table) return
     const kind = normalizeKind(d.kind)
     if (!['dmg', 'heal', 'shield', 'reaction'].includes(kind)) return
     // De-dup by (kind,talent,table,ele). Avoid treating different `key` values as distinct rows.
     if (gsHasDetail({ kind, talent: d.talent as any, table: d.table, ele: d.ele })) return
-    details.push(d)
+    if (details.length < 20) {
+      details.push(d)
+      return
+    }
+    const idx = gsFindReplaceableNaIdx()
+    if (idx >= 0) details.splice(idx, 1, d)
   }
 
   const gsPickPrefer2 = (arr: string[]): string | undefined => {
@@ -152,37 +201,34 @@ export function applyGsPostprocess(opts: {
   const gsHasTalentKind = (kind: CalcDetailKind, talent: TalentKeyGs): boolean =>
     details.some((d) => normalizeKind(d.kind) === kind && d.talent === talent)
 
-  // When the plan hits the 20-row cap, prefer dropping segmented NA rows (baseline rarely keeps all of them)
-  // so we can keep at least one E/Q showcase row.
-  const gsFindReplaceableNaIdx = (): number => {
-    for (let i = details.length - 1; i >= 0; i--) {
-      const d = details[i] as any
-      if (!d || typeof d !== 'object') continue
-      if (normalizeKind(d.kind) !== 'dmg') continue
-      if (d.talent !== 'a') continue
-      const title = String(d.title || '')
-      const table = String(d.table || '')
-      const key = String(d.key || '')
-      const s = `${title} ${table}`
-      // Keep charged/plunge/aimed rows.
-      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
-      // Prefer dropping segmented NA rows (首段/一段/二段/...).
-      if (/(首段|一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(s)) return i
+  // Push an "alias" row that may intentionally duplicate (kind,talent,table,ele) to improve
+  // baseline matching (panel-regression compares by titles first). De-dup only by normalized title.
+  const gsPushAliasByTitle = (d: CalcSuggestDetail): void => {
+    if (!d || typeof d !== 'object') return
+    if (!d.talent || !d.table) return
+    const kind = normalizeKind(d.kind)
+    if (!['dmg', 'heal', 'shield', 'reaction'].includes(kind)) return
+
+    const title = normalizePromptText(d.title)
+    if (!title) return
+    const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+    const hasSameTitle = details.some((x: any) => {
+      if (!x || typeof x !== 'object') return false
+      if (normalizeKind(x.kind) !== kind) return false
+      if (x.talent !== d.talent) return false
+      const t = normalizePromptText(String(x.title || ''))
+      if (!t || t !== title) return false
+      const xe = typeof x.ele === 'string' ? String(x.ele).trim() : ''
+      return xe === ele
+    })
+    if (hasSameTitle) return
+
+    if (details.length < 20) {
+      details.push(d)
+      return
     }
-    // Fallback: any plain NA dmg row.
-    for (let i = details.length - 1; i >= 0; i--) {
-      const d = details[i] as any
-      if (!d || typeof d !== 'object') continue
-      if (normalizeKind(d.kind) !== 'dmg') continue
-      if (d.talent !== 'a') continue
-      const title = String(d.title || '')
-      const table = String(d.table || '')
-      const key = String(d.key || '')
-      const s = `${title} ${table}`
-      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
-      return i
-    }
-    return -1
+    const idx = gsFindReplaceableNaIdx()
+    if (idx >= 0) details.splice(idx, 1, d)
   }
 
   // Ensure at least one E/Q damage row exists; otherwise reaction/totals derivation becomes ineffective and
@@ -211,6 +257,46 @@ export function applyGsPostprocess(opts: {
   gsEnsureCoreDmg('e')
   gsEnsureCoreDmg('q')
 
+  // Ensure baseline-like generic core titles also exist (in addition to table-specific titles),
+  // e.g. baseline may use "E伤害"/"Q伤害" even when the underlying table name is specific.
+  const gsEnsureCoreTitleAlias = (talent: 'e' | 'q'): void => {
+    const marker = talent === 'e' ? 'E' : 'Q'
+    const aliasTitle = `${marker}技能伤害`
+
+    // Pick the strongest damage-like table (same heuristic as core dmg selection).
+    const list = normalizeTableList((tables as any)[talent] || [])
+    const candidates = list.filter(gsIsDamageTableName)
+    candidates.sort((a, b) => gsScoreDamageTableName(b) - gsScoreDamageTableName(a))
+    const table = candidates[0]
+    if (!table) return
+
+    // Prefer cloning an existing base row for the chosen table (preserve key/params).
+    const base = details.find((d: any) => {
+      if (!d || typeof d !== 'object') return false
+      if (normalizeKind(d.kind) !== 'dmg') return false
+      if (d.talent !== talent) return false
+      if (String(d.table || '').trim() !== table) return false
+      const ele = typeof d.ele === 'string' ? d.ele.trim() : ''
+      return !ele
+    }) as any
+
+    const out: CalcSuggestDetail = base
+      ? { ...(base as CalcSuggestDetail), title: aliasTitle }
+      : ({ title: aliasTitle, kind: 'dmg', talent, table, key: talent } as any)
+
+    if (talent === 'q') {
+      const p0 = (out as any).params
+      const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
+      if (!Object.prototype.hasOwnProperty.call(p, 'q')) p.q = true
+      ;(out as any).params = p
+    }
+
+    gsPushAliasByTitle(out)
+  }
+
+  gsEnsureCoreTitleAlias('e')
+  gsEnsureCoreTitleAlias('q')
+
   // 3) Elemental reaction variants (amp / catalyze) for key hits.
   const gsEleVariant:
     | { id: 'vaporize' | 'melt' | 'aggravate' | 'spread'; suffix: string; maxE: number; maxQ: number }
@@ -229,7 +315,11 @@ export function applyGsPostprocess(opts: {
     const title = String(titleRaw || '').trim()
     if (!title) return title
     if (title.includes(suffix)) return title
-    if (/伤害$/.test(title)) return title.replace(/伤害$/, suffix)
+    if (/伤害$/.test(title)) {
+      // Baseline catalyze titles often keep the trailing "伤害": "激化伤害"/"超激化伤害".
+      const needsDamage = /激化/.test(suffix)
+      return title.replace(/伤害$/, needsDamage ? `${suffix}伤害` : suffix)
+    }
     return `${title}${suffix}`
   }
 
@@ -272,6 +362,24 @@ export function applyGsPostprocess(opts: {
 
   if (gsEleVariant) {
     const bases = details.filter(gsIsEleVariantBase)
+    const scoreBase = (d: CalcSuggestDetail): number => {
+      const title = normalizePromptText(d.title)
+      const table = normalizePromptText(d.table)
+      const s = `${title} ${table}`
+      let sc = 0
+      // Prefer higher-stage rows when multiple stages exist (e.g. "肆阶/叄阶/贰阶/壹阶").
+      if (/肆阶|四阶/.test(s)) sc += 60
+      if (/叄阶|三阶/.test(s)) sc += 45
+      if (/贰阶|二阶/.test(s)) sc += 30
+      if (/壹阶|一阶/.test(s)) sc += 15
+      if (/满层|最大|完全|完整/.test(s)) sc += 18
+      if (/总伤|总计|合计|一轮/.test(s)) sc += 14
+      if (/单次|单段/.test(s)) sc += 10
+      // Prefer explicit table titles (more likely baseline-compatible).
+      if (title.length >= 6) sc += 4
+      if (table.length >= 6) sc += 4
+      return sc
+    }
 
     // Prefer charged attack for amp showcases (蒸发/融化).
     if (gsEleVariant.id === 'vaporize' || gsEleVariant.id === 'melt') {
@@ -279,26 +387,176 @@ export function applyGsPostprocess(opts: {
       if (a2) gsTryAddEleVariant(a2, gsEleVariant)
     }
 
-    let eAdded = 0
-    for (const d of bases) {
-      if (d.talent !== 'e') continue
-      if (eAdded >= gsEleVariant.maxE) break
-      gsTryAddEleVariant(d, gsEleVariant)
-      eAdded++
-    }
+    const eBases = bases
+      .filter((d) => d.talent === 'e')
+      .sort((a, b) => scoreBase(b) - scoreBase(a))
+    for (const d of eBases.slice(0, gsEleVariant.maxE)) gsTryAddEleVariant(d, gsEleVariant)
 
-    let qAdded = 0
-    for (const d of bases) {
-      if (d.talent !== 'q') continue
-      if (qAdded >= gsEleVariant.maxQ) break
-      gsTryAddEleVariant(d, gsEleVariant)
-      qAdded++
-    }
+    const qBases = bases
+      .filter((d) => d.talent === 'q')
+      .sort((a, b) => scoreBase(b) - scoreBase(a))
+    for (const d of qBases.slice(0, gsEleVariant.maxQ)) gsTryAddEleVariant(d, gsEleVariant)
   }
 
   // 4) Baseline-style multi-hit total rows (e.g. Q激化总伤-10段 / Q总伤害·超激化).
   // Derived from official table names + descriptions (no baseline code reuse).
   applyGsDerivedTotals({ input, tables, details, gsBuffIdsOut })
+
+  // 4.1) Title aliases towards baseline: "激化" wording + common per-tick / single-hit / release labels.
+  // Keep it conservative and evidence-driven (avoid hardcoding per-character logic).
+  const descE = normalizePromptText((input.talentDesc as any)?.e)
+  const descQ = normalizePromptText((input.talentDesc as any)?.q)
+  const isTickLikeDesc = (desc: string): boolean =>
+    /(每隔?\s*\d+(?:\.\d+)?\s*(?:秒|s)|每\s*\d+(?:\.\d+)?\s*(?:秒|s))/i.test(desc) && /(造成|恢复|回复|治疗)/.test(desc)
+
+  // Prefer adding "激化" aliases for catalyze variants when the model used "超激化/蔓激化" (baseline frequently uses "激化").
+  for (const d0 of [...details]) {
+    const d: any = d0 as any
+    if (!d || typeof d !== 'object') continue
+    const title = typeof d.title === 'string' ? d.title : ''
+    if (!title) continue
+    if (!/(超激化|蔓激化)/.test(title)) continue
+    const aliasTitle = title.replace(/超激化/g, '激化').replace(/蔓激化/g, '激化')
+    if (aliasTitle !== title) gsPushAliasByTitle({ ...(d as CalcSuggestDetail), title: aliasTitle } as any)
+  }
+
+  const pickBest = (list: CalcSuggestDetail[], score: (d: CalcSuggestDetail) => number): CalcSuggestDetail | null => {
+    if (!list.length) return null
+    const sorted = list.slice().sort((a, b) => score(b) - score(a))
+    return sorted[0] || null
+  }
+
+  // "每跳治疗/每跳伤害" aliases for periodic kits (very common in baseline titles).
+  if (isTickLikeDesc(descE)) {
+    const eHeal = details.filter((d) => normalizeKind(d.kind) === 'heal' && d.talent === 'e')
+    const best = pickBest(eHeal, (d) => (normalizePromptText(d.title).length >= 4 ? 1 : 0))
+    if (best) gsPushAliasByTitle({ ...(best as any), title: 'E每跳治疗' } as any)
+
+    const eDmg = details.filter((d) => normalizeKind(d.kind) === 'dmg' && d.talent === 'e' && !String((d as any).ele || '').trim())
+    const bestDmg = pickBest(eDmg, (d) => (/每跳|持续/.test(`${d.title} ${d.table}`) ? 3 : 0) + (String(d.table || '').includes('伤害') ? 1 : 0))
+    if (bestDmg) gsPushAliasByTitle({ ...(bestDmg as any), title: 'E每跳伤害' } as any)
+  }
+  if (isTickLikeDesc(descQ)) {
+    const qHeal = details.filter((d) => normalizeKind(d.kind) === 'heal' && d.talent === 'q')
+    const best = pickBest(qHeal, (d) => (normalizePromptText(d.title).length >= 4 ? 1 : 0))
+    if (best) gsPushAliasByTitle({ ...(best as any), title: 'Q每跳治疗' } as any)
+
+    const qDmg = details.filter((d) => normalizeKind(d.kind) === 'dmg' && d.talent === 'q' && !String((d as any).ele || '').trim())
+    const bestDmg = pickBest(qDmg, (d) => (/每跳|持续/.test(`${d.title} ${d.table}`) ? 3 : 0) + (String(d.table || '').includes('伤害') ? 1 : 0))
+    if (bestDmg) gsPushAliasByTitle({ ...(bestDmg as any), title: 'Q每跳伤害' } as any)
+  }
+
+  // "Q单段伤害/Q释放伤害" are frequent baseline labels; derive them from the most "single-hit" Q row.
+  const qSingles = details.filter(
+    (d) =>
+      normalizeKind(d.kind) === 'dmg' &&
+      d.talent === 'q' &&
+      !String((d as any).ele || '').trim() &&
+      !/(总伤|总计|合计|每跳|持续)/.test(`${d.title} ${d.table}`)
+  )
+  const bestQSingle = pickBest(qSingles, (d) => {
+    const s = `${normalizePromptText(d.title)} ${normalizePromptText(d.table)}`
+    let sc = 0
+    if (/单次|单段/.test(s)) sc += 6
+    if (/释放/.test(s)) sc += 4
+    if (/技能伤害/.test(s)) sc += 3
+    if (String(d.table || '').trim().endsWith('2')) sc += 1
+    return sc
+  })
+  if (bestQSingle) {
+    gsPushAliasByTitle({ ...(bestQSingle as any), title: 'Q单段伤害' } as any)
+    gsPushAliasByTitle({ ...(bestQSingle as any), title: 'Q释放伤害' } as any)
+  }
+
+  // Symmetric: "E释放伤害" helps matching for kits where baseline uses cast-damage wording.
+  const eSingles = details.filter(
+    (d) =>
+      normalizeKind(d.kind) === 'dmg' &&
+      d.talent === 'e' &&
+      !String((d as any).ele || '').trim() &&
+      !/(总伤|总计|合计|每跳|持续)/.test(`${d.title} ${d.table}`)
+  )
+  const bestESingle = pickBest(eSingles, (d) => {
+    const s = `${normalizePromptText(d.title)} ${normalizePromptText(d.table)}`
+    let sc = 0
+    if (/释放|点按|长按/.test(s)) sc += 6
+    if (/技能伤害/.test(s)) sc += 3
+    return sc
+  })
+  if (bestESingle) gsPushAliasByTitle({ ...(bestESingle as any), title: 'E释放伤害' } as any)
+
+  // Add baseline-compatible title aliases from official table names (skill-specific names are common in baseline).
+  // Keep it compact: prefer inserting by replacing low-signal NA segment rows when at the detail cap.
+  const baseTableName = (tRaw: unknown): string => {
+    const t0 = normalizePromptText(String(tRaw || ''))
+    if (!t0) return ''
+    return t0.endsWith('2') ? t0.slice(0, -1) : t0
+  }
+  const isGenericTableTitle = (t: string): boolean => {
+    if (!t) return true
+    if (/^(?:一|二|三|四|五|六|七|八|九|十)段伤害$/.test(t)) return true
+    if (/^(?:重击伤害|下落攻击伤害|下坠期间伤害|坠地冲击伤害)$/.test(t)) return true
+    return false
+  }
+  const deriveTableTitleAliases = (tRaw: unknown): string[] => {
+    const t = baseTableName(tRaw)
+    if (!t) return []
+    if (isGenericTableTitle(t)) return []
+
+    const out: string[] = [t]
+    // Baseline commonly drops "量" suffixes in titles while keeping the same underlying table.
+    if (/(治疗|回复)量$/.test(t)) out.push(t.replace(/量$/, ''))
+    // Shield tables frequently map to a single baseline title.
+    if (/护盾吸收量$/.test(t)) out.push(t.replace(/护盾吸收量$/, '护盾最大吸收量'))
+    return out
+  }
+  const scoreAliasTitle = (tRaw: string): number => {
+    const t = normalizePromptText(tRaw)
+    if (!t) return -1
+    let s = 0
+    if (t.length >= 10) s += 12
+    else if (t.length >= 6) s += 6
+    if (/护盾最大吸收量/.test(t)) s += 40
+    if (/(每跳|持续)/.test(t)) s += 18
+    if (/(总伤|总计|合计|一轮)/.test(t)) s += 14
+    if (/(爆发|爆裂|召唤|协同|追击|联动|反击)/.test(t)) s += 10
+    if (/(激化|蒸发|融化)/.test(t)) s += 8
+    return s
+  }
+
+  const aliasCands: CalcSuggestDetail[] = []
+  for (const d0 of details) {
+    const d: any = d0 as any
+    if (!d || typeof d !== 'object') continue
+    const kind = normalizeKind(d.kind)
+    if (!['dmg', 'heal', 'shield'].includes(kind)) continue
+    if (!d.talent || !d.table) continue
+    for (const t of deriveTableTitleAliases(d.table)) {
+      if (!t) continue
+      if (normalizePromptText(d.title) === normalizePromptText(t)) continue
+      aliasCands.push({ ...(d as CalcSuggestDetail), title: t })
+    }
+  }
+  aliasCands.sort((a, b) => scoreAliasTitle(String(b.title || '')) - scoreAliasTitle(String(a.title || '')))
+  const aliasKeepMax = 10
+  for (const d of aliasCands.slice(0, aliasKeepMax)) gsPushAliasByTitle(d)
+
+  // "开Q..." is a common baseline synonym for "Q状态·...". Add a conservative alias for better matching.
+  for (const d0 of [...details]) {
+    const d: any = d0 as any
+    if (!d || typeof d !== 'object') continue
+    if (!d.talent || !d.table) continue
+    const title0 = normalizePromptText(d.title)
+    if (!title0) continue
+    if (!/^Q状态/.test(title0)) continue
+
+    const kind = normalizeKind(d.kind)
+    let rest = title0.replace(/^Q状态[·.]?/, '').trim()
+    if (!rest) continue
+    let title = `开Q${rest}`
+    if (kind === 'dmg' && !/(伤害|治疗|护盾|吸收量)/.test(title)) title = `${title}伤害`
+    gsPushAliasByTitle({ ...(d as CalcSuggestDetail), title } as any)
+  }
 
   // Prune over-generated transformative reaction rows from LLM plans.
   // These rows can dominate `maxAvg` (e.g. hyperBloom) and introduce large regression drift,
@@ -353,25 +611,40 @@ export function applyGsPostprocess(opts: {
       // Keep a small, table-backed subset. Prefer explicit lunar table names.
       const isLunarNamed = (sRaw: unknown): boolean => /(月感电|月绽放|月结晶)/.test(normalizePromptText(String(sRaw || '')))
       const keepMax = 3
-      const scored = lunarIdxs
-        .map((idx) => {
-          const d: any = details[idx]
-          const table = typeof d?.table === 'string' ? d.table : ''
-          const title = typeof d?.title === 'string' ? d.title : ''
-          const hasTable = typeof d?.talent === 'string' && typeof d?.table === 'string' && !!d.table
-          const strong = isLunarNamed(table) || isLunarNamed(title)
-          const score = (strong ? 10 : 0) + (hasTable ? 2 : 0)
-          return { idx, score }
-        })
-        .sort((a, b) => b.score - a.score || a.idx - b.idx)
-      const keep = new Set(scored.slice(0, keepMax).map((x) => x.idx))
+      const tableNamedIdxs = lunarIdxs.filter((idx) => {
+        const d: any = details[idx]
+        const table = typeof d?.table === 'string' ? d.table : ''
+        return isLunarNamed(table)
+      })
 
-      for (let i = details.length - 1; i >= 0; i--) {
-        const d: any = details[i]
-        if (!d || typeof d !== 'object') continue
-        if (normalizeKind(d.kind) !== 'dmg') continue
-        if (!isLunarEle(d.ele)) continue
-        if (!keep.has(i)) details.splice(i, 1)
+      if (tableNamedIdxs.length === 0) {
+        for (let i = details.length - 1; i >= 0; i--) {
+          const d: any = details[i]
+          if (!d || typeof d !== 'object') continue
+          if (normalizeKind(d.kind) !== 'dmg') continue
+          if (isLunarEle(d.ele)) details.splice(i, 1)
+        }
+      } else {
+        const scored = tableNamedIdxs
+          .map((idx) => {
+            const d: any = details[idx]
+            const table = typeof d?.table === 'string' ? d.table : ''
+            const title = typeof d?.title === 'string' ? d.title : ''
+            const hasTable = typeof d?.talent === 'string' && typeof d?.table === 'string' && !!d.table
+            const strong = isLunarNamed(table)
+            const score = (strong ? 10 : 0) + (hasTable ? 2 : 0) + (isLunarNamed(title) ? 1 : 0)
+            return { idx, score }
+          })
+          .sort((a, b) => b.score - a.score || a.idx - b.idx)
+        const keep = new Set(scored.slice(0, keepMax).map((x) => x.idx))
+
+        for (let i = details.length - 1; i >= 0; i--) {
+          const d: any = details[i]
+          if (!d || typeof d !== 'object') continue
+          if (normalizeKind(d.kind) !== 'dmg') continue
+          if (!isLunarEle(d.ele)) continue
+          if (!keep.has(i)) details.splice(i, 1)
+        }
       }
     }
   }

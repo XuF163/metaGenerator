@@ -26,6 +26,7 @@ import { applyGsBuffFilterTowardsBaseline } from './plan-validate/gs-buff-filter
 import { applyGsArrayVariantPicksFromTitles } from './plan-validate/gs-array-pick.js'
 import { applyGsBurstAltAttackKeyMapping } from './plan-validate/gs-qstate.js'
 import { applyGsPostprocess } from './plan-validate/gs-postprocess.js'
+import { rewriteGsBasePlusPerLayerDetails } from './plan-validate/gs-stack-per-layer.js'
 import { normalizeGsDetailTitlesTowardsBaseline } from './plan-validate/gs-title-normalize.js'
 import { normalizeKind, normalizeStat } from './plan-validate/normalize.js'
 import { rewriteSrDeltaMultiplierIncreaseExprs } from './plan-validate/sr-dmgexpr-fixup.js'
@@ -6970,10 +6971,21 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   if (input.game === 'gs') {
     applyGsBurstAltAttackKeyMapping(input, details)
     applyGsPostprocess({ input, tables, details, okReactions, gsBuffIdsOut })
+    rewriteGsBasePlusPerLayerDetails({ input, tables, details })
+    patchGsBuffGateFieldsFromTitles(buffsOut)
   }
 
   // SR: normalize multi-target titles and fill a few baseline-like showcase rows (generic, no per-character hardcode).
   if (input.game === 'sr') {
+    // SR: `details[i].ele` is NOT an element/reaction selector.
+    // Baseline SR calcs only use `ele="skillDot"` as a special tag (DoT / fixed-crit approximation).
+    // Break/superBreak and status DoTs (shock/burn/...) must be modeled via kind=reaction + reaction="<id>".
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+      if (ele && ele !== 'skillDot') delete (d as any).ele
+    }
+
     applySrPostprocess({ input, tables, details })
     applySrBuffPostprocess({ input, tables, buffs: buffsOut })
     // Final SR fixup: ensure "倍率提高" deltas are treated as additive (base + delta), including rows
@@ -7052,6 +7064,8 @@ function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
       }
       return false
     }
+    const wrapClampExpr = (expr: string, lo: number, hi: number): string =>
+      `Math.max(${lo}, Math.min(${hi}, (${expr})))`
 
     for (const b of buffs) {
       if (!b || typeof b !== 'object') continue
@@ -7081,6 +7095,24 @@ function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
         // Numeric clamp for common unit mistakes (avoid rejecting whole LLM plans).
         for (const [kRaw, vRaw] of Object.entries(data as any)) {
           const k = String(kRaw || '')
+          if (typeof vRaw === 'string') {
+            const expr = vRaw.trim()
+            if (!expr) continue
+            if (isCritRateKey(k)) {
+              ;(data as any)[k] = wrapClampExpr(expr, 0, 100)
+              continue
+            }
+            if (isPercentLikeKey(k)) {
+              const isBigDmgKey = k === 'dmg' || /Dmg$/.test(k)
+              // SR: keep within js-validate bounds; tighten a few known buckets.
+              if (k === 'kx') (data as any)[k] = wrapClampExpr(expr, -80, 100)
+              else if (k === 'enemydmg') (data as any)[k] = wrapClampExpr(expr, -80, 250)
+              else if (k === 'enemyDef' || k === 'enemyIgnore' || k === 'ignore') (data as any)[k] = wrapClampExpr(expr, 0, 120)
+              else (data as any)[k] = wrapClampExpr(expr, -80, isBigDmgKey ? 5000 : 500)
+              continue
+            }
+            continue
+          }
           if (typeof vRaw !== 'number' || !Number.isFinite(vRaw)) continue
           let v = vRaw
 
@@ -7114,6 +7146,112 @@ function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
 
           if (v !== vRaw) (data as any)[k] = v
         }
+      }
+    }
+  } catch {
+    // Best-effort: do not block generation.
+  }
+}
+
+function patchGsBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
+  try {
+    const clamp = (n: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, n))
+    const isCritRateKey = (k: string): boolean => k === 'cpct' || /Cpct$/.test(k)
+    const isPercentLikeKey = (k: string): boolean => {
+      if (!k || k.startsWith('_')) return false
+      if (k.endsWith('Inc') || k.endsWith('Multi')) return true
+      if (
+        k.endsWith('Plus') ||
+        k === 'atkPlus' ||
+        k === 'hpPlus' ||
+        k === 'defPlus' ||
+        k === 'fyplus' ||
+        k === 'fybase'
+      ) {
+        return false
+      }
+      if (k.endsWith('Pct') || k.endsWith('Dmg') || k.endsWith('Cdmg') || k.endsWith('Cpct')) return true
+      if (k === 'cpct' || k === 'cdmg' || k === 'dmg' || k === 'phy' || k === 'heal' || k === 'shield') return true
+      if (k === 'recharge' || k === 'kx' || k === 'enemyDef' || k === 'enemyIgnore' || k === 'ignore') return true
+      if (k === 'fypct' || k === 'fyinc' || k === 'fycdmg' || k === 'elevated' || k === 'multi' || k === 'fykx') return true
+      return false
+    }
+
+    const wrapClampExpr = (expr: string, lo: number, hi: number): string =>
+      `Math.max(${lo}, Math.min(${hi}, (${expr})))`
+
+    const rescalePercentLike = (v: number, hiAbs: number): number => {
+      const abs = Math.abs(v)
+      if (abs <= hiAbs) return v
+      const v100 = v / 100
+      if (Math.abs(v100) <= hiAbs) return v100
+      const v10 = v / 10
+      if (Math.abs(v10) <= hiAbs) return v10
+      return clamp(v, -hiAbs, hiAbs)
+    }
+
+    for (const b of buffs) {
+      if (!b || typeof b !== 'object') continue
+      const title = String((b as any).title || '').trim()
+      if (!title) continue
+
+      // Fill missing cons from title (e.g. "4命效果：...").
+      if (typeof (b as any).cons !== 'number') {
+        const m = /(^|[^\d])([1-6])\s*命/.exec(title)
+        if (m) (b as any).cons = Number(m[2])
+      }
+
+      const data = (b as any).data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+
+      for (const [kRaw, vRaw] of Object.entries(data as any)) {
+        const k = String(kRaw || '').trim()
+        if (!k) continue
+
+        // Clamp runtime outputs (avoid rejecting whole LLM plans in js-validate).
+        if (typeof vRaw === 'string') {
+          const expr = vRaw.trim()
+          if (!expr) continue
+          if (isCritRateKey(k)) {
+            ;(data as any)[k] = wrapClampExpr(expr, 0, 100)
+          } else if (isPercentLikeKey(k)) {
+            // Keep within validator bounds; negative outgoing percent-like buffs are almost always misreads.
+            ;(data as any)[k] = wrapClampExpr(expr, -80, 500)
+          }
+          continue
+        }
+
+        if (typeof vRaw !== 'number' || !Number.isFinite(vRaw)) continue
+        let v = vRaw
+
+        if (isCritRateKey(k)) {
+          v = rescalePercentLike(v, 100)
+          if (v < 0) {
+            delete (data as any)[k]
+            continue
+          }
+          v = clamp(v, 0, 100)
+        } else if (isPercentLikeKey(k)) {
+          // Guardrail for unit mistakes like 6000% (should be 60%).
+          v = rescalePercentLike(v, 500)
+
+          // Shred/ignore keys should be non-negative.
+          if (/^(enemyDef|enemyIgnore|ignore|kx|fykx)$/.test(k)) {
+            if (v < 0) v = Math.abs(v)
+            if (k === 'kx' || k === 'fykx') v = clamp(v, 0, 100)
+            else v = clamp(v, 0, 120)
+          } else {
+            // Negative outgoing percent-like buffs are almost always misreads (baseline rarely uses them).
+            if (v < 0) {
+              delete (data as any)[k]
+              continue
+            }
+          }
+
+          if (v > 500) v = 500
+        }
+
+        if (v !== vRaw) (data as any)[k] = v
       }
     }
   } catch {

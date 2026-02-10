@@ -184,6 +184,9 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '    - 常见例子：被动写“基于元素充能效率超过100%的部分，每1%提升0.4%元素伤害加成” => dmg = Math.max(calc(attr.recharge) - 100, 0) * 0.4。',
     '    - 若 q 表存在「伤害加成」这类 buff 表名，通常应写入 buffs（例如 dmg: talent.q["伤害加成"]），不要当作 details 的伤害倍率表。',
     '- GS 提示：若 a 表存在明显的“特殊重击/蓄力形态”表名（例如包含「重击·」/「持续伤害」/「蓄力」），请让“重击伤害/重击”条目优先代表该特殊形态，而不是普通「重击伤害」。',
+    '- GS 重要：若 dmgExpr 里引用了 talent 表的「伤害提升/伤害提高/伤害增加」类字段，先判断它是“倍率增量(同单位的百分比点)”还是“最终增伤乘区(比例)”。',
+    '  - 若它与「技能伤害」同单位（常见：叠层/蓄力每层提升，表单位仍是「元素战技伤害/元素爆发伤害/普攻伤害」），应写成 dmg(base + inc * N + extra, key)；不要写 base * (1 + inc * N)（会放大 100 倍）。',
+    '  - 只有当文案明确是“最终造成的伤害提高X%/伤害加成提高X%”这类乘区，才写 base * (1 + toRatio(inc) * N)（禁止直接用 inc 作为比例）。',
     '- SR key 建议：普攻=a；战技=e；终结技=q；天赋=t（追击等）；可在后面追加逗号标签。',
     '- SR 重要提示：表名含「提高/提升/增加/加成/增伤/抗性穿透/无视防御/防御降低/概率/效果命中/效果抵抗/击破效率/削韧」通常是 buffs/debuff 表，不要把它当作 details 的“伤害倍率表”用于 dmg(...)；应写入 buffs.data（否则会把 buff 当成伤害倍率，面板回归会出现 1.5x~3x 的离群偏差）。',
     '- SR 例外：表名含「倍率提高/伤害倍率提高/击破倍率提高」通常是“伤害倍率增量”(delta)，用于 details：dmg( baseTable + deltaTable , key )；不要写成 buffs.data 的 qDmg/dmg，也不要写 base*(1+delta)。',
@@ -394,6 +397,11 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
       ? `${userText}\n\nSR 提示：SR talent 表里的很多“百分比”是比例值（例如 0.4 表示 40%）。details 里的 dmg(...) / dmg.basic(...) 直接使用该比例值（不要乘 100）。但 miao-plugin 的 buffs.data（如 atkPct/cpct/cdmg/dmg/...）按“百分数数值”存储（40），因此从 talent 表取值写入 buffs.data 百分比键时通常需要乘以 100。`
       : userText
 
+  const userTextFinal2 =
+    input.game === 'sr'
+      ? `${userTextFinal}\n\nSR 额外提示：details[i].ele 在 SR 中仅允许写 "skillDot"（DoT / 固定暴击近似）。break/superBreak/shock/burn/... 等反应/状态必须用 kind=reaction + reaction="..." 建模，不要写到 details[i].ele。`
+      : userTextFinal
+
   return [
     {
       role: 'system',
@@ -401,6 +409,6 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
         '你是一个谨慎的 Node.js/JS 工程师，熟悉 miao-plugin 的 calc.js 结构。' +
         ' 你必须严格按要求输出 JSON，不要输出解释、Markdown、代码块。'
     },
-    { role: 'user', content: userTextFinal }
+    { role: 'user', content: userTextFinal2 }
   ]
 }

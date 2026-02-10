@@ -22,6 +22,14 @@ export function applyGsBuffFilterTowardsBaseline(input: CalcSuggestInput, buffs:
       .replace(/[·!?！？…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, '')
 
   const hintsRaw = Array.isArray(input.buffHints) ? input.buffHints : []
+  const allHintText = [
+    ...hintsRaw,
+    ...Object.values((input as any).talentDesc || {})
+  ]
+    .map((s) => normalizePromptText(s))
+    .filter(Boolean)
+    .join('\n')
+  const hasLunarHint = /(月感电|月绽放|月结晶|月曜|月兆|moonsign|lunar)/i.test(allHintText)
   const consHints = new Map<number, string>()
   for (const h0 of hintsRaw) {
     const h = normalizePromptText(h0)
@@ -96,6 +104,19 @@ export function applyGsBuffFilterTowardsBaseline(input: CalcSuggestInput, buffs:
     const mulIntent = hasMultiplierIntent(evidence)
 
     let changed = false
+
+    // 0) Guardrail: `fypct/fyinc/fycdmg/fykx` are lunar-reaction-only knobs in baseline meta.
+    // When the kit has no lunar hints, drop them to avoid large drift from LLM misreads.
+    if (!hasLunarHint) {
+      for (const k of Object.keys(data)) {
+        const key = String(k || '').trim()
+        if (!key || key.startsWith('_')) continue
+        if (key === 'fypct' || key === 'fyinc' || key === 'fycdmg' || key === 'fykx') {
+          delete (data as any)[k]
+          changed = true
+        }
+      }
+    }
 
     // 1) Drop one-shot ("next cast") multiplier-like keys to match baseline semantics.
     if (evidence && isOneShotLike(evidence)) {
