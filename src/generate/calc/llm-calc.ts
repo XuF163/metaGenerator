@@ -32,8 +32,10 @@ export type {
   CalcSuggestResult
 } from './llm-calc/types.js'
 
+export const CALC_CREATED_BY = 'awesome-gpt5.2-xhigh.llm-calc.v13'
+
 // Requirement: generated calc.js should have a consistent signature.
-const DEFAULT_CREATED_BY = 'awesome-gpt5.2-xhigh'
+const DEFAULT_CREATED_BY = CALC_CREATED_BY
 
 export async function suggestCalcPlan(
   llm: LlmService,
@@ -175,4 +177,3 @@ export async function buildCalcJsWithLlmOrHeuristic(
   }
   return { js, usedLlm: false, error: lastErr || `[meta-gen] LLM calc plan failed` }
 }
-

@@ -170,7 +170,15 @@ export function applyGsDerivedTotals(opts: {
   const isElem = (...keys: string[]): boolean => keys.includes(elemRaw) || keys.includes(elemLower)
   const catalyzeId = isElem('草', 'dendro') ? 'spread' : isElem('雷', 'electro') ? 'aggravate' : null
 
-  const qDetails = details.filter((d) => normalizeKind(d.kind) === 'dmg' && d.talent === 'q' && typeof d.table === 'string') as any[]
+  const isQBucket = (d: any): boolean => {
+    const k0 = typeof d?.key === 'string' ? String(d.key).trim() : ''
+    const head = (k0 || 'q').split(',')[0]?.trim().toLowerCase() || 'q'
+    return head === 'q'
+  }
+
+  const qDetails = details.filter(
+    (d) => normalizeKind(d.kind) === 'dmg' && d.talent === 'q' && typeof d.table === 'string' && isQBucket(d as any)
+  ) as any[]
   if (qDetails.length === 0) return
 
   const qTablesAll = normalizeTableList((tables as any).q || [])

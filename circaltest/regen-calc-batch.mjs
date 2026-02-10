@@ -336,6 +336,12 @@ function buildTableSamples(meta) {
       const sample = values[0]
       if (Array.isArray(sample) || (sample && typeof sample === "object")) {
         sampleMap[name] = sample
+      } else if (typeof sample === "number" && Number.isFinite(sample)) {
+        // Hit count tables are scalar but critical for deriving "total damage" rows.
+        if (!/(攻击次数|命中次数|攻击段数)/.test(name)) continue
+        const n = Math.trunc(sample)
+        if (n < 2 || n > 60) continue
+        sampleMap[name] = n
       }
     }
     if (Object.keys(sampleMap).length) out[k] = sampleMap

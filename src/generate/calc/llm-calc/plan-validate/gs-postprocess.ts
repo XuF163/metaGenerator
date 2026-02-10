@@ -149,6 +149,68 @@ export function applyGsPostprocess(opts: {
   gsAddExtraDmgTables('e', 2)
   gsAddExtraDmgTables('q', 2)
 
+  const gsHasTalentKind = (kind: CalcDetailKind, talent: TalentKeyGs): boolean =>
+    details.some((d) => normalizeKind(d.kind) === kind && d.talent === talent)
+
+  // When the plan hits the 20-row cap, prefer dropping segmented NA rows (baseline rarely keeps all of them)
+  // so we can keep at least one E/Q showcase row.
+  const gsFindReplaceableNaIdx = (): number => {
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i] as any
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'a') continue
+      const title = String(d.title || '')
+      const table = String(d.table || '')
+      const key = String(d.key || '')
+      const s = `${title} ${table}`
+      // Keep charged/plunge/aimed rows.
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
+      // Prefer dropping segmented NA rows (首段/一段/二段/...).
+      if (/(首段|一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(s)) return i
+    }
+    // Fallback: any plain NA dmg row.
+    for (let i = details.length - 1; i >= 0; i--) {
+      const d = details[i] as any
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'a') continue
+      const title = String(d.title || '')
+      const table = String(d.table || '')
+      const key = String(d.key || '')
+      const s = `${title} ${table}`
+      if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
+      return i
+    }
+    return -1
+  }
+
+  // Ensure at least one E/Q damage row exists; otherwise reaction/totals derivation becomes ineffective and
+  // regressions drift (baseline often showcases E/Q, not every NA segment).
+  const gsEnsureCoreDmg = (talent: 'e' | 'q'): void => {
+    if (gsHasTalentKind('dmg', talent)) return
+    const list = normalizeTableList((tables as any)[talent] || [])
+    const candidates = list.filter(gsIsDamageTableName)
+    candidates.sort((a, b) => gsScoreDamageTableName(b) - gsScoreDamageTableName(a))
+    const table = candidates[0]
+    if (!table) return
+    if (gsHasDetail({ kind: 'dmg', talent, table })) return
+
+    const prefix = talent === 'e' ? 'E' : 'Q'
+    const out: CalcSuggestDetail = { title: `${prefix}${table}`, kind: 'dmg', talent, table, key: talent }
+    if (talent === 'q') (out as any).params = { q: true }
+
+    if (details.length < 20) {
+      gsPushDetail(out)
+      return
+    }
+    const idx = gsFindReplaceableNaIdx()
+    if (idx >= 0) details.splice(idx, 1, out)
+  }
+
+  gsEnsureCoreDmg('e')
+  gsEnsureCoreDmg('q')
+
   // 3) Elemental reaction variants (amp / catalyze) for key hits.
   const gsEleVariant:
     | { id: 'vaporize' | 'melt' | 'aggravate' | 'spread'; suffix: string; maxE: number; maxQ: number }
@@ -201,40 +263,7 @@ export function applyGsPostprocess(opts: {
 
     // Keep reaction showcases even when the plan is already at the detail cap:
     // replace a low-signal NA segment row (baseline rarely keeps all NA segments).
-    const findReplaceableIdx = (): number => {
-      for (let i = details.length - 1; i >= 0; i--) {
-        const d = details[i]
-        if (!d || typeof d !== 'object') continue
-        if (normalizeKind((d as any).kind) !== 'dmg') continue
-        if ((d as any).talent !== 'a') continue
-        const title = String((d as any).title || '')
-        const table = String((d as any).table || '')
-        const key = String((d as any).key || '')
-        const s = `${title} ${table}`
-        // Keep charged/plunge/aimed rows.
-        if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
-        // Prefer dropping segmented NA rows (一段/二段/...).
-        if (/(一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(s)) {
-          return i
-        }
-      }
-      // Fallback: any plain NA dmg row.
-      for (let i = details.length - 1; i >= 0; i--) {
-        const d = details[i]
-        if (!d || typeof d !== 'object') continue
-        if (normalizeKind((d as any).kind) !== 'dmg') continue
-        if ((d as any).talent !== 'a') continue
-        const title = String((d as any).title || '')
-        const table = String((d as any).table || '')
-        const key = String((d as any).key || '')
-        const s = `${title} ${table}`
-        if (key === 'a2' || /(重击|下落|坠地|瞄准)/.test(s)) continue
-        return i
-      }
-      return -1
-    }
-
-    const idx = findReplaceableIdx()
+    const idx = gsFindReplaceableNaIdx()
     if (idx >= 0) {
       details.splice(idx, 1, out)
       gsBuffIdsOut.add(variant.id)
@@ -271,23 +300,132 @@ export function applyGsPostprocess(opts: {
   // Derived from official table names + descriptions (no baseline code reuse).
   applyGsDerivedTotals({ input, tables, details, gsBuffIdsOut })
 
+  // Prune over-generated transformative reaction rows from LLM plans.
+  // These rows can dominate `maxAvg` (e.g. hyperBloom) and introduce large regression drift,
+  // especially on healer/support kits where baseline typically does not showcase them.
+  const hintLines = [
+    ...(Array.isArray((input as any).buffHints) ? ((input as any).buffHints as unknown[]) : []),
+    ...Object.values((input as any).talentDesc || {})
+  ]
+    .map((s) => normalizePromptText(String(s || '')))
+    .filter(Boolean)
+  const hintTextAll = hintLines.join('\n')
+
+  // Prune over-generated lunar showcase rows from LLM plans.
+  // Lunar (Moonsign) reactions are represented as kind=dmg with ele=lunar* (NOT kind=reaction).
+  // Many non-lunar kits mention electro-charged/bloom keywords in descriptions; the model can hallucinate
+  // lunar rows (e.g. "月感电反应伤害") that then dominate `maxAvg` and break regressions.
+  const isLunarEle = (eleRaw: unknown): boolean => {
+    const e = typeof eleRaw === 'string' ? eleRaw.trim() : ''
+    return e === 'lunarCharged' || e === 'lunarBloom' || e === 'lunarCrystallize'
+  }
+  const hasLunarTables = (() => {
+    for (const listRaw of Object.values(tables || {})) {
+      const list = Array.isArray(listRaw) ? (listRaw as unknown[]) : []
+      for (const t0 of list) {
+        const t = normalizePromptText(String(t0 || ''))
+        if (!t) continue
+        if (/(月感电|月绽放|月结晶)/.test(t)) return true
+      }
+    }
+    return false
+  })()
+  const hasLunarHint = /(月感电|月绽放|月结晶|月曜|月兆|Moonsign|Lunar)/i.test(hintTextAll)
+  const allowLunarShowcase = hasLunarTables || hasLunarHint
+
+  const lunarIdxs: number[] = []
+  for (let i = 0; i < details.length; i++) {
+    const d: any = details[i]
+    if (!d || typeof d !== 'object') continue
+    if (normalizeKind(d.kind) !== 'dmg') continue
+    if (!isLunarEle(d.ele)) continue
+    lunarIdxs.push(i)
+  }
+  if (lunarIdxs.length) {
+    if (!allowLunarShowcase) {
+      for (let i = details.length - 1; i >= 0; i--) {
+        const d: any = details[i]
+        if (!d || typeof d !== 'object') continue
+        if (normalizeKind(d.kind) !== 'dmg') continue
+        if (isLunarEle(d.ele)) details.splice(i, 1)
+      }
+    } else {
+      // Keep a small, table-backed subset. Prefer explicit lunar table names.
+      const isLunarNamed = (sRaw: unknown): boolean => /(月感电|月绽放|月结晶)/.test(normalizePromptText(String(sRaw || '')))
+      const keepMax = 3
+      const scored = lunarIdxs
+        .map((idx) => {
+          const d: any = details[idx]
+          const table = typeof d?.table === 'string' ? d.table : ''
+          const title = typeof d?.title === 'string' ? d.title : ''
+          const hasTable = typeof d?.talent === 'string' && typeof d?.table === 'string' && !!d.table
+          const strong = isLunarNamed(table) || isLunarNamed(title)
+          const score = (strong ? 10 : 0) + (hasTable ? 2 : 0)
+          return { idx, score }
+        })
+        .sort((a, b) => b.score - a.score || a.idx - b.idx)
+      const keep = new Set(scored.slice(0, keepMax).map((x) => x.idx))
+
+      for (let i = details.length - 1; i >= 0; i--) {
+        const d: any = details[i]
+        if (!d || typeof d !== 'object') continue
+        if (normalizeKind(d.kind) !== 'dmg') continue
+        if (!isLunarEle(d.ele)) continue
+        if (!keep.has(i)) details.splice(i, 1)
+      }
+    }
+  }
+
+  const elemRaw = String(input.elem || '').trim()
+  const elemLower = elemRaw.toLowerCase()
+  const isElem = (...keys: string[]): boolean => keys.includes(elemRaw) || keys.includes(elemLower)
+  const isAnemoOrGeo = isElem('风', 'anemo') || isElem('岩', 'geo')
+
+  const hasEmHint = /(元素精通|精通|mastery|\bem\b)/i.test(hintTextAll)
+  const hasOffensiveReactionHint = (() => {
+    const hasReactionWord = /(绽放|超绽放|烈绽放|月绽放|扩散|结晶|燃烧|超载|感电|超导|碎冰)/
+    const offensive = /(造成|触发|提升|提高|增加|加成|额外|反应伤害)/
+    for (const line of hintLines) {
+      if (!line) continue
+      if (!hasReactionWord.test(line)) continue
+      // Lunar reactions should be modeled as kind=dmg (ele=lunar*), not kind=reaction.
+      if (/(月感电|月绽放|月结晶)/.test(line)) continue
+      // Skip purely defensive wording like "免疫感电反应的伤害" / "不受...影响".
+      if (/(免疫|不受)/.test(line)) continue
+      // Skip "受到...反应伤害降低/减少/减免" style defensive hints.
+      if (/受到/.test(line) && /(降低|减少|减免)/.test(line)) continue
+      if (offensive.test(line)) return true
+    }
+    return false
+  })()
+
+  // Only keep/inject a single transformative reaction showcase row when:
+  // - the kit explicitly benefits from reaction damage, OR
+  // - it is anemo/geo with clear EM hints (swirl/crystallize).
+  const allowReactionShowcase = hasOffensiveReactionHint || (hasEmHint && isAnemoOrGeo)
+  const hasAnyReaction = details.some((d) => normalizeKind(d.kind) === 'reaction')
+  if (hasAnyReaction) {
+    if (!allowReactionShowcase) {
+      for (let i = details.length - 1; i >= 0; i--) {
+        if (normalizeKind((details[i] as any)?.kind) === 'reaction') details.splice(i, 1)
+      }
+    } else {
+      // Keep at most one reaction row.
+      let kept = false
+      for (let i = details.length - 1; i >= 0; i--) {
+        if (normalizeKind((details[i] as any)?.kind) !== 'reaction') continue
+        if (!kept) {
+          kept = true
+          continue
+        }
+        details.splice(i, 1)
+      }
+    }
+  }
+
   const hasReaction = details.some((d) => normalizeKind(d.kind) === 'reaction')
   if (!hasReaction && details.length < 20) {
-    const hintText = [
-      ...(Array.isArray((input as any).buffHints) ? ((input as any).buffHints as unknown[]) : []),
-      ...Object.values((input as any).talentDesc || {})
-    ]
-      .map((s) => String(s || ''))
-      .join('\n')
-
-    const hasEmOrReactionHint =
-      /(元素精通|精通|mastery|\bem\b)/i.test(hintText) ||
-      /(反应|绽放|超绽放|烈绽放|月绽放|扩散|结晶|燃烧|超载|感电|超导|碎冰)/.test(hintText)
-
-    if (hasEmOrReactionHint) {
-      const elemRaw = String(input.elem || '').trim()
-      const elemLower = elemRaw.toLowerCase()
-      const isElem = (...keys: string[]): boolean => keys.includes(elemRaw) || keys.includes(elemLower)
+    if (allowReactionShowcase) {
       const pick =
         isElem('风', 'anemo')
           ? 'swirl'

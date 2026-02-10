@@ -229,7 +229,7 @@ const srTreeDataBaseStatKeyCompatIds = new Set(['1224', '8001', '8002', '8003', 
 const srTreeDataQuantumTypoCompatIds = new Set(['1201', '1214', '1314', '1406', '1407'])
 
 // Baseline naming convention: only a small set of characters label Blast main-target damage as "目标伤害".
-const srBlastTargetDamageNameCompatIds = new Set(['1014', '1210', '1212', '1213', '1218', '1221', '1310', '1314', '1402', '1413'])
+const srBlastTargetDamageNameCompatIds = new Set(['1014', '1210', '1212', '1213', '1218', '1221', '1310', '1314', '1413'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -590,6 +590,7 @@ function guessSrParamName(opts: {
   outIdx: number
   origIdx: number
   tagCn: string
+  memospriteName?: string
 }): string {
   const { descSrc, descPlain, charId, varCount, outIdx, origIdx, tagCn } = opts
 
@@ -608,6 +609,15 @@ function guessSrParamName(opts: {
   const afterClause = (after.split(/[，。,;；。！？]/)[0] || after).trim()
   const local = `${beforeSeg}${afterClause}`
   const afterNoVar = afterClause.replace(/^[#$]\d+\[(?:i|f1|f2)]%?/, '').trim()
+  const memospriteNameRaw = typeof opts.memospriteName === 'string' ? opts.memospriteName.trim() : ''
+  const memospriteName = memospriteNameRaw && memospriteNameRaw.length <= 16 ? memospriteNameRaw : ''
+  const isMemospriteParam = Boolean(memospriteName && beforeSeg.includes(memospriteName))
+  const withMemospriteSuffix = (name: string): string => {
+    if (!isMemospriteParam) return name
+    if (!name || name.includes('·')) return name
+    if (!/伤害/.test(name)) return name
+    return `${name}·${memospriteName}`
+  }
 
   const isPercent = new RegExp(`[#$]${idx1}\\[(?:i|f1|f2)]%`).test(descSrc)
   const hasDamage = /伤害/.test(descPlain)
@@ -644,6 +654,7 @@ function guessSrParamName(opts: {
   if (/攻击力.*(提高|增加)$/.test(beforeSeg)) return '攻击力提高'
   if (/防御力.*(提高|增加)$/.test(beforeSeg)) return '防御力提高'
   if (/(生命上限|生命值).*(提高|增加)$/.test(beforeSeg)) return '生命值提高'
+  if (/击破伤害倍率.*(提高|增加)$/.test(beforeSeg)) return '击破倍率提高'
   if (/伤害倍率.*(提高|增加)$/.test(beforeSeg)) return '伤害倍率提高'
   if (/倍率.*(提高|增加)$/.test(beforeSeg)) return '倍率提高'
   if (/战技.*伤害.*(提高|增加)$/.test(beforeSeg)) return '战技伤害提高'
@@ -696,7 +707,12 @@ function guessSrParamName(opts: {
     // can model them via `reaction("<elem>Break"/"superBreak")` and related buffs.
     if (/(击破伤害)/.test(local) || /(击破伤害)/.test(around)) {
       if (/超击破/.test(local) || /超击破/.test(around)) return '超击破伤害比例'
-      return '击破伤害比例'
+      // Special wording: "造成...属性击破伤害的击破伤害" / "无视弱点属性..." is closer to baseline "击破伤害".
+      // Keep the generic "击破伤害比例" for regular break-ratio tables (e.g. Ruan Mei).
+      if (/属性击破伤害/.test(local) || /属性击破伤害/.test(around) || /无视弱点属性/.test(around)) {
+        return withMemospriteSuffix('击破伤害')
+      }
+      return withMemospriteSuffix('击破伤害比例')
     }
 
     // Repeated-release multipliers: "可重复发动... 伤害倍率依次提高至 $2%/$3% ..."
@@ -720,12 +736,12 @@ function guessSrParamName(opts: {
     if (/(三次|第三次)/.test(local)) return '三次释放伤害'
     if (/(四次|第四次)/.test(local)) return '四次释放伤害'
 
-    if (/(随机).{0,6}(敌方|目标|单体)/.test(local)) return '随机伤害'
+    if (/(随机).{0,6}(敌方|目标|单体)/.test(local)) return withMemospriteSuffix('随机伤害')
     if (local.includes('持续伤害')) return '持续伤害'
     if (/每段/.test(around)) return '每段伤害'
     if (/每次/.test(around)) return '每次伤害'
     if (isAllTargetDamage) return '所有目标伤害'
-    if (isAdjacentDamage) return '相邻目标伤害'
+    if (isAdjacentDamage) return withMemospriteSuffix('相邻目标伤害')
     if (isCounterDamage) return '反击伤害'
     if (isFollowUpDamage) return varCount <= 1 ? '技能伤害' : '追加攻击伤害'
     if (isExtraDamage) {
@@ -735,9 +751,10 @@ function guessSrParamName(opts: {
     }
     if (tagCn === '单体') return '单体伤害'
     if (tagCn === '扩散' && outIdx === 1 && /相邻目标|相邻敌方/.test(descPlain)) {
-      return srBlastTargetDamageNameCompatIds.has(String(charId)) ? '目标伤害' : '技能伤害'
+      const base = srBlastTargetDamageNameCompatIds.has(String(charId)) ? '目标伤害' : '技能伤害'
+      return withMemospriteSuffix(base)
     }
-    return '技能伤害'
+    return withMemospriteSuffix('技能伤害')
   }
 
   // Heal-only skills (no damage present in the whole description) use more specific naming.
@@ -787,7 +804,7 @@ function skillDescAndTables(
   spBase: unknown,
   showStanceList: unknown,
   elemCn: string,
-  opts?: { levelCap?: number; tagCn?: string; noElemSpan?: boolean; charId?: number }
+  opts?: { levelCap?: number; tagCn?: string; noElemSpan?: boolean; charId?: number; memospriteName?: string }
 ): { desc: string; tables: Record<string, { name: string; isSame: boolean; values: number[] }> } {
   const descSrc = typeof rawDesc === 'string' ? rawDesc : ''
   const descPlain = normalizeTextInline(stripSrTextForParamName(descSrc))
@@ -865,7 +882,8 @@ function skillDescAndTables(
       varCount: varMap.size,
       outIdx,
       origIdx,
-      tagCn: opts?.tagCn ?? ''
+      tagCn: opts?.tagCn ?? '',
+      memospriteName: opts?.memospriteName
     })
     tables[String(outIdx)] = { name, isSame: false, values }
   }
@@ -1450,6 +1468,11 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
   const skills = isRecord(detail.Skills) ? (detail.Skills as Record<string, unknown>) : {}
   const skillTrees = isRecord(detail.SkillTrees) ? (detail.SkillTrees as Record<string, unknown>) : {}
   const skillIdToPointId = buildSkillIdToPointIdMap(skillTrees)
+  const memospriteName = (() => {
+    const mem = isRecord((detail as any).Memosprite) ? ((detail as any).Memosprite as Record<string, unknown>) : null
+    const n = mem && typeof (mem as any).Name === 'string' ? String((mem as any).Name).trim() : ''
+    return n || ''
+  })()
 
   const talent: Record<string, unknown> = {}
   const talentId: Record<string, SrTalentKey> = {}
@@ -1503,7 +1526,8 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       levelCap,
       tagCn,
       charId,
-      noElemSpan
+      noElemSpan,
+      memospriteName
     })
     const talentIdValue: string | number = srTalentBlockIdStringCompatIds.has(String(charId)) ? String(pointId) : pointId
     talent[key] = {

@@ -165,12 +165,17 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '  - weapon=bow：普攻/非满蓄力箭在游戏里多为物理；但同样只有需要物理桶时才写 phy。满蓄力/元素箭不要写 phy。',
     '  - 其他近战武器：普攻/重击/下落在游戏里多为物理，但基线 calc.js 经常省略 phy（让其走通用 dmg 加成桶）。只有当该角色明确走物理体系（物伤杯/物理拐/物理主C）或标题/表名明确写“物理”时才写 phy；若存在元素附魔/状态，请用 params+buff/check 表达。',
     '- GS 提示：若你在 talent.e 里看到像普攻一样的表名（例如「一段伤害/五段伤害/重击伤害」），通常表示“E状态下普攻倍率被替换”。此时请用 talent=e 的表作为 table，但 key 仍然用 a/a2（以便吃到普攻/重击相关增益）。',
+    '- GS 提示：若你在 talent.q 里看到像普攻一样的表名（例如「一段伤害/五段伤害/重击伤害/下落攻击伤害」），通常表示“Q状态下普攻倍率被替换”。',
+    '  - 若技能描述明确写了“在此状态下的普攻/重击/下落攻击伤害将视为元素爆发伤害”，则这些表仍用 key=q；否则应使用 key=a/a2/a3（对标基线常见的「Q状态·普攻首段」展示行）。',
+    '- GS 提示：如果你选择的 table 在运行时是数组（tableSamples 中为数组），并且你用多条展示行表示不同状态/档位（低/高/0%/100%/点按/长按/低空/高空等），请务必为每条 detail 指定 pick（0-based）选择正确的数组分量；不要让多条行都默认用 [0]。',
     '- GS 提示：如果某个表的 unit（单位提示）是「普通攻击伤害/重击伤害/下落攻击伤害/元素战技伤害/元素爆发伤害」等，通常表示“倍率/增益表”，不是直接技能倍率。',
     '  - 这类表不要直接用于 details 的 dmg(...)。',
     '  - 应在 buffs 中表达：',
     '    - “伤害提升/伤害提高/造成的伤害提升” => *Dmg（例如 qDmg）',
     '    - “倍率提高/倍率提升/系数提高” => *Pct（例如 qPct）',
     '    - 只有明确“造成原本X%/倍率变为X%/改为X%”这类“总倍率变更”才用 *Multi（例如 qMulti）',
+    '    - 若描述包含“下次/下一次/首次”等一次性效果（例如“下次元素战技造成原本300%伤害”），不要生成 *Multi（基线通常忽略一次性倍率，避免轮转建模导致偏差）。',
+    '    - “持续时间延长/冷却时间减少/攻击速度提高/移动速度提高/施加层数/施加效果”等机制不直接改变本次伤害数值：不要误写成 *Dmg/*Pct/*Multi；必要时用 params+details 表达或忽略。',
     '  - 重要：不要在表达式里写 `- 100` 来“换算倍率”。',
     '    - 若表值本身就是“总倍率%”（常见 100~400），请直接输出数字（例如 137.9），本地会自动折算为 Multi 的 delta。',
     '    - 若表值很小（例如 0.3），通常是“每点能量/每层/每次”的系数：应乘上对应的能量/层数（优先用 talent.q["元素能量"] 或 params.num），不要减 100。',
@@ -181,6 +186,7 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '- GS 提示：若 a 表存在明显的“特殊重击/蓄力形态”表名（例如包含「重击·」/「持续伤害」/「蓄力」），请让“重击伤害/重击”条目优先代表该特殊形态，而不是普通「重击伤害」。',
     '- SR key 建议：普攻=a；战技=e；终结技=q；天赋=t（追击等）；可在后面追加逗号标签。',
     '- SR 重要提示：表名含「提高/提升/增加/加成/增伤/抗性穿透/无视防御/防御降低/概率/效果命中/效果抵抗/击破效率/削韧」通常是 buffs/debuff 表，不要把它当作 details 的“伤害倍率表”用于 dmg(...)；应写入 buffs.data（否则会把 buff 当成伤害倍率，面板回归会出现 1.5x~3x 的离群偏差）。',
+    '- SR 例外：表名含「倍率提高/伤害倍率提高/击破倍率提高」通常是“伤害倍率增量”(delta)，用于 details：dmg( baseTable + deltaTable , key )；不要写成 buffs.data 的 qDmg/dmg，也不要写 base*(1+delta)。',
     '  - 例：talent.t["伤害提高"] => buffs: { dmg: talent.t["伤害提高"] }（SR 通常还需要 *100 转为百分数点）。',
     '  - 例：talent.q["抗性穿透提高"] => buffs: { kx: talent.q["抗性穿透提高"] }（并建议用 params.qBuff gating）。',
     '  - 例：talent.q["防御力降低"] => buffs: { enemyDef: talent.q["防御力降低"] }。',
@@ -195,6 +201,7 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '- SR：若可用 talent 表包含 a2/a3/e2/q2 等强化段（或 me/me2/mt/mt1/mt2 等忆灵段），details 至少覆盖每个主要段 1 行（例如「强化终结技总伤害/强化战技伤害/忆灵技伤害」）。',
     '- SR：buffs 中不要写“仅作用于队友/指定我方目标/除自身”的增益（文案含 队友/我方目标/指定我方/其他我方/除自身/为其他），避免污染本角色面板对标。',
     '- SR：attr 里的百分比类字段（cpct/cdmg/stance/effPct/effDef/recharge 等）已经是“百分比数值”，不要再 *100。',
+    '- SR：talent 表中的伤害倍率通常是小数倍率（例如 0.8 表示 80%），dmg(...) 直接使用 talent 值；禁止对 talent 值做 *100 或 /100。',
  	    '- details 可选字段：dmgExpr 用于表达复杂公式（当需要多属性混合、多段合计、或多表/条件分支时）。',
  	    '  - dmgExpr: JS 表达式（不要写 function/箭头函数），必须返回 dmg(...) 的结果对象；可用变量 talent, attr, calc, params, cons, weapon, trees, dmg, toRatio；不要使用 currentTalent（detail 运行时不可用）。',
  	    '  - 重要：dmgExpr 禁止返回裸数字；必须返回 dmg(...)/dmg.basic(...)/dmg.dynamic(...)/heal(...)/shield(...)/reaction(...) 的返回值，或形如 { dmg: xxx, avg: xxx } 的对象。',
@@ -294,11 +301,59 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
 
   // Some LLM endpoints hard-fail on very large prompts. Keep a compact fallback that
   // drops low-signal sections (samples/hints) and compresses table lists.
-  const formatTablesCompact = (arr: string[]): string => {
+  const formatTablesCompact = (talentKey: string, arr: string[]): string => {
     const list = normalizeTableList(arr)
-    const limit = 40
-    const shown = list.slice(0, limit).join(' | ')
-    return list.length > limit ? `${shown} ...(+${list.length - limit})` : shown
+    if (list.length === 0) return ''
+
+    // Keep the compact list short, but prefer *useful* table names (damage/heal/shield + common buff keys)
+    // so the model does not miss core E/Q rows when the table list is long.
+    const limit = 48
+    if (list.length <= limit) return list.join(' | ')
+
+    const tk = String(talentKey || '').trim()
+    const scoreOf = (nameRaw: string): number => {
+      const name = normalizePromptText(String(nameRaw || ''))
+      if (!name) return -999
+
+      let score = 0
+      // Highest signal: output tables (damage/heal/shield/break).
+      if (/(伤害|治疗|回复|护盾|吸收量)/.test(name)) score += 100
+      if (/(击破|超击破|削韧|\bbreak\b)/i.test(name)) score += 90
+
+      // Prefer common core rows.
+      if (/(技能伤害|普攻|普通攻击|战技|终结技|元素战技|元素爆发|追加攻击|追击|反击)/.test(name)) score += 40
+      if (/(合计|总计|总伤|完整)/.test(name) && !/(单次|单段|每次|每段|每跳)/.test(name)) score += 25
+
+      // Keep some buff-only tables (for deterministic buffs derived from tables).
+      if (/(抗性降低|无视|穿透|防御|暴击率|暴击伤害|伤害提高|伤害提升)/.test(name)) score += 18
+
+      // Penalize low-signal utility tables.
+      if (/(冷却|持续时间|能量恢复|回复能量|能量消耗|持续回合|概率|触发几率)/.test(name)) score -= 60
+      if (
+        /(提升|降低|增加|加成)/.test(name) &&
+        !/(伤害提高|伤害提升|治疗提升|护盾提升|暴击率|暴击伤害|抗性降低|无视|穿透)/.test(name)
+      ) {
+        score -= 25
+      }
+
+      // Slight bias towards tables that match the current talent bucket.
+      if (tk === 'a' && /(普攻|普通攻击)/.test(name)) score += 8
+      if (tk === 'e' && /(战技|元素战技)/.test(name)) score += 8
+      if (tk === 'q' && /(终结技|元素爆发)/.test(name)) score += 8
+      if (tk === 't' && /天赋/.test(name)) score += 6
+      if (/^m[et]/.test(tk) && /(忆灵|记忆)/.test(name)) score += 10
+
+      return score
+    }
+
+    const picked = list
+      .map((name, idx) => ({ name, idx, score: scoreOf(name) }))
+      .sort((a, b) => b.score - a.score || a.idx - b.idx)
+      .slice(0, limit)
+      .map((x) => x.name)
+
+    const shown = picked.join(' | ')
+    return `${shown} ...(+${Math.max(0, list.length - picked.length)})`
   }
   const userCompact = [
     `为 miao-plugin 生成 ${input.game === 'gs' ? '原神(GS)' : '星铁(SR)'} 角色 calc.js 的配置计划。只输出 JSON。`,
@@ -329,7 +384,7 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     ...(descLines.length ? ['技能描述摘要：', ...descLines.slice(0, 10), ''] : []),
     ...(buffHintLines.length ? ['Buff 线索：', ...buffHintLines.slice(0, 14), ''] : []),
     '可用表名（严格从这里选）：',
-    ...allowedTalents.map((k) => `- ${k}: ${formatTablesCompact(tables[k] || [])}`),
+    ...allowedTalents.map((k) => `- ${k}: ${formatTablesCompact(k, tables[k] || [])}`),
     ''
   ].join('\n')
 

@@ -240,7 +240,10 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
     element: game === 'gs' ? '雷' : 'shock',
     currentTalent: ''
   })
-  const ctx = mkCtx(100)
+  // SR talent multipliers are mostly ratios (0~2) rather than percent-like numbers. Using 100 here can
+  // false-positive on correct multi-hit/multi-target showcase rows (e.g. "×28 忆质" totals). Keep SR
+  // smaller while still catching obvious x100 unit explosions.
+  const ctx = mkCtx(game === 'sr' ? 10 : 100)
 
   const gsEleOk = new Set([
     // non-reaction markers
@@ -325,14 +328,18 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
     return Number.isFinite(n) ? n : 0
   }
 
-  // Showcase-scale validation only (not real damage). Some correct multi-target / multi-hit showcase rows can
-  // legitimately exceed 5e6 when using our large synthetic talent samples, so keep this bound looser while
-  // still catching obvious x100 unit mistakes (which tend to explode into 1e8+).
-  const MAX_SHOWCASE = 20_000_000
-  const assertShowcaseNum = (n: unknown, where: string): void => {
+  // Showcase-scale validation only (not real damage).
+  //
+  // Notes:
+  // - We validate *inputs* to dmg()/dmg.basic()/dmg.dynamic() more strictly to catch unit mistakes early.
+  // - SR has more "multi-hit / multi-target / full" showcase rows where the final displayed total can be
+  //   large even when each individual hit is reasonable. Allow a looser bound for the final detail return.
+  const MAX_SHOWCASE_CALL = 20_000_000
+  const MAX_SHOWCASE_DETAIL = game === 'sr' ? 60_000_000 : MAX_SHOWCASE_CALL
+  const assertShowcaseNum = (n: unknown, where: string, maxAbs = MAX_SHOWCASE_CALL): void => {
     if (typeof n !== 'number') return
     if (!Number.isFinite(n)) throw new Error(`${where} returned non-finite number`)
-    if (Math.abs(n) > MAX_SHOWCASE) {
+    if (Math.abs(n) > maxAbs) {
       throw new Error(`${where} returned unreasonable showcase value: ${n}`)
     }
   }
@@ -416,8 +423,8 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
         throw new Error(`detail.dmg() returned non-object (${typeof ret})`)
       }
       // Numeric sanity check (showcase-scale only, not real damage).
-      assertShowcaseNum((ret as any).dmg, 'detail.dmg()')
-      assertShowcaseNum((ret as any).avg, 'detail.dmg()')
+      assertShowcaseNum((ret as any).dmg, 'detail.dmg()', MAX_SHOWCASE_DETAIL)
+      assertShowcaseNum((ret as any).avg, 'detail.dmg()', MAX_SHOWCASE_DETAIL)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       throw new Error(`[meta-gen] Generated calc.js invalid detail.dmg(): ${msg}`)

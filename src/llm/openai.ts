@@ -142,6 +142,17 @@ async function fetchWithRetry(
       if (res.ok) return res
       // Retry on 429/5xx (and occasional transient 403 from CDNs/proxies).
       if ([403, 429, 500, 502, 503, 504].includes(res.status) && attempt < retries) {
+        // Some providers return 403 for auth/config errors. Do NOT retry those.
+        if (res.status === 403) {
+          try {
+            const preview = (await res.clone().text()).slice(0, 800)
+            if (/invalid\s+api\s*key/i.test(preview) || /unauthorized/i.test(preview)) {
+              return res
+            }
+          } catch {
+            // Ignore preview failures; fall back to generic retry behavior.
+          }
+        }
         const retryAfter = parseRetryAfterMs(res)
         await sleep(retryAfter ?? backoffMs(attempt))
         continue

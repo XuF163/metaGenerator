@@ -18,6 +18,16 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
   if (input.game === 'gs') {
     const details = Array.isArray(plan.details) ? (plan.details as CalcSuggestDetail[]) : []
     const hasNightByTalent = new Set<TalentKeyGs>()
+    const stripNightTitle = (titleRaw: unknown): string | null => {
+      const t0 = typeof titleRaw === 'string' ? titleRaw.trim() : ''
+      if (!t0) return null
+      if (!/\u591c\u9b42/.test(t0)) return null
+      let t = t0
+      t = t.replace(/\(\s*\u591c\u9b42\s*\)/g, '')
+      t = t.replace(/\u591c\u9b42/g, '')
+      t = t.replace(/\(\s*\)/g, '')
+      return t.trim() || null
+    }
 
     for (const d of details) {
       const tk = (d as any)?.talent
@@ -39,6 +49,9 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         if (kind === 'reaction') continue
 
         const keyRaw = typeof (d as any)?.key === 'string' ? String((d as any).key).trim() : ''
+        // Baseline titles typically do not include "(夜魂)" suffixes; keep the state in dmgKey/params instead.
+        const titleStripped = stripNightTitle((d as any)?.title)
+        if (titleStripped) (d as any).title = titleStripped
         if (!keyRaw) {
           ;(d as any).key = `${tk},nightsoul`
           continue
@@ -851,20 +864,57 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     // easily mis-detect HP/DEF/EM scaling and explode damage numbers (e.g. mixed-scaling skills where only one
     // sub-table uses HP/DEF/EM).
     const hasPerTableHint = !!unitNorm || !!textNorm
-    const baseInferred =
+    let baseInferred =
       unitBase ||
       textBase ||
       ((input.game === 'gs' && !hasPerTableHint) || looksLikePlainPctUnit || looksLikePlainPctTextSample
         ? 'atk'
         : descBase) ||
       'atk'
+    // SR: Remembrance/memosprite rows (me/mt) are commonly HP-based, and upstream tables often lack explicit
+    // per-table unit hints. When we see a Remembrance kit, bias me/mt to HP to avoid generating `dmg(...)`
+    // (ATK-based) and collapsing memosprite showcase numbers.
+    if (input.game === 'sr' && kind === 'dmg' && !hasPerTableHint) {
+      const tk = String(talent || '').trim()
+      const isMem = /^m[et]/.test(tk)
+      if (isMem) {
+        const path = normalizePromptText(input.weapon)
+        if (/记忆/.test(path) && baseInferred === 'atk') baseInferred = 'hp'
+      }
+    }
+    // SR: Basic attacks are ATK-scaling for the vast majority of kits. Some official descriptions mention HP/DEF
+    // for other parts of the kit, and we often lack per-table unit hints. To avoid exploding/imploding A-dmg by
+    // over-trusting broad descriptions, only allow non-ATK scaling for talent.a when the path strongly suggests it
+    // (e.g. Preservation/Abundance/Memory) OR when the basic-attack description itself strongly indicates HP/DEF scaling.
+    if (input.game === 'sr' && kind === 'dmg' && talent === 'a' && !hasPerTableHint) {
+      const path = normalizePromptText(input.weapon)
+      const descA = normalizePromptText((input.talentDesc as any)?.[talent])
+      const strongNonAtkFromDesc =
+        !!descA &&
+        /伤害/.test(descA) &&
+        !/(治疗|护盾|回复)/.test(descA) &&
+        /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
+      const allowNonAtk = strongNonAtkFromDesc || /(存护|丰饶|记忆)/.test(path)
+      if (!allowNonAtk && baseInferred !== 'atk') baseInferred = 'atk'
+    }
     // SR: allow validated plan.stat overrides for HP/DEF-scaling kits.
     // (Tables often lack per-table unit markers; relying only on description heuristics can still miss.)
     const statOverrideRaw = typeof (d as any).stat === 'string' ? String((d as any).stat).trim().toLowerCase() : ''
-    const statOverride =
+    let statOverride =
       input.game === 'sr' && kind === 'dmg' && (statOverrideRaw === 'hp' || statOverrideRaw === 'def' || statOverrideRaw === 'atk')
         ? statOverrideRaw
         : ''
+    if (input.game === 'sr' && kind === 'dmg' && talent === 'a' && !hasPerTableHint) {
+      const path = normalizePromptText(input.weapon)
+      const descA = normalizePromptText((input.talentDesc as any)?.[talent])
+      const strongNonAtkFromDesc =
+        !!descA &&
+        /伤害/.test(descA) &&
+        !/(治疗|护盾|回复)/.test(descA) &&
+        /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
+      const allowNonAtk = strongNonAtkFromDesc || /(存护|丰饶|记忆)/.test(path)
+      if (!allowNonAtk && statOverride && statOverride !== 'atk') statOverride = ''
+    }
     const base = (statOverride || baseInferred) as 'atk' | 'hp' | 'def' | 'mastery'
     const useBasic = base !== 'atk'
 
@@ -1105,12 +1155,80 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     if (typeof d.talent === 'string' && d.talent) return d.talent
     return ''
   }
-  const firstKeyIdx = plan.details.findIndex((d) => !!detailKey(d))
-  const fallbackIdx = firstKeyIdx >= 0 ? firstKeyIdx : 0
-  const defDmgKey =
-    (plan.defDmgKey && plan.defDmgKey.trim()) || detailKey(plan.details[fallbackIdx]) || 'e'
-  const defDmgIdxRaw = plan.details.findIndex((d) => detailKey(d) === defDmgKey)
-  const defDmgIdx = defDmgIdxRaw >= 0 ? defDmgIdxRaw : fallbackIdx
+
+  // Choose a stable default damage row (defDmgIdx) that is closer to baseline behavior.
+  // NOTE: baseline often points defDmgIdx at a "总伤/完整/合计" style row (not the first row of a key bucket),
+  // and SR Memory kits typically use memosprite totals as the default showcase.
+  const detailsArr = Array.isArray(plan.details) ? (plan.details as CalcSuggestDetail[]) : []
+  const validIdxs: number[] = []
+  for (let i = 0; i < detailsArr.length; i++) {
+    if (detailKey(detailsArr[i])) validIdxs.push(i)
+  }
+  const scoreAsDefault = (d: CalcSuggestDetail, idx: number): number => {
+    const title = normalizePromptText((d as any)?.title)
+    const kind = typeof (d as any)?.kind === 'string' ? String((d as any).kind).trim().toLowerCase() : 'dmg'
+    const talent = typeof (d as any)?.talent === 'string' ? String((d as any).talent).trim() : ''
+    const hasParams = (() => {
+      const p: any = (d as any)?.params
+      return p && typeof p === 'object' && !Array.isArray(p) && Object.keys(p).length > 0
+    })()
+
+    let s = 0
+    if (kind === 'dmg') s += 100
+    else if (kind === 'heal' || kind === 'shield') s += 35
+
+    const isTotal = /(合计|总计|总伤|完整)/.test(title) && !/(单次|单段|每次|每段|每跳)/.test(title)
+    if (isTotal) s += 30
+    if (hasParams) s += 6
+
+    if (input.game === 'gs') {
+      if (talent === 'q') s += 14
+      else if (talent === 'e') s += 8
+      else if (talent === 'a') s -= 4
+    } else {
+      // sr
+      if (/^m[et]\d*$/.test(talent)) s += 18
+      else if (talent === 'q') s += 10
+      else if (talent === 'e') s += 6
+      else if (talent === 'a') s -= 2
+    }
+
+    // Prefer earlier rows when the score ties (stable ordering).
+    return s * 1000 - idx
+  }
+  const pickBestIdx = (idxs: number[]): number | null => {
+    let bestIdx: number | null = null
+    let bestScore = Number.NEGATIVE_INFINITY
+    for (const idx of idxs) {
+      const d = detailsArr[idx]
+      if (!d) continue
+      const sc = scoreAsDefault(d, idx)
+      if (sc > bestScore) {
+        bestScore = sc
+        bestIdx = idx
+      }
+    }
+    return bestIdx
+  }
+
+  const prefKey = typeof plan.defDmgKey === 'string' ? plan.defDmgKey.trim() : ''
+  const idxsByPref = prefKey ? validIdxs.filter((i) => detailKey(detailsArr[i]) === prefKey) : []
+
+  // SR Memory kits: prefer a memosprite "总伤/完整" row as default showcase when present.
+  const srMemTotalIdxs =
+    input.game === 'sr'
+      ? validIdxs.filter((i) => {
+          const d: any = detailsArr[i]
+          const tk = typeof d?.talent === 'string' ? String(d.talent).trim() : ''
+          if (!/^m[et]\d*$/.test(tk)) return false
+          const title = normalizePromptText(d?.title)
+          return /(合计|总计|总伤|完整)/.test(title) && !/(单次|单段|每次|每段|每跳)/.test(title)
+        })
+      : []
+
+  const defDmgIdx =
+    pickBestIdx(srMemTotalIdxs) ?? pickBestIdx(idxsByPref) ?? pickBestIdx(validIdxs) ?? (detailsArr.length ? 0 : 0)
+  const defDmgKey = detailKey(detailsArr[defDmgIdx]) || prefKey || detailKey(detailsArr[0]) || 'e'
 
   const isIdent = (k: string): boolean => /^[$A-Z_][0-9A-Z_$]*$/i.test(k)
   const renderProp = (k: string): string => (isIdent(k) ? k : jsString(k))

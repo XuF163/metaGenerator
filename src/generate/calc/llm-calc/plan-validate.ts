@@ -19,9 +19,18 @@ import {
   uniq
 } from './utils.js'
 import { pickDamageTable } from './heuristic.js'
+import { rewriteGsAdditiveCoeffDmgExpr } from './plan-validate/gs-dmgexpr-fixup.js'
+import { rewriteGsDmgExprFixArrayDmgCalls } from './plan-validate/gs-dmgexpr-array-call-fixup.js'
+import { rewriteDmgExprRemoveCritExpectation } from './plan-validate/dmgexpr-crit-fixup.js'
+import { applyGsBuffFilterTowardsBaseline } from './plan-validate/gs-buff-filter.js'
+import { applyGsArrayVariantPicksFromTitles } from './plan-validate/gs-array-pick.js'
+import { applyGsBurstAltAttackKeyMapping } from './plan-validate/gs-qstate.js'
 import { applyGsPostprocess } from './plan-validate/gs-postprocess.js'
+import { normalizeGsDetailTitlesTowardsBaseline } from './plan-validate/gs-title-normalize.js'
 import { normalizeKind, normalizeStat } from './plan-validate/normalize.js'
+import { rewriteSrDeltaMultiplierIncreaseExprs } from './plan-validate/sr-dmgexpr-fixup.js'
 import { applySrPostprocess } from './plan-validate/sr-postprocess.js'
+import { applySrBuffPostprocess } from './plan-validate/sr-buff-postprocess.js'
 
 export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): CalcSuggestResult {
   const tables: Record<string, string[]> = {}
@@ -80,6 +89,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   const isSafeExpr = (expr: string): boolean => {
     const s = expr.trim()
     if (!s) return false
+    // Disallow raw escapes: the expression is embedded as JS source, not a string literal.
+    if (/\\/.test(s)) return false
     // No statement separators / blocks.
     if (/[;{}]/.test(s)) return false
     // No comments (can break generated JS).
@@ -119,6 +130,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   const isSafeDmgExpr = (expr: string): boolean => {
     const s = expr.trim()
     if (!s) return false
+    // Disallow raw escapes: the expression is embedded as JS source, not a string literal.
+    if (/\\/.test(s)) return false
     // No statement separators.
     if (/[;]/.test(s)) return false
     // No comments (can break generated JS).
@@ -936,6 +949,10 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         deltaTable
       )}], ${keyLit}${eleLit})`
     }
+
+    // Also fix a common LLM misread where the delta table is treated as a percent increase:
+    // `base * (1 + delta)` should be `base + delta` for "倍率提高" tables.
+    rewriteSrDeltaMultiplierIncreaseExprs(details)
   }
 
   // SR: DOT detonation patterns (e.g. "引爆持续伤害").
@@ -1205,8 +1222,28 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       //   certainly missing the scale stat multiplication (1000x too small); drop dmgExpr to fall back to
       //   deterministic rendering.
       if (typeof (d as any).dmgExpr === 'string') {
-        const exprRaw = ((d as any).dmgExpr as string).trim()
-        if (exprRaw) {
+        let exprRaw = ((d as any).dmgExpr as string).trim()
+          if (exprRaw) {
+          if (input.game === 'gs') {
+            const fixed = rewriteGsAdditiveCoeffDmgExpr(exprRaw, tables)
+            if (fixed && fixed !== exprRaw) {
+              ;(d as any).dmgExpr = fixed
+              exprRaw = fixed
+            }
+
+            const fixedArray = rewriteGsDmgExprFixArrayDmgCalls(exprRaw, input)
+            if (fixedArray && fixedArray !== exprRaw) {
+              ;(d as any).dmgExpr = fixedArray
+              exprRaw = fixedArray
+            }
+          }
+
+          const critFixed = rewriteDmgExprRemoveCritExpectation(exprRaw)
+          if (critFixed && critFixed !== exprRaw) {
+            ;(d as any).dmgExpr = critFixed
+            exprRaw = critFixed
+          }
+
           if (typeof d.key === 'string' && d.key.includes(',')) {
             const want = d.key.trim()
             const baseKey = want.split(',')[0]?.trim() || ''
@@ -2155,7 +2192,10 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       return null
     })()
 
-    const isBreakRatioTable = (t: string): boolean => /击破伤害比例/.test(t) && !/超击破/.test(t)
+    const isBreakRatioTable = (t: string): boolean =>
+      (/^(击破伤害比例|击破伤害)$/.test(String(t || '').trim()) ||
+        (/击破伤害/.test(String(t || '').trim()) && !/(提高|提升|增加|降低|减少)/.test(String(t || '').trim()))) &&
+      !/超击破/.test(String(t || '').trim())
     const isSuperBreakRatioTable = (t: string): boolean => /超击破伤害比例/.test(t)
 
     const ratioExprOf = (talent: TalentKey, tableName: string): string => {
@@ -2286,7 +2326,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         ...(typeof d.cons === 'number' ? { cons: d.cons } : {}),
         ...(d.params ? { params: d.params } : {}),
         ...(d.check ? { check: d.check } : {}),
-        dmgExpr: `({ avg: (reaction(${jsString(reactionId)}).avg || 0) * (${ratioExpr}) * ${row.coef} })`
+        dmgExpr: `({ avg: (reaction(${jsString(reactionId)}).avg || 0) / 0.9 * (${ratioExpr}) * ${row.coef} })`
       })
       details.splice(idx, 1, ...toughnessRows.map(mk))
     }
@@ -2295,42 +2335,60 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       let baseTitle = d.title || '超击破伤害'
       const ratio = ratioExpr && ratioExpr.trim() ? ratioExpr.trim() : '1'
 
-      const inferTalent = (): SrCoreTalent | null => {
-        const tk0 = typeof d.talent === 'string' ? String(d.talent).trim() : ''
-        const tk = (tk0.replace(/\d+$/, '') as SrCoreTalent) || ''
-        if (tk === 'a' || tk === 'e' || tk === 'q' || tk === 't') return tk
-        return inferTalentFromTitle(baseTitle) as any
+      const tkRaw = typeof d.talent === 'string' ? String(d.talent).trim() : ''
+      const coreFromRaw = (tkRaw.replace(/\d+$/, '') as SrCoreTalent) || ''
+      const inferCoreTalent = (): SrCoreTalent | null => {
+        if (coreFromRaw === 'a' || coreFromRaw === 'e' || coreFromRaw === 'q' || coreFromRaw === 't') return coreFromRaw
+        return (inferTalentFromTitle(baseTitle) as any) || null
       }
-      const tk = inferTalent()
-      if (tk) {
-        const tNorm = normalizePromptText(baseTitle)
-        const hasPrefix = /^(普攻|战技|终结技|天赋|秘技)/.test(tNorm)
-        if (!hasPrefix && /超击破/.test(tNorm)) {
-          const prefix = tk === 'a' ? '普攻' : tk === 'e' ? '战技' : tk === 'q' ? '终结技' : tk === 't' ? '天赋' : ''
-          if (prefix) baseTitle = `${prefix}·${baseTitle}`
-        }
+      const coreTk = inferCoreTalent()
+      const isEnhanced = Boolean(tkRaw && /^([aeq])\d+$/.test(tkRaw) && tkRaw !== coreFromRaw)
+
+      const tNorm = normalizePromptText(baseTitle)
+      const hasPrefix = /^(强化普攻|强化战技|强化终结技|普攻|战技|终结技|天赋|秘技)/.test(tNorm)
+      if (!hasPrefix && /超击破/.test(tNorm)) {
+        const prefix =
+          isEnhanced && coreFromRaw === 'a'
+            ? '强化普攻'
+            : isEnhanced && coreFromRaw === 'e'
+              ? '强化战技'
+              : isEnhanced && coreFromRaw === 'q'
+                ? '强化终结技'
+                : coreTk === 'a'
+                  ? '普攻'
+                  : coreTk === 'e'
+                    ? '战技'
+                    : coreTk === 'q'
+                      ? '终结技'
+                      : coreTk === 't'
+                        ? '天赋'
+                        : ''
+        if (prefix) baseTitle = `${prefix}·${baseTitle}`
       }
-      const hasTable = (talentKey: SrCoreTalent, tableName: string): boolean => {
+
+      const hasTable = (talentKey: string, tableName: string): boolean => {
         const list = (tables as any)?.[talentKey]
         return Array.isArray(list) && list.includes(tableName)
       }
-      const costSumExpr = tk && hasTable(tk, '削韧') ? `talent.${tk}[${jsString('削韧')}]` : '1'
-      const costUnitExpr =
-        tk && hasTable(tk, '削韧(单次)') ? `talent.${tk}[${jsString('削韧(单次)')}]` : costSumExpr
+
+      const tkTables =
+        tkRaw && hasTable(tkRaw, '削韧') ? tkRaw : coreTk && hasTable(coreTk, '削韧') ? coreTk : ''
+      const costSumExpr = tkTables ? `talent.${tkTables}[${jsString('削韧')}]` : '1'
+      const costUnitExpr = tkTables && hasTable(tkTables, '削韧(单次)') ? `talent.${tkTables}[${jsString('削韧(单次)')}]` : costSumExpr
 
       let costExpr = costSumExpr
       // Trace-based first-hit stance bonus (e.g. "第一次伤害的削韧值额外提高100%").
       for (const [treeKey, bonus] of superBreakFirstHitStanceBonusByTree.entries()) {
-        if (!tk || bonus.talent !== tk) continue
+        if (!coreTk || bonus.talent !== coreTk) continue
         const add = `(${costUnitExpr}) * (${Number((bonus.pct / 100).toFixed(6))})`
         costExpr = `(${costExpr}) + (trees[${jsString(treeKey)}] ? (${add}) : 0)`
       }
       // Eidolon: extra hit count (conservatively model as +1 unit toughness cost).
-      if (tk === 'e' && superBreakExtraCostConsE && superBreakExtraCostConsE >= 1 && superBreakExtraCostConsE <= 6) {
+      if (coreTk === 'e' && superBreakExtraCostConsE && superBreakExtraCostConsE >= 1 && superBreakExtraCostConsE <= 6) {
         costExpr = `(${costExpr}) + (cons >= ${superBreakExtraCostConsE} ? (${costUnitExpr}) : 0)`
       }
       // Trace-based extra hit count (conservatively model as +1 unit toughness cost).
-      if (tk === 'e' && superBreakExtraCostTreeE.size) {
+      if (coreTk === 'e' && superBreakExtraCostTreeE.size) {
         for (const treeKey of superBreakExtraCostTreeE) {
           costExpr = `(${costExpr}) + (trees[${jsString(treeKey)}] ? (${costUnitExpr}) : 0)`
         }
@@ -2348,7 +2406,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         title: baseTitle,
         kind: 'reaction',
         reaction: 'superBreak',
-        ...(tk ? { talent: tk } : d.talent ? { talent: d.talent } : {}),
+        ...(tkRaw ? { talent: tkRaw } : coreTk ? { talent: coreTk } : d.talent ? { talent: d.talent } : {}),
         ...(typeof d.cons === 'number' ? { cons: d.cons } : {}),
         ...(d.params ? { params: d.params } : {}),
         ...(d.check ? { check: d.check } : {}),
@@ -2415,9 +2473,9 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (kind !== 'reaction') {
         const tk = d.talent
         const tableName = typeof d.table === 'string' ? d.table.trim() : ''
-        if (!tk || !tableName) continue
+        if (!tk) continue
 
-        if (isBreakRatioTable(tableName) && elemBreak) {
+        if (tableName && isBreakRatioTable(tableName) && elemBreak) {
           if (!wantsBreakDetails) {
             details.splice(i, 1)
             continue
@@ -2427,7 +2485,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
           continue
         }
 
-        if (isSuperBreakRatioTable(tableName)) {
+        if (tableName && isSuperBreakRatioTable(tableName)) {
           if (!wantsSuperBreakDetails) {
             details.splice(i, 1)
             continue
@@ -2435,6 +2493,48 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
           const ratioExpr = ratioExprOf(tk, tableName)
           patchSuperBreakDetailAt(i, d, ratioExpr)
           continue
+        }
+
+        // Title-driven break rows (some models express break damage via dmgExpr and omit `table`).
+        // If the kit wants break details and the title clearly says "击破伤害", enforce reaction-style formulas.
+        if (elemBreak) {
+          const titleN = normalizePromptText((d as any).title || '')
+          if (/击破伤害/.test(titleN) && !/受到/.test(titleN)) {
+            if (!wantsBreakDetails) {
+              details.splice(i, 1)
+              continue
+            }
+            const allowed = (tables as any)?.[tk] as string[] | undefined
+            const list = Array.isArray(allowed) ? allowed : []
+            const baseTable = list.includes('击破伤害比例')
+              ? '击破伤害比例'
+              : list.includes('击破伤害')
+                ? '击破伤害'
+                : ''
+            if (!baseTable) continue
+            let ratioExpr = ratioExprOf(tk, baseTable)
+
+            const incTable = list.includes('击破倍率提高')
+              ? '击破倍率提高'
+              : list.includes('伤害倍率提高')
+                ? '伤害倍率提高'
+                : ''
+            if (incTable) {
+              const p = (d as any).params
+              const stackExpr =
+                p && typeof p === 'object' && !Array.isArray(p) && typeof (p as any).tStacks === 'number'
+                  ? 'params.tStacks'
+                  : p && typeof p === 'object' && !Array.isArray(p) && typeof (p as any).stacks === 'number'
+                    ? 'params.stacks'
+                    : ''
+              if (stackExpr) {
+                ratioExpr = `(${ratioExpr}) + (${ratioExprOf(tk, incTable)}) * (${stackExpr})`
+              }
+            }
+
+            patchBreakDetailAt(i, d, elemBreak, ratioExpr)
+            continue
+          }
         }
         continue
       }
@@ -2523,26 +2623,28 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       }
 
       // 2) Ensure canonical A/E superBreak rows exist when the corresponding talents have toughness tables.
-      const hasStanceTable = (tk: SrCoreTalent): boolean => {
+      const hasStanceTable = (tk: string): boolean => {
         const list = (tables as any)?.[tk]
         return Array.isArray(list) && list.includes('削韧')
       }
-      const hasSuperBreakTalent = (tk: SrCoreTalent): boolean =>
-        details.some((d: any) => normalizeKind(d?.kind) === 'reaction' && d?.reaction === 'superBreak' && String(d?.talent || '').replace(/\d+$/, '') === tk)
+      const hasSuperBreakTalent = (tk: string): boolean =>
+        details.some((d: any) => normalizeKind(d?.kind) === 'reaction' && d?.reaction === 'superBreak' && String(d?.talent || '').trim() === tk)
 
-      const ensure = (tk: SrCoreTalent, title: string): void => {
+      const ensure = (tk: string, title: string, preferCore: SrCoreTalent): void => {
         if (!hasStanceTable(tk)) return
         if (hasSuperBreakTalent(tk)) return
-        const prefer = tk as any
+        const prefer = preferCore as any
         const src = findRatioSource(prefer, '超击破伤害比例')
         const ratioExpr = src ? ratioExprOf(src as any, '超击破伤害比例') : '1'
         const idx = details.length
-        details.push({ title, kind: 'reaction', reaction: 'superBreak', talent: tk, params: { q: true } })
+        details.push({ title, kind: 'reaction', reaction: 'superBreak', talent: tk as any, params: { q: true } })
         patchSuperBreakDetailAt(idx, details[idx]!, ratioExpr)
       }
 
-      ensure('a', '普攻·超击破伤害')
-      ensure('e', '战技·超击破伤害')
+      ensure('a', '普攻·超击破伤害', 'a')
+      ensure('e', '战技·超击破伤害', 'e')
+      ensure('a2', '强化普攻·超击破伤害', 'a')
+      ensure('e2', '强化战技·超击破伤害', 'e')
 
       while (details.length > 20) details.pop()
     }
@@ -3785,8 +3887,18 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     if (qI?.enemyDef) {
       pushIfMissing('推导：终结技防御力降低[enemyDef]%', 'enemyDef', `talent.q[${jsString(qI.enemyDef)}] * 100`)
     }
+    if (qI?.enemydmg) {
+      pushIfMissing(
+        '推导：终结技使敌方受到伤害提高[enemydmg]%',
+        'enemydmg',
+        `talent.q[${jsString(qI.enemydmg)}] * 100`
+      )
+    }
 
     const eI = srIntentTableByTalent.get('e')
+    if (eI?.enemyDef) {
+      pushIfMissing('推导：战技防御力降低[enemyDef]%', 'enemyDef', `talent.e[${jsString(eI.enemyDef)}] * 100`)
+    }
     if (eI?.enemydmg) {
       pushIfMissing('推导：战技使敌方受到伤害提高[enemydmg]%', 'enemydmg', `talent.e[${jsString(eI.enemydmg)}] * 100`)
     }
@@ -3794,6 +3906,13 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     const tI = srIntentTableByTalent.get('t')
     if (tI?.enemyDef) {
       pushIfMissing('推导：天赋防御力降低[enemyDef]%', 'enemyDef', `talent.t[${jsString(tI.enemyDef)}] * 100`)
+    }
+    if (tI?.enemydmg) {
+      pushIfMissing(
+        '推导：天赋使敌方受到伤害提高[enemydmg]%',
+        'enemydmg',
+        `talent.t[${jsString(tI.enemydmg)}] * 100`
+      )
     }
 
     // SR: Derive common self buffs from table names when LLM misses them.
@@ -3809,15 +3928,51 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       return ''
     }
 
+    const hasMemKit = Object.keys(tables || {}).some((k) => /^m[et]\d*$/.test(String(k || '').trim()))
+    const escapeRe = (s: string): string => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const parseSpriteName = (textRaw: unknown): string => {
+      const s = normalizePromptText(textRaw)
+      if (!s || !/召唤忆灵/.test(s)) return ''
+      const m =
+        /召唤忆灵[^“「『"《》]{0,20}(?:“([^”]{1,12})”|「([^」]{1,12})」|『([^』]{1,12})』|"([^"]{1,12})"|《([^》]{1,12})》)/.exec(
+          s
+        )
+      return String(m?.[1] || m?.[2] || m?.[3] || m?.[4] || m?.[5] || '').trim()
+    }
+    const parseSpriteNameLoose = (textRaw: unknown): string => {
+      const s = normalizePromptText(textRaw)
+      if (!s) return ''
+      const m = /忆灵\s*([^\s，。、；：:「」『』“”《》]{1,12})/.exec(s)
+      return String(m?.[1] || '').trim()
+    }
+    const spriteName = hasMemKit
+      ? parseSpriteName((input.talentDesc as any)?.z) ||
+        parseSpriteName((input.talentDesc as any)?.q) ||
+        parseSpriteNameLoose((input.talentDesc as any)?.t) ||
+        parseSpriteNameLoose((input.talentDesc as any)?.z) ||
+        parseSpriteNameLoose((input.talentDesc as any)?.q) ||
+        ''
+      : ''
+
     const srPickBuffKeyFromTableName = (talentKey: TalentKey, tableNameRaw: string): string | null => {
-      const tn = normalizePromptText(tableNameRaw)
+      const tableName = String(tableNameRaw || '').trim()
+      const tn = normalizePromptText(tableName)
       if (!tn) return null
       // Non-damage affecting / ambiguous mechanics: ignore.
       if (/(基础概率|概率|几率|效果命中|效果抵抗|命中|抵抗|击破效率|削韧|持续时间|回合|次数|层数上限)/.test(tn)) return null
+      // Delta talent multiplier tables are additive to the base multiplier (handled in details as base+delta).
+      // Deriving them into `*Dmg` buffs would massively inflate damage and/or double-count.
+      if (/(伤害)?倍率(提高|提升|增加)/.test(tn)) return null
 
       const tkBase = String(talentKey || '')
         .trim()
         .replace(/\d+$/, '') as TalentKey
+
+      // Prefer intent inferred from placeholder contexts (more reliable than generic table names like "技能伤害/伤害提高").
+      const intent = srIntentTableByTalent.get(talentKey) || srIntentTableByTalent.get(tkBase)
+      if (intent?.enemyDef && intent.enemyDef === tableName) return 'enemyDef'
+      if (intent?.enemydmg && intent.enemydmg === tableName) return 'enemydmg'
+
       const scope = (
         baseKey: 'cpct' | 'cdmg' | 'dmg'
       ): 'cpct' | 'cdmg' | 'dmg' | 'aCpct' | 'eCpct' | 'qCpct' | 'meCpct' | 'mtCpct' | 'aCdmg' | 'eCdmg' | 'qCdmg' | 'meCdmg' | 'mtCdmg' | 'aDmg' | 'eDmg' | 'qDmg' | 'meDmg' | 'mtDmg' => {
@@ -3854,6 +4009,14 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         // "使我方全体造成的伤害提高..." (Robin E). Baseline usually models these as global `dmg`,
         // not `eDmg/qDmg`, so we opt into global when the description is explicit.
         const desc0 = normalizePromptText((input.talentDesc as any)?.[tkBase])
+        // Remembrance kits: some passive (`t`) tables apply only to the memosprite, but the table name is generic
+        // (e.g. "伤害提高"). Use the memosprite name in the official description as a conservative scope signal.
+        if (hasMemKit && spriteName && tkBase === 't' && desc0) {
+          const re = new RegExp(
+            `${escapeRe(spriteName)}.{0,18}(?:造成|造成的).{0,18}伤害.{0,18}(?:提高|提升|增加|加成|增伤)`
+          )
+          if (re.test(desc0)) return 'meDmg'
+        }
         const isTeamAll =
           !!desc0 &&
           /(我方全体|全体|队友|其他我方|除自身|为其他)/.test(desc0) &&
@@ -5504,11 +5667,11 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         }
 
         for (const line0 of hintLines) {
-          if (!/^琚姩锛?/.test(line0)) continue
+          if (!/^被动：/.test(line0)) continue
           const line = normalizePromptText(line0)
           if (!line) continue
-          if (!/(鍏冪礌绮鹃€殀绮鹃€?|mastery)/i.test(line)) continue
-          if (!/姣忕偣/.test(line) || !/(鑷冲|鏈€澶氾紝?|鏈€澶氥€?)/.test(line)) continue
+          if (!/(元素精通|精通|mastery)/i.test(line)) continue
+          if (!/(每点|每\\s*\\d+\\s*点)/.test(line) || !/(至多|最多|最大|上限)/.test(line)) continue
 
           const tk = inferTalentKey(line)
           if (!tk) continue
@@ -5519,7 +5682,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
             const k = keyOf(tk, 'dmg')
             if (!existing.has(k)) {
               const expr = `Math.min(${dmg.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${dmg.per})`
-              buffsOut.push({ title: `琚姩锛氬熀浜庡厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              buffsOut.push({ title: `被动：基于元素精通提高[${k}]%`, sort: 9, data: { [k]: expr } as any })
               existing.add(k)
             }
           }
@@ -5529,7 +5692,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
             const k = keyOf(tk, 'cpct')
             if (!existing.has(k)) {
               const expr = `Math.min(${cpct.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${cpct.per})`
-              buffsOut.push({ title: `琚姩锛氬熀浜庅厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              buffsOut.push({ title: `被动：基于元素精通提高[${k}]%`, sort: 9, data: { [k]: expr } as any })
               existing.add(k)
             }
           }
@@ -5539,7 +5702,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
             const k = keyOf(tk, 'cdmg')
             if (!existing.has(k)) {
               const expr = `Math.min(${cdmg.cap}, Math.max(calc(attr.mastery) - ${th}, 0) * ${cdmg.per})`
-              buffsOut.push({ title: `琚姩锛氬熀浜庅厓绱犵簿閫氭彁楂?{${k}}]%`, sort: 9, data: { [k]: expr } as any })
+              buffsOut.push({ title: `被动：基于元素精通提高[${k}]%`, sort: 9, data: { [k]: expr } as any })
               existing.add(k)
             }
           }
@@ -6353,6 +6516,14 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     while (details.length > 20) details.pop()
   }
 
+  // GS: infer missing `pick` for non-slash variant array tables (e.g. BondOfLife low/high variants).
+  applyGsArrayVariantPicksFromTitles(input, details)
+
+  // GS: normalize some common titles towards baseline conventions.
+  if (input.game === 'gs') {
+    normalizeGsDetailTitlesTowardsBaseline(details)
+  }
+
   // GS: If the model picked a `...2` multi-hit table like "[pct, times]" (text sample contains "*N"),
   // but the baseline-style total table without trailing "2" exists, prefer the total table for charged-attack rows.
   //
@@ -6790,18 +6961,30 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     deriveSrConsFromBuffHints(input.buffHints, details, buffsOut)
     patchSrBuffGateFieldsFromTitles(buffsOut)
     patchSrNonAtkDmgExprCalls(input, details)
+    patchSrRedundantDmgExprMultipliersFromDmgBuffs(details, buffsOut)
   }
 
   // GS: If the character has clear EM/reaction hints but the plan omitted all reaction rows,
   // add a single representative transformative reaction row to avoid "too-low maxAvg" regressions
   // (e.g. electro EM triggers commonly benchmarked by hyperBloom).
   if (input.game === 'gs') {
+    applyGsBurstAltAttackKeyMapping(input, details)
     applyGsPostprocess({ input, tables, details, okReactions, gsBuffIdsOut })
   }
 
   // SR: normalize multi-target titles and fill a few baseline-like showcase rows (generic, no per-character hardcode).
   if (input.game === 'sr') {
     applySrPostprocess({ input, tables, details })
+    applySrBuffPostprocess({ input, tables, buffs: buffsOut })
+    // Final SR fixup: ensure "倍率提高" deltas are treated as additive (base + delta), including rows
+    // created by SR post-processing.
+    rewriteSrDeltaMultiplierIncreaseExprs(details)
+  }
+
+  // GS: Drop one-shot ("next cast") multiplier buffs to stay closer to baseline semantics.
+  // Baseline commonly omits these to avoid rotation/state modeling (prevents ~3x regressions).
+  if (input.game === 'gs') {
+    applyGsBuffFilterTowardsBaseline(input, buffsOut)
   }
 
   // GS: If we use any reaction variants, ensure mastery is present in mainAttr (baseline pattern).
@@ -7074,6 +7257,97 @@ function patchSrNonAtkDmgExprCalls(input: CalcSuggestInput, details: CalcSuggest
   }
 }
 
+function patchSrRedundantDmgExprMultipliersFromDmgBuffs(details: CalcSuggestDetail[], buffs: CalcSuggestBuff[]): void {
+  try {
+    const byCons = new Map<number, Map<string, number[]>>()
+    for (const b of buffs) {
+      const consRaw = (b as any)?.cons
+      const cons = typeof consRaw === 'number' && Number.isFinite(consRaw) ? Math.trunc(consRaw) : 0
+      if (!(cons >= 1 && cons <= 6)) continue
+
+      const data = (b as any)?.data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+
+      for (const [k0, v] of Object.entries(data)) {
+        const k = String(k0 || '').trim()
+        if (!k) continue
+        if (!(k === 'dmg' || /Dmg$/.test(k))) continue
+        if (typeof v !== 'number' || !Number.isFinite(v)) continue
+
+        let m = byCons.get(cons)
+        if (!m) {
+          m = new Map<string, number[]>()
+          byCons.set(cons, m)
+        }
+        const arr = m.get(k) || []
+        arr.push(v)
+        m.set(k, arr)
+      }
+    }
+
+    if (byCons.size === 0) return
+
+    const pickBucketKeys = (talentRaw: unknown): string[] => {
+      const tk0 = typeof talentRaw === 'string' ? String(talentRaw).trim() : ''
+      const tk = tk0.replace(/\d+$/, '')
+      if (!tk) return ['dmg']
+      if (tk.startsWith('me')) return ['meDmg', 'dmg']
+      if (tk.startsWith('mt')) return ['mtDmg', 'dmg']
+      if (tk.startsWith('a')) return ['aDmg', 'dmg']
+      if (tk.startsWith('e')) return ['eDmg', 'dmg']
+      if (tk.startsWith('q')) return ['qDmg', 'dmg']
+      if (tk.startsWith('t')) return ['tDmg', 'dmg']
+      if (tk.startsWith('dot')) return ['dotDmg', 'dmg']
+      if (tk.startsWith('break')) return ['breakDmg', 'dmg']
+      return ['dmg']
+    }
+
+    const refMulRe =
+      /\btalent\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(['"])(.*?)\2\s*\]\s*\*\s*([0-9]+(?:\.[0-9]+)?)\b/g
+
+    const close = (a: number, b: number): boolean => Math.abs(a - b) <= 0.5
+
+    for (const d of details) {
+      const consRaw = (d as any)?.cons
+      const cons = typeof consRaw === 'number' && Number.isFinite(consRaw) ? Math.trunc(consRaw) : 0
+      if (!(cons >= 1 && cons <= 6)) continue
+      const m = byCons.get(cons)
+      if (!m) continue
+
+      const expr0 = typeof (d as any)?.dmgExpr === 'string' ? String((d as any).dmgExpr).trim() : ''
+      if (!expr0) continue
+
+      const keys = pickBucketKeys((d as any)?.talent)
+      const pcts: number[] = []
+      for (const k of keys) {
+        const arr = m.get(k)
+        if (arr && arr.length) pcts.push(...arr)
+      }
+      if (pcts.length === 0) continue
+
+      let changed = false
+      const out = expr0.replace(refMulRe, (full, tk, q, table, factorRaw) => {
+        const factor = Number(factorRaw)
+        if (!Number.isFinite(factor)) return full
+        if (factor <= 1.001 || factor > 80) return full
+        // Only strip non-integer factors: integer multipliers are commonly hit-count totals.
+        if (Math.abs(factor - Math.round(factor)) < 1e-9) return full
+
+        const pct = (factor - 1) * 100
+        if (!Number.isFinite(pct) || pct <= 0 || pct > 2000) return full
+        const ok = pcts.some((v) => close(v, pct))
+        if (!ok) return full
+
+        changed = true
+        return `talent.${tk}[${q}${table}${q}]`
+      })
+      if (changed) (d as any).dmgExpr = out
+    }
+  } catch {
+    // Best-effort: do not block generation.
+  }
+}
+
 function deriveSrConsFromBuffHints(
   buffHints: unknown,
   details: CalcSuggestDetail[],
@@ -7235,10 +7509,12 @@ function deriveSrConsFromBuffHints(
       // Global dmg% buffs from Eidolon text (common, deterministic).
       // Example: "造成的伤害提高160%".
       if (/(造成|造成的).{0,8}伤害.{0,8}(提高|提升|增加)/.test(h)) {
-        const scoped =
-          /(普攻|普通攻击|战技|终结技|天赋|秘技|追加攻击|追击|反击|追加|附加|持续|dot|击破|超击破|倍率|伤害倍率)/i.test(
-            h
-          )
+        // Scope detection:
+        // - Many eidolons are phrased as "施放终结技时，使自身造成的伤害提高..." (global buff, triggered by Q).
+        // - Only treat it as skill-scoped when the skill name is directly tied to the damage phrase (baseline-like).
+        const scoped = /(?:普攻|普通攻击|战技|终结技|天赋|秘技|追加攻击|追击|反击|追加|附加|持续|dot|击破|超击破)(?!时)(?!后)[^。\n]{0,18}(?:造成的)?伤害.{0,8}(提高|提升|增加)/i.test(
+          h
+        )
 
         // Skill-scoped dmg% buffs (e.g. "战技造成的伤害提高20%" / "天赋的追加攻击造成的伤害提高729%").
         // Use bucketed keys (aDmg/eDmg/qDmg/tDmg) instead of global `dmg` to keep it maintainable and closer to baseline.
@@ -7301,6 +7577,45 @@ function deriveSrConsFromBuffHints(
         }
       }
 
+      // Final multiplier ("为原伤害的140%") style buffs from Eidolon text.
+      // This wording is usually a multiplicative modifier, better modeled as `*Multi` (or global `multi`)
+      // rather than an additive `dmg` buff.
+      try {
+        const pctTo =
+          pickMaxPctByRegex(
+            h,
+            /\u4e3a\u539f(?:\u672c)?\u4f24\u5bb3.{0,12}?([0-9]+(?:\.[0-9]+)?)\s*[%％]/g
+          ) ??
+          pickMaxPctByRegex(
+            h,
+            /\u53d8\u4e3a\u539f(?:\u672c)?\u4f24\u5bb3.{0,12}?([0-9]+(?:\.[0-9]+)?)\s*[%％]/g
+          ) ??
+          null
+
+        if (pctTo != null && Number.isFinite(pctTo) && pctTo > 100 && pctTo <= 3000) {
+          const delta = Number((pctTo - 100).toFixed(6))
+          const talentKey = pickTalentKey(h)
+          const dataKey = talentKey ? `${talentKey}Multi` : 'multi'
+          if (isAllowedMiaoBuffDataKey('sr', dataKey)) {
+            const gateKey = `cons${cons}`
+            const expr = `params.${gateKey} ? ${delta} : 0`
+            const existing = findConsBuffKey(dataKey, cons)
+            if (existing) {
+              const d: any = existing.data
+              if (d && typeof d === 'object') (d as any)[dataKey] = expr
+            } else if (!existingKeys.has(dataKey)) {
+              buffs.push({
+                title: `推导：${cons}魂 伤害为原伤害的${pctTo}%[${dataKey}]`,
+                cons,
+                data: { [dataKey]: expr }
+              })
+              existingKeys.add(dataKey)
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
       // kx% (resistance penetration) is a common SR damage modifier.
       if (/抗性穿透/.test(h) && /(提高|提升|增加)/.test(h)) {
         const pct = pickMaxPctByRegex(h, /抗性穿透.{0,12}([0-9]+(?:\.[0-9]+)?)\s*[%％]/g, 100) ?? null
@@ -7369,6 +7684,26 @@ function deriveSrConsFromBuffHints(
               cons,
               ...(check ? { check } : {}),
               data: { ignore: pct }
+            })
+          }
+        }
+      }
+
+      // Enemy DEF shred (debuff): baseline commonly models this as `enemyDef`.
+      if (/(防御力降低|防御降低|减防)/.test(h) && !/(无视|ignore)/i.test(h)) {
+        const pct =
+          pickMaxPctByRegex(h, /防御.{0,10}(?:降低|下降|减少).{0,12}?([0-9]+(?:\.[0-9]+)?)\s*[%％]/g, 120) ?? null
+        if (pct != null) {
+          const existing = findConsBuffKey('enemyDef', cons)
+          if (existing) {
+            const d: any = existing.data
+            if (d && typeof d === 'object' && typeof d.enemyDef === 'number') d.enemyDef = pct
+          } else {
+            buffs.push({
+              title: `推导：${cons}魂降低目标防御力[enemyDef]%`,
+              cons,
+              ...(check ? { check } : {}),
+              data: { enemyDef: pct }
             })
           }
         }
@@ -7445,7 +7780,9 @@ export function applySrDerivedFromBuffHints(input: CalcSuggestInput, plan: CalcS
     if (!(b as any).title) continue
     buffsArr.push(b as CalcSuggestBuff)
   }
-  ;(plan as any).buffs = [...buffStrings, ...buffsArr]
 
+  // NOTE: `deriveSrConsFromBuffHints` may push new buff entries; write back after derivation.
   deriveSrConsFromBuffHints(input.buffHints, details, buffsArr)
+  patchSrBuffGateFieldsFromTitles(buffsArr)
+  ;(plan as any).buffs = [...buffStrings, ...buffsArr]
 }
