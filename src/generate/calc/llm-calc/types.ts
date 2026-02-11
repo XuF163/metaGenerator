@@ -9,6 +9,8 @@ export type { TalentKeyGs, TalentKey }
 
 export interface CalcSuggestInput {
   game: 'gs' | 'sr'
+  /** Optional numeric avatar id (GS: 100000xx, SR: 1001..). */
+  id?: number
   name: string
   elem: string
   weapon?: string
@@ -44,6 +46,20 @@ export interface CalcSuggestInput {
    * Keep each entry as a single line (passives/cons/traces/technique).
    */
   buffHints?: string[]
+  /**
+   * Optional trusted upstream context for "upstream-follow" calc generation.
+   *
+   * This is intended to be produced by local scripts that read upstream repos (as submodules),
+   * then injected into the LLM prompt to reduce hallucination and keep semantics aligned.
+   */
+  upstream?: {
+    /** Upstream project name, e.g. "genshin-optimizer" / "hsr-optimizer". */
+    source: string
+    /** Optional upstream file path (for debugging). */
+    file?: string
+    /** Small excerpt / summary (keep it short; prompt is size-limited). */
+    excerpt?: string
+  }
 }
 
 export type CalcDetailKind = 'dmg' | 'heal' | 'shield' | 'reaction'

@@ -62,6 +62,17 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     buffHintLines.push(`- ${shortenText(t, 520)}`)
   }
 
+  const upstreamLines: string[] = []
+  const upstream = input.upstream
+  if (upstream && typeof upstream === 'object') {
+    const source = typeof upstream.source === 'string' ? upstream.source.trim() : ''
+    const file = typeof upstream.file === 'string' ? upstream.file.trim() : ''
+    const excerpt = typeof upstream.excerpt === 'string' ? upstream.excerpt.trim() : ''
+    if (source) upstreamLines.push(`source: ${source}`)
+    if (file) upstreamLines.push(`file: ${shortenText(file, 180)}`)
+    if (excerpt) upstreamLines.push(shortenText(excerpt, 2400))
+  }
+
   const sampleLines: string[] = []
   const samples = input.tableSamples || {}
   for (const k of allowedTalents) {
@@ -273,6 +284,13 @@ export function buildMessages(input: CalcSuggestInput): ChatMessage[] {
     '',
     ...(descLines.length
       ? ['技能描述摘要（用于判断哪些表是伤害倍率/选择标题，不要复述）：', ...descLines, '']
+      : []),
+    ...(upstreamLines.length
+      ? [
+          '上游追随（可信参考；当其与普通描述/线索冲突时，优先对齐上游；不要复述）：',
+          ...upstreamLines,
+          ''
+        ]
       : []),
     ...(buffHintLines.length ? ['Buff 线索（用于生成 buffs，不要复述）：', ...buffHintLines, ''] : []),
     ...(buffLikeTableLines.length

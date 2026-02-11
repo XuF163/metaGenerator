@@ -31,8 +31,8 @@ import { buildGiTalent, buildGiTablesFromPromote, normalizePromoteList } from '.
 import type { GiSkillDescOptions } from './talent.js'
 import { inferGiTalentConsFromHakushDetail, inferGiTalentConsFromMetaJson } from './talent-cons.js'
 import type { LlmService } from '../../../llm/service.js'
-import { buildCalcJsWithLlmOrHeuristic } from '../../calc/llm-calc.js'
-import type { CalcSuggestInput } from '../../calc/llm-calc.js'
+import { buildCalcJsWithChannel, normalizeCalcChannel } from '../../calc/build.js'
+import type { CalcChannel, CalcSuggestInput } from '../../calc/llm-calc.js'
 import type { GiTalentCons } from './talent-cons.js'
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -441,13 +441,38 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
   assetJobs: AssetJob[]
   assetOutDedup: Set<string>
   bannerFixDirs: string[]
+  calcChannel?: CalcChannel
+  calcUpstream?: {
+    genshinOptimizerRoot?: string
+    hsrOptimizerRoot?: string
+    includeTeamBuffs?: boolean
+    preferUpstream?: boolean
+  }
   llm?: LlmService
   calcJobs?: CalcJob[]
   log?: Pick<Console, 'info' | 'warn'>
 }): Promise<void> {
-  const { metaGsRootAbs, projectRootAbs, repoRootAbs, hakush, agdAttr, giSkillDescOpts, variantGroups, index, assetJobs, assetOutDedup, bannerFixDirs, llm, calcJobs, log } = opts
+  const {
+    metaGsRootAbs,
+    projectRootAbs,
+    repoRootAbs,
+    hakush,
+    agdAttr,
+    giSkillDescOpts,
+    variantGroups,
+    index,
+    assetJobs,
+    assetOutDedup,
+    bannerFixDirs,
+    calcChannel,
+    calcUpstream,
+    llm,
+    calcJobs,
+    log
+  } = opts
   const charRoot = path.join(metaGsRootAbs, 'character')
   const llmCacheRootAbs = path.join(projectRootAbs, '.cache', 'llm')
+  const calcChannelNorm = normalizeCalcChannel(calcChannel)
 
   const travelerBaseIds = ['10000005', '10000007']
   const mannequinBaseIds = ['10000117', '10000118']
@@ -835,6 +860,7 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
 	          }
 	          const input: CalcSuggestInput = {
 	            game: 'gs',
+	            id: travelerAgdId,
 	            name: `旅行者/${elem}`,
 	            elem,
 	            weapon,
@@ -851,11 +877,14 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
             // LLM calls are slow; defer and batch with concurrency at the end.
             calcJobs.push({ name: input.name, calcPath, input })
           } else {
-            const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+            const { js, usedLlm, error } = await buildCalcJsWithChannel({
               llm,
+              channel: calcChannelNorm,
+              projectRootAbs,
+              upstream: calcUpstream,
               input,
-              { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
-            )
+              cache: { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+            })
             if (error) {
               log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (旅行者/${elem}), using heuristic: ${error}`)
             } else if (usedLlm) {
@@ -1401,6 +1430,7 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
       }
       const input: CalcSuggestInput = {
         game: 'gs',
+        id: mannequinAgdId,
         name,
         elem,
         weapon,
@@ -1417,11 +1447,14 @@ async function generateGsTravelerAndMannequinsFromVariants(opts: {
         // LLM calls are slow; defer and batch with concurrency at the end.
         calcJobs.push({ name, calcPath, input })
       } else {
-        const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
+        const { js, usedLlm, error } = await buildCalcJsWithChannel({
           llm,
+          channel: calcChannelNorm,
+          projectRootAbs,
+          upstream: calcUpstream,
           input,
-          { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
-        )
+          cache: { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+        })
         if (error) {
           log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${name}), using heuristic: ${error}`)
         } else if (usedLlm) {
@@ -1511,6 +1544,13 @@ export interface GenerateGsCharacterOptions {
   forceAssets: boolean
   /** Whether to refresh LLM disk cache (shared flag with upstream cache). */
   forceCache: boolean
+  calcChannel?: CalcChannel
+  calcUpstream?: {
+    genshinOptimizerRoot?: string
+    hsrOptimizerRoot?: string
+    includeTeamBuffs?: boolean
+    preferUpstream?: boolean
+  }
   llm?: LlmService
   log?: Pick<Console, 'info' | 'warn'>
 }
@@ -1519,6 +1559,7 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
   const charRoot = path.join(opts.metaGsRootAbs, 'character')
   const indexPath = path.join(charRoot, 'data.json')
   const llmCacheRootAbs = path.join(opts.projectRootAbs, '.cache', 'llm')
+  const calcChannelNorm = normalizeCalcChannel(opts.calcChannel)
 
   const indexRaw = fs.existsSync(indexPath) ? JSON.parse(fs.readFileSync(indexPath, 'utf8')) : {}
   const index: Record<string, unknown> = isRecord(indexRaw) ? (indexRaw as Record<string, unknown>) : {}
@@ -2307,6 +2348,7 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
 
 	      const input: CalcSuggestInput = {
 	        game: 'gs',
+	        id: toInt(id) || undefined,
 	        name,
 	        elem,
 	        weapon,
@@ -2323,11 +2365,14 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
         // LLM calls are slow; defer and batch with concurrency at the end.
         calcJobs.push({ name, calcPath, input })
       } else {
-        const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
-          opts.llm,
+        const { js, usedLlm, error } = await buildCalcJsWithChannel({
+          llm: opts.llm,
+          channel: calcChannelNorm,
+          projectRootAbs: opts.projectRootAbs,
+          upstream: opts.calcUpstream,
           input,
-          { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
-        )
+          cache: { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+        })
         if (error) {
           opts.log?.warn?.(`[meta-gen] (gs) calc plan failed (${name}), using heuristic: ${error}`)
         } else if (usedLlm) {
@@ -2447,6 +2492,8 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     assetJobs,
     assetOutDedup,
     bannerFixDirs,
+    calcChannel: calcChannelNorm,
+    calcUpstream: opts.calcUpstream,
     llm: opts.llm,
     calcJobs,
     log: opts.log
@@ -2473,11 +2520,14 @@ export async function generateGsCharacters(opts: GenerateGsCharacterOptions): Pr
     const CALC_CONCURRENCY = Math.max(1, opts.llm.maxConcurrency)
     let calcDone = 0
     await runPromisePool(calcJobs, CALC_CONCURRENCY, async (job) => {
-      const { js, usedLlm, error } = await buildCalcJsWithLlmOrHeuristic(
-        opts.llm,
-        job.input,
-        { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
-      )
+      const { js, usedLlm, error } = await buildCalcJsWithChannel({
+        llm: opts.llm,
+        channel: calcChannelNorm,
+        projectRootAbs: opts.projectRootAbs,
+        upstream: opts.calcUpstream,
+        input: job.input,
+        cache: { cacheRootAbs: llmCacheRootAbs, force: opts.forceCache }
+      })
       if (error) {
         opts.log?.warn?.(`[meta-gen] (gs) LLM calc plan failed (${job.name}), using heuristic: ${error}`)
       } else if (usedLlm) {

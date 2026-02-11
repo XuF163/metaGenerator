@@ -27,6 +27,20 @@
     "//llmCalc": "可选：是否在 `meta-gen gen` 阶段使用 LLM 生成角色 calc.js（默认 false，建议用 `meta-gen calc` 进行可续跑批量升级）",
     "llmCalc": false
   },
+  "calc": {
+    "//": "calc.js 生成渠道：llm（默认）或 upstream（追随上游项目 genshin-optimizer/hsr-optimizer 生成/修补）",
+    "channel": "llm",
+    "upstream": {
+      "//genshinOptimizerRoot": "可选：genshin-optimizer 子模块路径（默认 upstream/genshin-optimizer）",
+      "genshinOptimizerRoot": "upstream/genshin-optimizer",
+      "//hsrOptimizerRoot": "可选：hsr-optimizer 子模块路径（默认 upstream/hsr-optimizer）",
+      "hsrOptimizerRoot": "upstream/hsr-optimizer",
+      "//includeTeamBuffs": "可选：是否包含上游的队友/团队 Buff（默认 false，避免引入队伍状态导致面板回归漂移）",
+      "includeTeamBuffs": false,
+      "//preferUpstream": "可选：当上游推导出的 buff 与现有计划冲突时，是否优先采用上游（默认 true）",
+      "preferUpstream": true
+    }
+  },
   "llm": {
     "enabled": false,
     "baseUrl": "https://api.openai.com",

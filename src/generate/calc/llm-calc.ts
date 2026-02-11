@@ -32,10 +32,20 @@ export type {
   CalcSuggestResult
 } from './llm-calc/types.js'
 
-export const CALC_CREATED_BY = 'awesome-gpt5.2-xhigh.llm-calc.v23'
+export type CalcChannel = 'llm' | 'upstream'
+
+export const CALC_CREATED_BY_LLM = 'awesome-gpt5.2-xhigh.llm-calc.v23'
+export const CALC_CREATED_BY_UPSTREAM = 'awesome-gpt5.2-xhigh.upstream-follow.v1'
+
+// Back-compat: old callsites treat this as the single expected signature.
+export const CALC_CREATED_BY = CALC_CREATED_BY_LLM
+
+export function calcCreatedBy(channel: CalcChannel): string {
+  return channel === 'upstream' ? CALC_CREATED_BY_UPSTREAM : CALC_CREATED_BY_LLM
+}
 
 // Requirement: generated calc.js should have a consistent signature.
-const DEFAULT_CREATED_BY = CALC_CREATED_BY
+const DEFAULT_CREATED_BY = CALC_CREATED_BY_LLM
 
 export async function suggestCalcPlan(
   llm: LlmService,
@@ -124,7 +134,8 @@ export { renderCalcJs }
 export async function buildCalcJsWithLlmOrHeuristic(
   llm: LlmService | undefined,
   input: CalcSuggestInput,
-  cache?: Omit<LlmDiskCacheOptions, 'purpose'>
+  cache?: Omit<LlmDiskCacheOptions, 'purpose'>,
+  createdBy = DEFAULT_CREATED_BY
 ): Promise<{ js: string; usedLlm: boolean; error?: string }> {
   if (!llm) {
     let plan = heuristicPlan(input)
@@ -135,7 +146,7 @@ export async function buildCalcJsWithLlmOrHeuristic(
       // Keep heuristic plan as-is.
     }
     applySrDerivedFromBuffHints(input, plan)
-    const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+    const js = renderCalcJs(input, plan, createdBy)
     validateCalcJsText(js)
     validateCalcJsRuntime(js, input)
     return { js, usedLlm: false }
@@ -150,7 +161,7 @@ export async function buildCalcJsWithLlmOrHeuristic(
       const cacheTry = cache ? { ...cache, force: i > 0 ? true : cache.force } : undefined
       const plan = await suggestCalcPlan(llm, input, cacheTry, lastErr)
       applySrDerivedFromBuffHints(input, plan)
-      const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+      const js = renderCalcJs(input, plan, createdBy)
       validateCalcJsText(js)
       validateCalcJsRuntime(js, input)
       return { js, usedLlm: true }
@@ -166,7 +177,7 @@ export async function buildCalcJsWithLlmOrHeuristic(
     // Keep heuristic plan as-is.
   }
   applySrDerivedFromBuffHints(input, plan)
-  const js = renderCalcJs(input, plan, DEFAULT_CREATED_BY)
+  const js = renderCalcJs(input, plan, createdBy)
   // Heuristic output should always be valid; if not, still return it (caller logs error).
   try {
     validateCalcJsText(js)

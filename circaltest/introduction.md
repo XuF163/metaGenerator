@@ -5,6 +5,9 @@
 ## 快速开始（建议顺序）
 
 ```powershell
+# 0) 可选：初始化上游子模块（仅 calc.channel="upstream" 需要）
+git submodule update --init --recursive
+
 # 1) 构建
 npm i
 npm run build
@@ -74,6 +77,10 @@ node circaltest/panel-regression-cover.mjs --game sr
 ## calc.js 批量迭代（LLM）
 
 当面板回归发现某些角色偏差较大时，可根据 diff.json 自动挑选 Top N 角色批量重生成 `calc.js`：
+
+提示：可在 `config/config.json` 设置 `calc.channel` 切换 calc 生成渠道：
+- `llm`（默认）：LLM 自生成
+- `upstream`：追随上游（genshin-optimizer / hsr-optimizer）抽取上下文 + LLM 生成（需要先初始化子模块）
 
 ```powershell
 # 从某次 panel-regression 的 diff.json 中挑选偏差最大角色批量重生成（仅 GS）

@@ -15,6 +15,35 @@ export interface ToolConfig {
   outputRoot?: string
   games?: Game[]
   types?: MetaType[]
+  calc?: {
+    /**
+     * calc.js generation channel.
+     *
+     * - "llm": LLM JSON plan -> local validate -> deterministic JS render (with heuristic fallback when LLM is unavailable).
+     * - "upstream": follow upstream projects (genshin-optimizer / hsr-optimizer) to derive/patch calc plan.
+     *
+     * Default: "llm" (current behavior).
+     */
+    channel?: 'llm' | 'upstream'
+    upstream?: {
+      /** Optional local path to genshin-optimizer submodule (for GS). Default: upstream/genshin-optimizer */
+      genshinOptimizerRoot?: string
+      /** Optional local path to hsr-optimizer submodule (for SR). Default: upstream/hsr-optimizer */
+      hsrOptimizerRoot?: string
+      /**
+       * Whether to include team buffs from upstream models.
+       *
+       * Default: false (panel regressions are single-avatar; baseline calc.js rarely models team state).
+       */
+      includeTeamBuffs?: boolean
+      /**
+       * When upstream-derived buff keys conflict with existing plan buffs, prefer upstream values.
+       *
+       * Default: true
+       */
+      preferUpstream?: boolean
+    }
+  }
   network?: {
     /**
      * Optional network proxy/mirror prefix/template for all HTTP(S) requests.

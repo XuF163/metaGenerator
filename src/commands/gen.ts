@@ -19,6 +19,7 @@ import { repairGsTalentTables } from '../generate/compat/gs-talent-repair.js'
 import { generateGsArtifactArtisMarkJs } from '../generate/compat/gs-artis-mark.js'
 import { generateSrArtifactArtisMarkJs } from '../generate/compat/sr-artis-mark.js'
 import { applyHakushUpdates } from '../generate/hakush/index.js'
+import { normalizeCalcChannel } from '../generate/calc/build.js'
 import { loadToolConfig } from '../config/config.js'
 import { tryCreateLlmService } from '../llm/try-create.js'
 import type { CommandContext, GenOptions } from '../types.js'
@@ -33,6 +34,7 @@ export async function genCommand(ctx: CommandContext, options: GenOptions): Prom
   const outputRoot = resolveRepoPath(ctx, options.outputRoot)
   const { games, types, force, forceCache, forceAssets, baselineOverlay } = options
   const toolConfig = loadToolConfig(ctx.projectRoot) ?? undefined
+  const calcChannel = normalizeCalcChannel(toolConfig?.calc?.channel)
   ctx.log.info(`[meta-gen] gen: outputRoot=${outputRoot}`)
   ctx.log.info(`[meta-gen] baselineRoot=${baselineRoot}`)
   ctx.log.info(
@@ -69,6 +71,8 @@ export async function genCommand(ctx: CommandContext, options: GenOptions): Prom
     forceCache,
     forceAssets,
     baselineOverlay,
+    calcChannel,
+    calcUpstream: toolConfig?.calc?.upstream,
     llm
   })
 

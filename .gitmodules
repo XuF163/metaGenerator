@@ -1,0 +1,6 @@
+[submodule "upstream/genshin-optimizer"]
+	path = upstream/genshin-optimizer
+	url = https://github.com/frzyc/genshin-optimizer.git
+[submodule "upstream/hsr-optimizer"]
+	path = upstream/hsr-optimizer
+	url = https://github.com/fribbels/hsr-optimizer.git

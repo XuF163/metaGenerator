@@ -46,6 +46,15 @@ export interface HakushUpdateOptions {
   forceAssets: boolean
   /** Whether generation is allowed to read baseline meta as an overlay (debug). */
   baselineOverlay: boolean
+  /** calc.js generation channel ("llm" vs "upstream-follow"). */
+  calcChannel?: 'llm' | 'upstream'
+  /** Optional upstream-follow settings (paths to git submodules, etc.). */
+  calcUpstream?: {
+    genshinOptimizerRoot?: string
+    hsrOptimizerRoot?: string
+    includeTeamBuffs?: boolean
+    preferUpstream?: boolean
+  }
   /** Optional LLM service used to generate calc.js for new characters. */
   llm?: LlmService
 }
@@ -121,6 +130,8 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
             animeGameData,
             forceAssets: opts.forceAssets,
             forceCache: opts.forceCache,
+            calcChannel: opts.calcChannel,
+            calcUpstream: opts.calcUpstream,
             llm: opts.llm,
             log: opts.ctx.log
           })
@@ -163,6 +174,8 @@ export async function applyHakushUpdates(opts: HakushUpdateOptions): Promise<voi
             yatta,
             forceAssets: opts.forceAssets,
             forceCache: opts.forceCache,
+            calcChannel: opts.calcChannel,
+            calcUpstream: opts.calcUpstream,
             llm: opts.llm,
             log: opts.ctx.log
           })
