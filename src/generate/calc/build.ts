@@ -2,11 +2,14 @@ import path from 'node:path'
 import type { LlmDiskCacheOptions } from '../../llm/disk-cache.js'
 import type { LlmService } from '../../llm/service.js'
 import { buildCalcJsWithLlmOrHeuristic, calcCreatedBy, type CalcChannel, type CalcSuggestInput } from './llm-calc.js'
+import { buildCalcJsWithUpstreamDirect } from './upstream-direct.js'
 import { buildCalcUpstreamContext } from './upstream-follow/context.js'
 
 export function normalizeCalcChannel(v: unknown): CalcChannel {
   const t = typeof v === 'string' ? v.trim().toLowerCase() : ''
-  return t === 'upstream' ? 'upstream' : 'llm'
+  if (t === 'upstream') return 'upstream'
+  if (t === 'upstream-direct' || t === 'upstream_direct' || t === 'upstreamdirect') return 'upstream-direct'
+  return 'llm'
 }
 
 function resolveMaybeRelative(projectRootAbs: string, p: string | undefined): string | undefined {
@@ -25,11 +28,12 @@ export async function buildCalcJsWithChannel(opts: {
     genshinOptimizerRoot?: string
     hsrOptimizerRoot?: string
     includeTeamBuffs?: boolean
+    preferUpstream?: boolean
   }
 }): Promise<{ js: string; usedLlm: boolean; error?: string }> {
   const createdBy = calcCreatedBy(opts.channel)
 
-  if (opts.channel !== 'upstream') {
+  if (opts.channel === 'llm') {
     return buildCalcJsWithLlmOrHeuristic(opts.llm, opts.input, opts.cache, createdBy)
   }
 
@@ -45,5 +49,15 @@ export async function buildCalcJsWithChannel(opts: {
   })
   if (upstreamCtx) input.upstream = upstreamCtx
 
+  if (opts.channel === 'upstream-direct') {
+    return buildCalcJsWithUpstreamDirect({
+      input,
+      createdBy,
+      projectRootAbs: opts.projectRootAbs,
+      upstream: opts.upstream
+    })
+  }
+
+  // upstream-follow (LLM + injected upstream context)
   return buildCalcJsWithLlmOrHeuristic(opts.llm, input, opts.cache, createdBy)
 }

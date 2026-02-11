@@ -21,10 +21,11 @@ export interface ToolConfig {
      *
      * - "llm": LLM JSON plan -> local validate -> deterministic JS render (with heuristic fallback when LLM is unavailable).
      * - "upstream": follow upstream projects (genshin-optimizer / hsr-optimizer) to derive/patch calc plan.
+     * - "upstream-direct": follow upstream projects (genshin-optimizer / hsr-optimizer) WITHOUT LLM; deterministic extraction + heuristics.
      *
      * Default: "llm" (current behavior).
      */
-    channel?: 'llm' | 'upstream'
+    channel?: 'llm' | 'upstream' | 'upstream-direct'
     upstream?: {
       /** Optional local path to genshin-optimizer submodule (for GS). Default: upstream/genshin-optimizer */
       genshinOptimizerRoot?: string

@@ -58,7 +58,7 @@ export async function genCommand(ctx: CommandContext, options: GenOptions): Prom
 
   // Only initialize LLM when the selected generation types can actually use it.
   // (Avoid hard-failing `gen` for unrelated types when LLM is not configured.)
-  const useLlmCalc = Boolean(toolConfig?.gen?.llmCalc) && types.includes('character')
+  const useLlmCalc = Boolean(toolConfig?.gen?.llmCalc) && types.includes('character') && calcChannel !== 'upstream-direct'
   const llm = useLlmCalc ? tryCreateLlmService(ctx, toolConfig, { purpose: 'gen', required: true }) : undefined
 
   // Generate meta from Hakush (idempotent; only writes missing entries unless output is wiped by --force).

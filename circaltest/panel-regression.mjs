@@ -192,8 +192,12 @@ function diffRuns(baseline, generated) {
       continue
     }
 
-    const bRet = b?.dmg?.profile?.ret || []
-    const gRet = g?.dmg?.profile?.ret || []
+    const bProfile = b?.dmg?.profile || {}
+    const gProfile = g?.dmg?.profile || {}
+    const bRetRaw = Array.isArray(bProfile?.ret) ? bProfile.ret : []
+    const gRetRaw = Array.isArray(gProfile?.ret) ? gProfile.ret : []
+    const bRet = Array.isArray(bProfile?.retEx) ? bProfile.retEx : bRetRaw
+    const gRet = Array.isArray(gProfile?.retEx) ? gProfile.retEx : gRetRaw
 
     const collectFiniteAvg = (arr) =>
       (arr || [])
@@ -221,6 +225,12 @@ function diffRuns(baseline, generated) {
     // - Allow loose match (strip leading skill marker / SR mid-markers) when it yields a closer value,
     //   even if strict matches exist (prevents false positives when generated rows have wrong prefixes).
     const toFiniteNumOrNull = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null)
+    const withinRatio = (r, pct = 0.025) => {
+      if (typeof r !== "number" || !Number.isFinite(r) || r <= 0) return false
+      const hi = 1 + pct
+      const lo = 1 / hi
+      return r >= lo && r <= hi
+    }
     const scoreDiff = (bAvg, gAvg) => {
       if (bAvg === null || gAvg === null) return Number.POSITIVE_INFINITY
       if (bAvg === 0) return gAvg === 0 ? 0 : Math.abs(gAvg)
@@ -232,11 +242,13 @@ function diffRuns(baseline, generated) {
 
     const gRows = gRet.map((gr0, gi) => {
       const gr = gr0 || null
+      const sig = typeof gr?.sig === "string" ? gr.sig.trim() : ""
       const strict = normTitle(gr?.title)
       const loose = normTitleLoose(gr?.title)
       return {
         gi,
         gr,
+        sig,
         strict,
         loose,
         cat: extractCat(strict),
@@ -244,9 +256,15 @@ function diffRuns(baseline, generated) {
         dmg: toFiniteNumOrNull(gr?.dmg)
       }
     })
+    const gBySig = new Map()
     const gByStrict = new Map()
     const gByLoose = new Map()
     for (const row of gRows) {
+      if (row.sig) {
+        const list = gBySig.get(row.sig) || []
+        list.push(row.gi)
+        gBySig.set(row.sig, list)
+      }
       if (row.strict) {
         const list = gByStrict.get(row.strict) || []
         list.push(row.gi)
@@ -262,12 +280,17 @@ function diffRuns(baseline, generated) {
     const usedGenIdx = new Set()
     const matches = new Map() // baseline idx -> { gi, match }
     const pickBest = (br, bi) => {
+      const bSig = typeof br?.sig === "string" ? br.sig.trim() : ""
       const bStrict = normTitle(br?.title)
       const bLoose = normTitleLoose(br?.title)
       const bCat = extractCat(bStrict)
       const bAvg = toFiniteNumOrNull(br?.avg)
 
       const cand = new Set()
+      for (const gi of (bSig ? gBySig.get(bSig) || [] : [])) {
+        if (!usedGenIdx.has(gi)) cand.add(gi)
+      }
+      // Fallback to title matching when signature is missing (or not produced by older evidence runs).
       for (const gi of (bStrict ? gByStrict.get(bStrict) || [] : [])) {
         if (!usedGenIdx.has(gi)) cand.add(gi)
       }
@@ -283,11 +306,12 @@ function diffRuns(baseline, generated) {
       for (const gi of cand) {
         const row = gRows[gi]
         if (!row) continue
-        if (bCat && row.cat && row.cat !== bCat) continue
+        const isSig = !!bSig && row.sig === bSig
+        if (!isSig && bCat && row.cat && row.cat !== bCat) continue
 
         const isStrict = !!bStrict && row.strict === bStrict
-        const match = isStrict ? "strict" : "loose"
-        const penalty = isStrict ? 0 : 0.35
+        const match = isSig ? "sig" : isStrict ? "strict" : "loose"
+        const penalty = isSig ? 0 : isStrict ? 0.15 : 0.35
         const diff = scoreDiff(bAvg, row.avg)
         const score = penalty + diff
 
@@ -297,7 +321,8 @@ function diffRuns(baseline, generated) {
         }
         if (Math.abs(score - best.score) < 1e-12) {
           // Tie-break: prefer strict, then smaller diff, then smaller index.
-          if (match === "strict" && best.match !== "strict") best = { gi, match, score, diff }
+          if (match === "sig" && best.match !== "sig") best = { gi, match, score, diff }
+          else if (match === "strict" && best.match !== "sig" && best.match !== "strict") best = { gi, match, score, diff }
           else if (diff < best.diff - 1e-12) best = { gi, match, score, diff }
           else if (gi < best.gi) best = { gi, match, score, diff }
         }
@@ -316,6 +341,7 @@ function diffRuns(baseline, generated) {
 
     const bMatchedAvgs = []
     const gMatchedAvgs = []
+    let matchedWithin25 = 0
 
     let outIdx = 0
     for (let i = 0; i < bRet.length; i++) {
@@ -354,6 +380,7 @@ function diffRuns(baseline, generated) {
 
         bMatchedAvgs.push(bAvg)
         gMatchedAvgs.push(gAvg)
+        if (withinRatio(ratio, 0.025)) matchedWithin25++
       }
 
       entries.push({
@@ -400,6 +427,11 @@ function diffRuns(baseline, generated) {
       level: b.level,
       cons: b.cons,
       weapon: b.weapon?.name || "",
+      matchSummary: {
+        matched: bMatchedAvgs.length,
+        within25: matchedWithin25,
+        withinRate: bMatchedAvgs.length ? matchedWithin25 / bMatchedAvgs.length : 0
+      },
       maxAvg: {
         baseline: bMaxAvg,
         generated: gMaxAvg,

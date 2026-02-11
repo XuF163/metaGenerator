@@ -239,7 +239,8 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
   const toolConfig = loadToolConfig(ctx.projectRoot) ?? undefined
   const calcChannel = normalizeCalcChannel(toolConfig?.calc?.channel)
   const expectedCreatedBy = calcCreatedBy(calcChannel)
-  let llm = tryCreateLlmService(ctx, toolConfig, { purpose: 'calc' })
+  const needsLlm = calcChannel !== 'upstream-direct'
+  let llm = needsLlm ? tryCreateLlmService(ctx, toolConfig, { purpose: 'calc' }) : undefined
   const llmCacheRootAbs = path.join(ctx.projectRoot, '.cache', 'llm')
 
   // Fast-fail / protect outputs:

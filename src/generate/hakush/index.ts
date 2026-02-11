@@ -28,6 +28,7 @@ import { generateSrArtifacts } from './sr/artifact.js'
 import { generateSrCharacters } from './sr/character.js'
 import { generateSrMaterials } from './sr/material.js'
 import { ensureSrPublicPathIcons } from './sr/public-icons.js'
+import type { CalcChannel } from '../calc/llm-calc.js'
 
 function metaGameDir(outputRootAbs: string, game: Game): string {
   return path.join(outputRootAbs, `meta-${game}`)
@@ -47,7 +48,7 @@ export interface HakushUpdateOptions {
   /** Whether generation is allowed to read baseline meta as an overlay (debug). */
   baselineOverlay: boolean
   /** calc.js generation channel ("llm" vs "upstream-follow"). */
-  calcChannel?: 'llm' | 'upstream'
+  calcChannel?: CalcChannel
   /** Optional upstream-follow settings (paths to git submodules, etc.). */
   calcUpstream?: {
     genshinOptimizerRoot?: string

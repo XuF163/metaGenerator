@@ -220,12 +220,13 @@ function renderSummaryMd({ game, cover, perUid, worstAvatars }) {
 
   lines.push("## Per UID")
   lines.push("")
-  lines.push("| uid | avatars | missing | matched=0 | ratios | within±2.5% | meanAbsLogDev |")
+  lines.push("| uid | avatars | missing | matched=0 | rowsMatched | rowsWithin±2.5% | withinRate |")
   lines.push("|---:|---:|---:|---:|---:|---:|---:|")
   for (const r of perUid) {
-    const mean = typeof r.meanAbsLogDev === "number" ? r.meanAbsLogDev.toFixed(4) : ""
+    const rate =
+      typeof r.rowsWithinRate === "number" && Number.isFinite(r.rowsWithinRate) ? r.rowsWithinRate.toFixed(4) : ""
     lines.push(
-      `| ${r.uid} | ${r.avatars} | ${r.missing} | ${r.matched0} | ${r.ratios} | ${r.within} | ${mean} |`
+      `| ${r.uid} | ${r.avatars} | ${r.missing} | ${r.matched0} | ${r.rowsMatched} | ${r.rowsWithin} | ${rate} |`
     )
   }
   lines.push("")
@@ -263,6 +264,9 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
         ratios: 0,
         within: 0,
         meanAbsLogDev: null,
+        rowsMatched: 0,
+        rowsWithin: 0,
+        rowsWithinRate: null,
         error: `diff missing: ${path.relative(repoRoot, diffPath)}`
       })
       continue
@@ -275,14 +279,18 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
     let ratios = 0
     let within = 0
     let sumAbsLog = 0
+    let rowsMatched = 0
+    let rowsWithin = 0
 
     for (const d of diffs) {
       if (d?.kind === "missing") {
         missing++
         continue
       }
-      const matched = Number(d?.maxAvgMatched?.matched || 0)
+      const matched = Number(d?.matchSummary?.matched || d?.maxAvgMatched?.matched || 0)
       if (!matched) matched0++
+      rowsMatched += matched
+      rowsWithin += Number(d?.matchSummary?.within25 || 0)
 
       const ratio = getPrimaryRatio(d)
       if (isFinitePos(ratio)) {
@@ -318,7 +326,10 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
       matched0,
       ratios,
       within,
-      meanAbsLogDev: ratios ? sumAbsLog / ratios : null
+      meanAbsLogDev: ratios ? sumAbsLog / ratios : null,
+      rowsMatched,
+      rowsWithin,
+      rowsWithinRate: rowsMatched ? rowsWithin / rowsMatched : null
     })
   }
 

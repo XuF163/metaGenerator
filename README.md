@@ -10,7 +10,7 @@
 在仓库根目录执行：
 
 ```powershell
-# 可选：仅当使用 calc.channel="upstream" 时需要
+# 可选：仅当使用 calc.channel="upstream" / "upstream-direct" 时需要
 git submodule update --init --recursive
 
 npm i
@@ -76,6 +76,8 @@ node dist/cli.js calc --games gs,sr
 - `calc.channel="upstream"`：追随上游（genshin-optimizer / hsr-optimizer）抽取上下文 + LLM 生成 calc.js
   - 前置：初始化子模块 `git submodule update --init --recursive`
   - 可选：`calc.upstream.includeTeamBuffs=true`（默认 false，单人面板回归更稳定）
+- `calc.channel="upstream-direct"`：追随上游（genshin-optimizer / hsr-optimizer）但不使用 LLM，脚本直出（更适合 CI/CD）
+  - 前置：初始化子模块 `git submodule update --init --recursive`
 
 说明：
 - 启用 LLM：设置 `config/config.json` 的 `llm.enabled=true`，并配置 `llm.model` + key（推荐 env；见 `docs/llmapi.md`）。

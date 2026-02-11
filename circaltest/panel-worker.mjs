@@ -77,6 +77,114 @@ function sanitizePlayerInfo(raw, uid) {
   return out
 }
 
+function buildDetailSig(detail) {
+  try {
+    if (!detail || typeof detail !== "object") return ""
+    const d = detail
+    const fn = typeof d.dmg === "function" ? String(d.dmg) : ""
+
+    const kind = (() => {
+      if (/\breaction\s*\(/.test(fn) || /\.reaction\s*\(/.test(fn)) return "reaction"
+      if (/\{\s*heal\s*\}/.test(fn) || /\bheal\s*\(/.test(fn)) return "heal"
+      if (/\{\s*shield\s*\}/.test(fn) || /\bshield\s*\(/.test(fn)) return "shield"
+      return "dmg"
+    })()
+
+    const dmgKeyProp = typeof d.dmgKey === "string" ? d.dmgKey.trim() : ""
+    const keyFromFn = (() => {
+      const m = /\bdmg(?:\.basic)?\s*\([^)]*?,\s*['"]([^'"]+)['"]/.exec(fn)
+      return m?.[1]?.trim() || ""
+    })()
+    const key = dmgKeyProp || keyFromFn
+
+    const eleFromFn = (() => {
+      const m = /\bdmg(?:\.basic)?\s*\([^)]*?,\s*['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]/.exec(fn)
+      return m?.[1]?.trim() || ""
+    })()
+
+    const paramsPart = (() => {
+      const p = d.params
+      if (!p || typeof p !== "object" || Array.isArray(p)) return ""
+      const keys = Object.keys(p).filter(Boolean).sort()
+      if (!keys.length) return ""
+      const parts = []
+      for (const k of keys) {
+        const v = p[k]
+        if (typeof v === "number" && Number.isFinite(v)) parts.push(`${k}=${v}`)
+        else if (typeof v === "boolean") parts.push(`${k}=${v ? 1 : 0}`)
+        else if (typeof v === "string" && v.trim()) parts.push(`${k}=${v.trim()}`)
+        else if (v == null) parts.push(`${k}=null`)
+      }
+      return parts.join(",")
+    })()
+
+    const dmgCalls = (fn.match(/\bdmg(?:\.basic)?\s*\(/g) || []).length
+    const hitMul = (() => {
+      let max = 0
+      const re = /\b(?:avg|dmg)\s*:\s*[^,}]*?\*\s*([0-9]+)\b/g
+      for (const m of fn.matchAll(re)) {
+        const n = Number(m?.[1])
+        if (Number.isFinite(n) && n > max) max = n
+      }
+      return max > 1 ? String(max) : ""
+    })()
+
+    const tables = []
+    const re = /\btalent\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(['"])(.*?)\2\s*\]/g
+    for (const m of fn.matchAll(re)) {
+      const tk = String(m[1] || "").trim()
+      const tn = String(m[3] || "").trim()
+      if (!tk || !tn) continue
+      tables.push(`${tk}:${tn}`)
+      if (tables.length >= 6) break
+    }
+    const uniq = Array.from(new Set(tables)).sort()
+    const tablePart = uniq.join("+")
+
+    // Keep sig stable across different auto-generated wrappers:
+    // - Do NOT include dmgCalls/hitMul (they vary with code shape but often represent same semantic row).
+    return [kind, key || "", eleFromFn || "", tablePart || "", paramsPart || ""].join("|")
+  } catch {
+    return ""
+  }
+}
+
+function attachRetSig(dmgProfile, charCalcData) {
+  try {
+    if (!dmgProfile || typeof dmgProfile !== "object") return dmgProfile
+    const ret = Array.isArray(dmgProfile.ret) ? dmgProfile.ret : null
+    if (!ret) return dmgProfile
+    const details = Array.isArray(charCalcData?.details) ? charCalcData.details : []
+    if (!details.length) return dmgProfile
+    const sigs = details.map(buildDetailSig)
+    const retEx = ret.map((r, idx) => ({ ...(r || {}), sig: sigs[idx] || "" }))
+    return { ...dmgProfile, retEx }
+  } catch {
+    return dmgProfile
+  }
+}
+
+const calcModuleCache = new Map()
+async function tryImportCalcModule(calcPathAbs) {
+  try {
+    const p = String(calcPathAbs || "").trim()
+    if (!p) return null
+    if (calcModuleCache.has(p)) return calcModuleCache.get(p)
+    if (!fs.existsSync(p)) {
+      calcModuleCache.set(p, null)
+      return null
+    }
+    const u = pathToFileURL(p)
+    // Cache-bust by mtime to reflect regenerated calc.js during the same process.
+    const mtimeMs = Number(fs.statSync(p)?.mtimeMs || 0)
+    const mod = await import(`${u.href}?t=${mtimeMs}`)
+    calcModuleCache.set(p, mod)
+    return mod
+  } catch {
+    return null
+  }
+}
+
 async function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
@@ -277,6 +385,21 @@ async function main() {
           }
         }
 
+        // calc.js evidence: which file was actually loaded + hash
+        let calcPath = ""
+        let calcSha256 = ""
+        try {
+          let ruleName = avatar.char?.name
+          if ([10000005, 10000007, 20000000].includes(Number(avatar.char?.id))) {
+            ruleName = `旅行者/${avatar.elem}`
+          }
+          const calc = ProfileDmg.dmgRulePath(ruleName, game)
+          if (calc?.path && fs.existsSync(calc.path)) {
+            calcPath = calc.path
+            calcSha256 = sha256File(calc.path)
+          }
+        } catch {}
+
         let dmgCtx = null
         let talentSample = null
         let talentLv = null
@@ -285,7 +408,13 @@ async function main() {
           try {
             const pd = avatar.dmg
             if (pd && typeof pd.getCalcRule === "function") {
-              const charCalcData = await pd.getCalcRule()
+              const charCalcData0 = await pd.getCalcRule()
+              let charCalcData = charCalcData0
+              if (!Array.isArray(charCalcData?.details) || charCalcData.details.length === 0) {
+                const imported = await tryImportCalcModule(calcPath)
+                if (imported) charCalcData = imported
+              }
+              dmgProfile = attachRetSig(dmgProfile, charCalcData)
               talentLv = pd.profile?.talent || null
               const detail = pd.char?.detail || {}
               const maxTableLen = (tk) => {
@@ -392,21 +521,6 @@ async function main() {
             dmgCtx = { error: e instanceof Error ? (e.stack || e.message) : String(e) }
           }
         }
-
-        // calc.js evidence: which file was actually loaded + hash
-        let calcPath = ""
-        let calcSha256 = ""
-        try {
-          let ruleName = avatar.char?.name
-          if ([10000005, 10000007, 20000000].includes(Number(avatar.char?.id))) {
-            ruleName = `旅行者${avatar.elem}`
-          }
-          const calc = ProfileDmg.dmgRulePath(ruleName, game)
-          if (calc?.path && fs.existsSync(calc.path)) {
-            calcPath = calc.path
-            calcSha256 = sha256File(calc.path)
-          }
-        } catch {}
 
         avatars.push({
           id: avatar.id,
@@ -584,6 +698,21 @@ async function main() {
         }
       }
 
+      // calc.js evidence: which file was actually loaded + hash
+      let calcPath = ""
+      let calcSha256 = ""
+      try {
+        let ruleName = avatar.char?.name
+        if ([10000005, 10000007, 20000000].includes(Number(avatar.char?.id))) {
+          ruleName = `旅行者/${avatar.elem}`
+        }
+        const calc = ProfileDmg.dmgRulePath(ruleName, game)
+        if (calc?.path && fs.existsSync(calc.path)) {
+          calcPath = calc.path
+          calcSha256 = sha256File(calc.path)
+        }
+      } catch {}
+
       let dmgCtx = null
       let talentSample = null
       let talentLv = null
@@ -592,7 +721,13 @@ async function main() {
         try {
           const pd = avatar.dmg
           if (pd && typeof pd.getCalcRule === "function") {
-            const charCalcData = await pd.getCalcRule()
+            const charCalcData0 = await pd.getCalcRule()
+            let charCalcData = charCalcData0
+            if (!Array.isArray(charCalcData?.details) || charCalcData.details.length === 0) {
+              const imported = await tryImportCalcModule(calcPath)
+              if (imported) charCalcData = imported
+            }
+            dmgProfile = attachRetSig(dmgProfile, charCalcData)
             talentLv = pd.profile?.talent || null
             const detail = pd.char?.detail || {}
             const maxTableLen = (tk) => {
@@ -699,21 +834,6 @@ async function main() {
           dmgCtx = { error: e instanceof Error ? (e.stack || e.message) : String(e) }
         }
       }
-
-      // calc.js evidence: which file was actually loaded + hash
-      let calcPath = ""
-      let calcSha256 = ""
-      try {
-        let ruleName = avatar.char?.name
-        if ([10000005, 10000007, 20000000].includes(Number(avatar.char?.id))) {
-          ruleName = `旅行者/${avatar.elem}`
-        }
-        const calc = ProfileDmg.dmgRulePath(ruleName, game)
-        if (calc?.path && fs.existsSync(calc.path)) {
-          calcPath = calc.path
-          calcSha256 = sha256File(calc.path)
-        }
-      } catch {}
 
       avatars.push({
         id: avatar.id,
