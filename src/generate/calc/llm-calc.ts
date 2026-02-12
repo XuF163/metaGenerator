@@ -34,9 +34,9 @@ export type {
 
 export type CalcChannel = 'llm' | 'upstream' | 'upstream-direct'
 
-export const CALC_CREATED_BY_LLM = 'awesome-gpt5.2-xhigh.llm-calc.v23'
-export const CALC_CREATED_BY_UPSTREAM = 'awesome-gpt5.2-xhigh.upstream-follow.v1'
-export const CALC_CREATED_BY_UPSTREAM_DIRECT = 'awesome-gpt5.2-xhigh.upstream-direct.v2'
+export const CALC_CREATED_BY_LLM = 'awesome-gpt5.2-xhigh.llm-calc.v28'
+export const CALC_CREATED_BY_UPSTREAM = 'awesome-gpt5.2-xhigh.upstream-follow.v6'
+export const CALC_CREATED_BY_UPSTREAM_DIRECT = 'awesome-gpt5.2-xhigh.upstream-direct.v13'
 
 // Back-compat: old callsites treat this as the single expected signature.
 export const CALC_CREATED_BY = CALC_CREATED_BY_LLM

@@ -95,7 +95,7 @@ function inferUnitHintFromTableValues(valuesRaw: unknown): string {
     if (!t) continue
     if (/(元素精通|精通)/.test(t)) return '元素精通'
     if (/(生命值上限|最大生命值|生命值)/.test(t)) return '生命值上限'
-    if (/防御力/.test(t)) return '防御力'
+    if (/(防御力|防御)/.test(t)) return '防御力'
     if (/(攻击力|攻击)/.test(t)) return '攻击力'
   }
   return ''

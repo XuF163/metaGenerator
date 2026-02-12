@@ -85,10 +85,9 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
     pickSrHealOrShield('e', eTables, 'shield', '战技护盾量')
   } else if (eHasHeal) {
     pickSrHealOrShield('e', eTables, 'heal', '战技治疗量')
-  } else {
-    const e = pickDamageTable(eTables)
-    if (e) details.push({ title: '战技伤害', talent: 'e', table: e, key: 'e' })
   }
+  const e = pickDamageTable(eTables)
+  if (e) details.push({ title: '战技伤害', talent: 'e', table: e, key: 'e' })
 
   // Q
   const qDesc = descText('q')
@@ -98,10 +97,9 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
     pickSrHealOrShield('q', qTables, 'shield', '终结技护盾量')
   } else if (qHasHeal) {
     pickSrHealOrShield('q', qTables, 'heal', '终结技治疗量')
-  } else {
-    const q = pickDamageTable(qTables)
-    if (q) details.push({ title: '终结技伤害', talent: 'q', table: q, key: 'q' })
   }
+  const q = pickDamageTable(qTables)
+  if (q) details.push({ title: '终结技伤害', talent: 'q', table: q, key: 'q' })
   // Extra Q damage tables (e.g. 冻结回合开始伤害 -> 冻结附加伤害)
   const qMain = details.find((d) => d.talent === 'q' && d.kind !== 'heal' && d.kind !== 'shield')?.table || ''
   for (const tn of qTables) {

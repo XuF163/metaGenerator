@@ -149,15 +149,88 @@ function buildDetailSig(detail) {
   }
 }
 
-function attachRetSig(dmgProfile, charCalcData) {
+function normTitleKey(s) {
+  let t = String(s || "").trim()
+  if (!t) return ""
+  t = t.replace(/\s+/g, "")
+  t = t.replace(/[·•･・…?？、，,。．：:；;!！"'“”‘’()（）【】\[\]{}《》〈〉<>「」『』]/g, "")
+  t = t.replace(/[=+~`^|\\]/g, "")
+  t = t.replace(/[-_—–]/g, "")
+  return t
+}
+
+function expandCalcDetails(detailsRaw, meta) {
+  const out = []
+  const metaSafe = meta && typeof meta === "object" ? meta : {}
+
+  for (const d0 of detailsRaw || []) {
+    if (!d0) continue
+    if (typeof d0 === "function") {
+      try {
+        const v = d0(metaSafe)
+        if (Array.isArray(v)) {
+          for (const x of v) if (x && typeof x === "object") out.push(x)
+        } else if (v && typeof v === "object") {
+          out.push(v)
+        }
+      } catch {}
+      continue
+    }
+    if (typeof d0 === "object") out.push(d0)
+  }
+
+  return out
+}
+
+function attachRetSig(dmgProfile, charCalcData, meta) {
   try {
     if (!dmgProfile || typeof dmgProfile !== "object") return dmgProfile
     const ret = Array.isArray(dmgProfile.ret) ? dmgProfile.ret : null
     if (!ret) return dmgProfile
-    const details = Array.isArray(charCalcData?.details) ? charCalcData.details : []
+
+    const detailsRaw = Array.isArray(charCalcData?.details) ? charCalcData.details : []
+    if (!detailsRaw.length) return dmgProfile
+
+    // IMPORTANT: miao-plugin filters out details whose `check` fails (cons/tree/params...),
+    // so `dmgProfile.ret` is not index-aligned with exported `details`.
+    // Bind signatures by (normalized) title instead of index to avoid massive mismatches.
+    const details = expandCalcDetails(detailsRaw, meta)
     if (!details.length) return dmgProfile
-    const sigs = details.map(buildDetailSig)
-    const retEx = ret.map((r, idx) => ({ ...(r || {}), sig: sigs[idx] || "" }))
+
+    const byTitle = new Map()
+    const byNorm = new Map()
+    for (const d of details) {
+      const title = String(d?.title || "").trim()
+      if (!title) continue
+      const sig = buildDetailSig(d)
+      if (!sig) continue
+
+      const list = byTitle.get(title) || []
+      list.push(sig)
+      byTitle.set(title, list)
+
+      const nk = normTitleKey(title)
+      if (nk) {
+        const list2 = byNorm.get(nk) || []
+        list2.push(sig)
+        byNorm.set(nk, list2)
+      }
+    }
+
+    const retEx = ret.map((r) => {
+      const title = String(r?.title || "").trim()
+      let sig = ""
+      if (title) {
+        const list = byTitle.get(title)
+        if (list && list.length) sig = list.shift() || ""
+      }
+      if (!sig && title) {
+        const nk = normTitleKey(title)
+        const list2 = nk ? byNorm.get(nk) : null
+        if (list2 && list2.length) sig = list2.shift() || ""
+      }
+      return { ...(r || {}), sig }
+    })
     return { ...dmgProfile, retEx }
   } catch {
     return dmgProfile
@@ -410,11 +483,10 @@ async function main() {
             if (pd && typeof pd.getCalcRule === "function") {
               const charCalcData0 = await pd.getCalcRule()
               let charCalcData = charCalcData0
-              if (!Array.isArray(charCalcData?.details) || charCalcData.details.length === 0) {
-                const imported = await tryImportCalcModule(calcPath)
-                if (imported) charCalcData = imported
-              }
-              dmgProfile = attachRetSig(dmgProfile, charCalcData)
+            if (!Array.isArray(charCalcData?.details) || charCalcData.details.length === 0) {
+              const imported = await tryImportCalcModule(calcPath)
+              if (imported) charCalcData = imported
+            }
               talentLv = pd.profile?.talent || null
               const detail = pd.char?.detail || {}
               const maxTableLen = (tk) => {
@@ -441,8 +513,11 @@ async function main() {
                 cons: (pd.profile?.cons || 0) * 1,
                 talent: talentPlan,
                 trees: pd.trees(),
-                weapon: pd.profile?.weapon
+                weapon: pd.profile?.weapon,
+                elem: avatar.elem,
+                element: avatar.elem
               }
+              dmgProfile = attachRetSig(dmgProfile, charCalcData, meta)
               let defParams = charCalcData?.defParams || {}
               defParams = typeof defParams === "function" ? defParams(meta) : defParams || {}
               const originalAttr = DmgAttr.getAttr({
@@ -727,7 +802,6 @@ async function main() {
               const imported = await tryImportCalcModule(calcPath)
               if (imported) charCalcData = imported
             }
-            dmgProfile = attachRetSig(dmgProfile, charCalcData)
             talentLv = pd.profile?.talent || null
             const detail = pd.char?.detail || {}
             const maxTableLen = (tk) => {
@@ -754,8 +828,11 @@ async function main() {
               cons: (pd.profile?.cons || 0) * 1,
               talent: talentPlan,
               trees: pd.trees(),
-              weapon: pd.profile?.weapon
+              weapon: pd.profile?.weapon,
+              elem: avatar.elem,
+              element: avatar.elem
             }
+            dmgProfile = attachRetSig(dmgProfile, charCalcData, meta)
             let defParams = charCalcData?.defParams || {}
             defParams = typeof defParams === "function" ? defParams(meta) : defParams || {}
             const originalAttr = DmgAttr.getAttr({

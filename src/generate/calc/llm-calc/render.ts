@@ -257,20 +257,21 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     const hasHpDmgCtx =
       new RegExp(`(?:基于|按).{0,20}${hpWord}.{0,30}${dmgWord}`).test(desc) ||
       new RegExp(`${dmgWord}.{0,30}(?:基于|按).{0,20}${hpWord}`).test(desc) ||
-      new RegExp(`${eqWord}.{0,20}${hpWord}.{0,30}伤害`).test(desc) ||
-      new RegExp(`伤害.{0,30}${eqWord}.{0,20}${hpWord}`).test(desc)
+      // Allow a longer window to tolerate placeholder noise like "$1[f1]% 和 $2[f1]%".
+      new RegExp(`${eqWord}.{0,60}${hpWord}.{0,30}伤害`).test(desc) ||
+      new RegExp(`伤害.{0,30}${eqWord}.{0,60}${hpWord}`).test(desc)
 
     const hasDefDmgCtx =
       new RegExp(`(?:基于|按).{0,20}${defWord}.{0,30}${dmgWord}`).test(desc) ||
       new RegExp(`${dmgWord}.{0,30}(?:基于|按).{0,20}${defWord}`).test(desc) ||
-      new RegExp(`${eqWord}.{0,20}${defWord}.{0,30}伤害`).test(desc) ||
-      new RegExp(`伤害.{0,30}${eqWord}.{0,20}${defWord}`).test(desc)
+      new RegExp(`${eqWord}.{0,60}${defWord}.{0,30}伤害`).test(desc) ||
+      new RegExp(`伤害.{0,30}${eqWord}.{0,60}${defWord}`).test(desc)
 
     const hasEmDmgCtx =
       new RegExp(`(?:基于|按).{0,20}${emWord}.{0,30}${dmgWord}`).test(desc) ||
       new RegExp(`${dmgWord}.{0,30}(?:基于|按).{0,20}${emWord}`).test(desc) ||
-      new RegExp(`${eqWord}.{0,20}${emWord}.{0,30}伤害`).test(desc) ||
-      new RegExp(`伤害.{0,30}${eqWord}.{0,20}${emWord}`).test(desc)
+      new RegExp(`${eqWord}.{0,60}${emWord}.{0,30}伤害`).test(desc) ||
+      new RegExp(`伤害.{0,30}${eqWord}.{0,60}${emWord}`).test(desc)
 
     if (hasEmDmgCtx && !emBonusCtx && !emBuffCtx) return 'mastery'
     if (hasHpDmgCtx && !hasHpHealCtx && !hpBonusCtx && !hpBuffCtx && !hpInheritCtx) return 'hp'
@@ -281,10 +282,32 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
   const inferScaleStatFromDesc = (descRaw: unknown): CalcScaleStat => {
     const desc = normalizePromptText(descRaw)
     if (!desc) return 'atk'
-    if (/(元素精通|精通)/.test(desc)) return 'mastery'
-    if (/(基于|按).{0,20}(生命上限|生命值上限|最大生命值|生命值)/.test(desc)) return 'hp'
-    if (/(基于|按).{0,20}防御力/.test(desc)) return 'def'
-    if (/(基于|按).{0,20}(攻击力|攻击)/.test(desc)) return 'atk'
+
+    const verbs = '(?:基于|按(?:照)?|受益于|取决于|根据|依据)'
+    const hpWord = '(?:生命上限|生命值上限|最大生命值|生命值|\\bhp\\b)'
+    const defWord = '(?:防御力|防御|\\bdef\\b)'
+    const atkWord = '(?:攻击力|\\batk\\b)'
+    const emWord = '(?:元素精通|精通|mastery|elemental mastery|\\bem\\b)'
+
+    const hasScalingHint = (statWord: string): boolean =>
+      new RegExp(`${verbs}.{0,40}${statWord}`, 'i').test(desc) ||
+      new RegExp(`受.{0,10}${statWord}.{0,10}(?:影响|决定)`, 'i').test(desc) ||
+      new RegExp(`${statWord}.{0,20}(?:决定|影响|相关|为基础|为基准|为依据)`, 'i').test(desc) ||
+      new RegExp(`以.{0,40}${statWord}.{0,20}(?:为基础|为基准|为依据)`, 'i').test(desc)
+
+    const hp = hasScalingHint(hpWord)
+    const def = hasScalingHint(defWord)
+    const mastery = hasScalingHint(emWord)
+    const atk = hasScalingHint(atkWord)
+
+    const hits = Number(hp) + Number(def) + Number(mastery) + Number(atk)
+    if (hits === 1) return hp ? 'hp' : def ? 'def' : mastery ? 'mastery' : 'atk'
+
+    // Mixed descriptions are common (damage + heal/shield in one talent). Bias towards non-ATK scaling.
+    if (hp) return 'hp'
+    if (def) return 'def'
+    if (mastery) return 'mastery'
+    if (atk) return 'atk'
     return 'atk'
   }
 
@@ -667,8 +690,9 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       if (talentKey) {
         detailsLines.push(`    talent: ${jsString(talentKey)},`)
       }
-      // For reaction-only rows, baseline calc.js typically omits dmgKey to avoid accidental key-based buffs.
-      if (kind !== 'reaction') {
+      // Baseline calc.js typically omits dmgKey for non-damage rows (heal/shield/reaction)
+      // to avoid accidental key-based buffs and to keep signatures stable.
+      if (kind === 'dmg') {
         detailsLines.push(`    dmgKey: ${jsString(d.key || talentKey || 'e')},`)
       }
       if (typeof d.cons === 'number' && Number.isFinite(d.cons)) {
@@ -894,7 +918,9 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         /伤害/.test(descA) &&
         !/(治疗|护盾|回复)/.test(descA) &&
         /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
-      const allowNonAtk = strongNonAtkFromDesc || /(存护|丰饶|记忆)/.test(path)
+      // Baseline meta treats most SR basic attacks as ATK-scaling.
+      // Do NOT allow non-ATK scaling purely from description heuristics; only allow it for specific paths.
+      const allowNonAtk = /(存护|丰饶|记忆)/.test(path)
       if (!allowNonAtk && baseInferred !== 'atk') baseInferred = 'atk'
     }
     // SR: allow validated plan.stat overrides for HP/DEF-scaling kits.
@@ -912,7 +938,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         /伤害/.test(descA) &&
         !/(治疗|护盾|回复)/.test(descA) &&
         /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
-      const allowNonAtk = strongNonAtkFromDesc || /(存护|丰饶|记忆)/.test(path)
+      const allowNonAtk = /(存护|丰饶|记忆)/.test(path)
       if (!allowNonAtk && statOverride && statOverride !== 'atk') statOverride = ''
     }
     const base = (statOverride || baseInferred) as 'atk' | 'hp' | 'def' | 'mastery'
@@ -997,7 +1023,6 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	      detailsLines.push('  {')
 	      detailsLines.push(`    title: ${title},`)
 	      detailsLines.push(`    talent: ${jsString(talent)},`)
-	      detailsLines.push(`    dmgKey: ${dmgKeyProp},`)
       if (typeof d.cons === 'number' && Number.isFinite(d.cons)) {
         detailsLines.push(`    cons: ${Math.trunc(d.cons)},`)
       }

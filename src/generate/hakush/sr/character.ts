@@ -310,7 +310,7 @@ function inferUnitHintFromTableValues(valuesRaw: unknown): string {
     if (!t) continue
     if (/(元素精通|精通|mastery|elemental mastery|\bem\b)/i.test(t)) return '元素精通'
     if (/(生命值上限|最大生命值|生命值|\bhp\b)/i.test(t)) return '生命值上限'
-    if (/(防御力|\bdef\b)/i.test(t)) return '防御力'
+    if (/(防御力|防御|\bdef\b)/i.test(t)) return '防御力'
     if (/(攻击力|攻击|\batk\b)/i.test(t)) return '攻击力'
   }
   return ''
@@ -706,12 +706,7 @@ function guessSrParamName(opts: {
     // These are not regular "技能伤害" multipliers and should be named explicitly so downstream calc.js
     // can model them via `reaction("<elem>Break"/"superBreak")` and related buffs.
     if (/(击破伤害)/.test(local) || /(击破伤害)/.test(around)) {
-      if (/超击破/.test(local) || /超击破/.test(around)) return '超击破伤害比例'
-      // Special wording: "造成...属性击破伤害的击破伤害" / "无视弱点属性..." is closer to baseline "击破伤害".
-      // Keep the generic "击破伤害比例" for regular break-ratio tables (e.g. Ruan Mei).
-      if (/属性击破伤害/.test(local) || /属性击破伤害/.test(around) || /无视弱点属性/.test(around)) {
-        return withMemospriteSuffix('击破伤害')
-      }
+      if (/超击破/.test(local) || /超击破/.test(around)) return withMemospriteSuffix('超击破伤害')
       return withMemospriteSuffix('击破伤害比例')
     }
 

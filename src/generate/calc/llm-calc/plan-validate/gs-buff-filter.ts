@@ -100,8 +100,12 @@ export function applyGsBuffFilterTowardsBaseline(input: CalcSuggestInput, buffs:
     const data = b.data
     if (!data || typeof data !== 'object' || Array.isArray(data)) continue
 
-    const dmgIntent = hasDamageIntent(evidence)
-    const mulIntent = hasMultiplierIntent(evidence)
+    const isUpstreamLike = title.startsWith('upstream:')
+    const hasDamageKeys = isUpstreamLike && Object.keys(data).some((k) => isDamageLikeKey(k))
+    const hasMultiKeys = isUpstreamLike && Object.keys(data).some((k) => /Multi$/.test(String(k || '')))
+
+    const dmgIntent = hasDamageIntent(evidence) || hasDamageKeys
+    const mulIntent = hasMultiplierIntent(evidence) || hasMultiKeys
 
     let changed = false
 

@@ -1,6 +1,6 @@
 import type { CalcSuggestBuff, CalcSuggestInput, CalcSuggestResult } from './llm-calc/types.js'
 import { heuristicPlan } from './llm-calc/heuristic.js'
-import { validatePlan, applySrDerivedFromBuffHints } from './llm-calc/plan-validate.js'
+import { validatePlan } from './llm-calc/plan-validate.js'
 import { renderCalcJs } from './llm-calc/render.js'
 import { validateCalcJsRuntime, validateCalcJsText } from './llm-calc/js-validate.js'
 import { buildGsUpstreamDirectBuffs } from './upstream-direct-gs.js'
@@ -128,12 +128,6 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
   } catch {
     // keep heuristic plan as-is
   }
-  applySrDerivedFromBuffHints(input, plan)
-  try {
-    plan = validatePlan(input, plan)
-  } catch {
-    // best-effort
-  }
 
   try {
     const js = renderCalcJs(input, plan, createdBy)
@@ -149,7 +143,6 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
     } catch {
       // keep heuristic
     }
-    applySrDerivedFromBuffHints(input, fallbackPlan)
 
     const js = renderCalcJs(input, fallbackPlan, createdBy)
     try {

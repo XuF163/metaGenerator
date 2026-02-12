@@ -243,12 +243,19 @@ function diffRuns(baseline, generated) {
     const gRows = gRet.map((gr0, gi) => {
       const gr = gr0 || null
       const sig = typeof gr?.sig === "string" ? gr.sig.trim() : ""
+      const sigLoose = (() => {
+        if (!sig) return ""
+        const parts = sig.split("|")
+        if (parts.length < 5) return sig
+        return `${parts.slice(0, 4).join("|")}|`
+      })()
       const strict = normTitle(gr?.title)
       const loose = normTitleLoose(gr?.title)
       return {
         gi,
         gr,
         sig,
+        sigLoose,
         strict,
         loose,
         cat: extractCat(strict),
@@ -257,6 +264,7 @@ function diffRuns(baseline, generated) {
       }
     })
     const gBySig = new Map()
+    const gBySigLoose = new Map()
     const gByStrict = new Map()
     const gByLoose = new Map()
     for (const row of gRows) {
@@ -264,6 +272,11 @@ function diffRuns(baseline, generated) {
         const list = gBySig.get(row.sig) || []
         list.push(row.gi)
         gBySig.set(row.sig, list)
+      }
+      if (row.sigLoose) {
+        const list = gBySigLoose.get(row.sigLoose) || []
+        list.push(row.gi)
+        gBySigLoose.set(row.sigLoose, list)
       }
       if (row.strict) {
         const list = gByStrict.get(row.strict) || []
@@ -281,6 +294,12 @@ function diffRuns(baseline, generated) {
     const matches = new Map() // baseline idx -> { gi, match }
     const pickBest = (br, bi) => {
       const bSig = typeof br?.sig === "string" ? br.sig.trim() : ""
+      const bSigLoose = (() => {
+        if (!bSig) return ""
+        const parts = bSig.split("|")
+        if (parts.length < 5) return bSig
+        return `${parts.slice(0, 4).join("|")}|`
+      })()
       const bStrict = normTitle(br?.title)
       const bLoose = normTitleLoose(br?.title)
       const bCat = extractCat(bStrict)
@@ -288,6 +307,10 @@ function diffRuns(baseline, generated) {
 
       const cand = new Set()
       for (const gi of (bSig ? gBySig.get(bSig) || [] : [])) {
+        if (!usedGenIdx.has(gi)) cand.add(gi)
+      }
+      // Allow signature matching without params (baseline often encodes stack/variant params while generated rows may omit them).
+      for (const gi of (bSigLoose ? gBySigLoose.get(bSigLoose) || [] : [])) {
         if (!usedGenIdx.has(gi)) cand.add(gi)
       }
       // Fallback to title matching when signature is missing (or not produced by older evidence runs).
@@ -306,12 +329,13 @@ function diffRuns(baseline, generated) {
       for (const gi of cand) {
         const row = gRows[gi]
         if (!row) continue
-        const isSig = !!bSig && row.sig === bSig
-        if (!isSig && bCat && row.cat && row.cat !== bCat) continue
+        const isSigStrict = !!bSig && row.sig === bSig
+        const isSigLoose = !isSigStrict && !!bSigLoose && row.sigLoose === bSigLoose
+        if (!isSigStrict && !isSigLoose && bCat && row.cat && row.cat !== bCat) continue
 
         const isStrict = !!bStrict && row.strict === bStrict
-        const match = isSig ? "sig" : isStrict ? "strict" : "loose"
-        const penalty = isSig ? 0 : isStrict ? 0.15 : 0.35
+        const match = isSigStrict ? "sig" : isSigLoose ? "sig-loose" : isStrict ? "strict" : "loose"
+        const penalty = isSigStrict ? 0 : isSigLoose ? 0.05 : isStrict ? 0.15 : 0.35
         const diff = scoreDiff(bAvg, row.avg)
         const score = penalty + diff
 
@@ -320,9 +344,9 @@ function diffRuns(baseline, generated) {
           continue
         }
         if (Math.abs(score - best.score) < 1e-12) {
-          // Tie-break: prefer strict, then smaller diff, then smaller index.
-          if (match === "sig" && best.match !== "sig") best = { gi, match, score, diff }
-          else if (match === "strict" && best.match !== "sig" && best.match !== "strict") best = { gi, match, score, diff }
+          // Tie-break: prefer signature, then strict, then smaller diff, then smaller index.
+          const rank = (m) => (m === "sig" ? 0 : m === "sig-loose" ? 1 : m === "strict" ? 2 : 3)
+          if (rank(match) < rank(best.match)) best = { gi, match, score, diff }
           else if (diff < best.diff - 1e-12) best = { gi, match, score, diff }
           else if (gi < best.gi) best = { gi, match, score, diff }
         }

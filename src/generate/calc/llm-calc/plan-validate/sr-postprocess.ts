@@ -623,7 +623,8 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
     // Best-effort: do not block generation.
   }
 
-  // 0c) Common SR blast pattern: tables provide both "技能伤害" (main) and "相邻目标伤害" (adjacent),
+  // 0c) Common SR blast pattern: tables provide both main-target dmg (技能伤害/目标伤害/主目标伤害) and
+  // adjacent-target dmg (相邻目标伤害),
   // but models often only emit a single generic row (e.g. "战技伤害").
   // Add the missing adjacent row so the later blast-style pass can normalize "(主目标)" and derive a "(完整)" total.
   try {
@@ -680,9 +681,10 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
 
       const list = Array.isArray(listRaw) ? listRaw.map((s) => norm(s)).filter(Boolean) : []
       if (!list.includes('相邻目标伤害')) continue
-      if (!list.includes('技能伤害')) continue
+      const mainTable = ['技能伤害', '目标伤害', '主目标伤害'].find((t) => list.includes(t)) || ''
+      if (!mainTable) continue
 
-      const main = findDmgDetail(tk, '技能伤害')
+      const main = findDmgDetail(tk, mainTable)
       const adj = findDmgDetail(tk, '相邻目标伤害')
 
       const basePrefer = preferBaseTitleByTalent(tk)
@@ -697,10 +699,14 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
           title: `${base}(主目标)`,
           kind: 'dmg',
           talent: tk as any,
-          table: '技能伤害',
+          table: mainTable,
           key,
-          stat: inferScaleStat(tk, '技能伤害') as any
+          stat: inferScaleStat(tk, mainTable) as any
         } as any)
+      } else {
+        // Normalize existing main row title so base-grouping works even when the adjacent row already exists.
+        const t = String((main as any).title || '').trim()
+        if (!/\(主目标\)/.test(t)) (main as any).title = `${base}(主目标)`
       }
 
       // Ensure the adjacent row exists for blast derivation.
@@ -720,8 +726,9 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
           check: typeof proto.check === 'string' ? proto.check : undefined
         } as any)
       } else {
-        const t = String((adj as any).title || '').trim()
-        if (!/相邻目标/.test(norm(t))) (adj as any).title = `${base}(相邻目标)`
+        // IMPORTANT: always normalize the adjacent row title to share the same base,
+        // even when the model already emitted a raw "相邻目标..." title.
+        ;(adj as any).title = `${base}(相邻目标)`
       }
     }
   } catch {
@@ -868,6 +875,99 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
     }
   } catch {
     // Best-effort: do not block generation.
+  }
+
+  // 2b) Enhanced/strength state convention:
+  // - Baseline SR meta frequently uses `params.strength===true` to represent an enhanced/transformed state.
+  // - Many SR kits store enhanced multipliers in `e2/q2` talent blocks.
+  // Mark those rows as strength-state and add a `q+strength` variant when only `q` rows exist.
+  try {
+    const hasEnhancedBlock = Object.keys(tables || {}).some((tk) => /^e2\b|^q2\b/.test(String(tk || '').trim()))
+    if (hasEnhancedBlock) {
+      const ensureStrength = (d: CalcSuggestDetail): void => {
+        const p0 = (d as any)?.params
+        const p =
+          p0 && typeof p0 === 'object' && !Array.isArray(p0)
+            ? ({ ...(p0 as Record<string, number | boolean | string>) } as Record<string, number | boolean | string>)
+            : ({} as Record<string, number | boolean | string>)
+        if (!Object.prototype.hasOwnProperty.call(p, 'strength')) p.strength = true
+        ;(d as any).params = p
+      }
+
+      for (const d of details) {
+        if (!d || typeof d !== 'object') continue
+        if (!isDmg(d)) continue
+        const tk = String((d as any).talent || '').trim()
+        if (!/^e2\b|^q2\b/.test(tk)) continue
+        ensureStrength(d)
+      }
+
+      const hasStrengthUlt = details.some((d: any) => {
+        if (!d || typeof d !== 'object') return false
+        if (normalizeKind(d.kind) !== 'dmg') return false
+        const tk = String(d.talent || '').trim()
+        if (!tk.startsWith('q')) return false
+        const p = d.params
+        return !!(p && typeof p === 'object' && !Array.isArray(p) && (p as any).q === true && (p as any).strength === true)
+      })
+
+      if (!hasStrengthUlt) {
+        const pickQ = (): CalcSuggestDetail | null => {
+          const full = details.find((d: any) => {
+            if (!d || typeof d !== 'object') return false
+            if (normalizeKind(d.kind) !== 'dmg') return false
+            if (String(d.talent || '').trim() !== 'q') return false
+            const p = d.params
+            if (!(p && typeof p === 'object' && !Array.isArray(p) && (p as any).q === true)) return false
+            return isFullTitle(String(d.title || ''))
+          })
+          if (full) return full as any
+          return (
+            (details.find((d: any) => {
+              if (!d || typeof d !== 'object') return false
+              if (normalizeKind(d.kind) !== 'dmg') return false
+              if (String(d.talent || '').trim() !== 'q') return false
+              const p = d.params
+              return !!(p && typeof p === 'object' && !Array.isArray(p) && (p as any).q === true)
+            }) as any) || null
+          )
+        }
+
+        const qRow = pickQ()
+        if (qRow) {
+          const clone: CalcSuggestDetail = JSON.parse(JSON.stringify(qRow))
+          const t0 = String((clone as any).title || '').trim()
+          ;(clone as any).title = t0 ? `${baseOf(t0)}(强化状态)` : '终结技伤害(强化状态)'
+
+          const p0 = (clone as any)?.params
+          const p =
+            p0 && typeof p0 === 'object' && !Array.isArray(p0)
+              ? ({ ...(p0 as Record<string, number | boolean | string>) } as Record<string, number | boolean | string>)
+              : ({} as Record<string, number | boolean | string>)
+          p.q = true
+          p.strength = true
+          ;(clone as any).params = p
+
+          if (details.length < 20) {
+            details.push(clone)
+          } else {
+            // Replace a low-signal normal attack row if possible.
+            for (let i = details.length - 1; i >= 0; i--) {
+              const cur: any = details[i]
+              if (!cur || typeof cur !== 'object') continue
+              if (normalizeKind(cur.kind) !== 'dmg') continue
+              const tk = String(cur.talent || '').trim()
+              if (tk === 'a' || tk === 'a2' || tk === 'a3') {
+                details.splice(i, 1, clone)
+                break
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
   }
 
   // 3) Multi-hit segment showcase: when the official talent desc exposes a hard cap like

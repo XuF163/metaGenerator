@@ -35,13 +35,14 @@ export function applyGsPostprocess(opts: {
     return normalizePromptText(u)
   }
 
-  const gsInferStatFromUnit = (unitRaw: unknown, fallback: CalcScaleStat): CalcScaleStat => {
+  const gsTryInferStatFromUnit = (unitRaw: unknown): CalcScaleStat | null => {
     const unit = normalizePromptText(unitRaw)
+    if (!unit) return null
     if (/(元素精通|精通|mastery|elemental mastery|\bem\b)/i.test(unit)) return 'mastery'
     if (/(生命值上限|最大生命值|生命值|\bhp\b)/i.test(unit)) return 'hp'
     if (/(防御力|防御|\bdef\b)/i.test(unit)) return 'def'
     if (/(攻击力|攻击|\batk\b)/i.test(unit)) return 'atk'
-    return fallback
+    return null
   }
 
   const gsCleanHealShieldTitle = (table: string): string => {
@@ -128,10 +129,12 @@ export function applyGsPostprocess(opts: {
     const table = gsPickPrefer2(candidates)
     if (!table) return
 
-    const stat = gsInferStatFromUnit(gsUnitOf(talent, table), kind === 'heal' ? 'hp' : 'def')
     const prefix = talent === 'a' ? 'A' : talent === 'e' ? 'E' : 'Q'
     const title = `${prefix}${gsCleanHealShieldTitle(table)}`
-    gsPushDetail({ title, kind, talent, table, stat, key: talent })
+    const unitStat = gsTryInferStatFromUnit(gsUnitOf(talent, table))
+    const d: CalcSuggestDetail = { title, kind, talent, table, key: talent }
+    if (unitStat) d.stat = unitStat
+    gsPushDetail(d)
   }
 
   addGsHealOrShield('e', 'heal')
@@ -147,15 +150,42 @@ export function applyGsPostprocess(opts: {
 
   // 1) Core A variants: charged attack is frequently shown in baseline profiles.
   const aTables = normalizeTableList((tables as any).a || [])
+  const gsWeapon = String(input.weapon || '').trim().toLowerCase()
+  const gsIsBow = gsWeapon === 'bow'
+
+  const gsScoreA2Table = (tRaw: string): number => {
+    const t = normalizePromptText(tRaw)
+    if (!t) return -1
+    if (!/伤害/.test(t)) return -1
+    if (/(冷却时间|持续时间|体力消耗|元素能量|能量恢复|积攒|治疗|护盾|吸收量|上限|能量值)/.test(t)) return -1
+    if (/(下坠|坠地|低空|高空)/.test(t)) return -1
+
+    let s = 0
+    if (/重击/.test(t)) s += 90
+    if (/(瞄准|蓄力)/.test(t)) s += 85
+    if (/满/.test(t) && /(瞄准|蓄力)/.test(t)) s += 20
+    if (gsIsBow && /(箭|矢)/.test(t)) s += 25
+
+    if (/(次级|追加|额外|附加|协同|追击|连携|后续)/.test(t)) s -= 20
+    // Avoid treating plain NA segments as charged/aimed shots.
+    if (/(首段|一段|二段|三段|四段|五段|六段|七段|八段|九段|十段|段伤害)/.test(t)) s -= 60
+    if (/2$/.test(t)) s -= 1
+    return s
+  }
+
   const chargedTable =
     aTables.find((t) => t === '重击伤害') ||
     aTables.find((t) => t === '重击伤害2') ||
-    aTables.find((t) => /重击/.test(t) && /伤害/.test(t))
-  if (chargedTable && details.length < 20) {
-    // Prefer key=a2 so buffs gated by currentTalent can distinguish it.
-    if (!gsHasDetail({ kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })) {
-      gsPushDetail({ title: '重击伤害', kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })
-    }
+    aTables.find((t) => /重击/.test(t) && /伤害/.test(t)) ||
+    aTables
+      .map((t) => ({ t, s: gsScoreA2Table(t) }))
+      .filter((x) => x.s >= 20)
+      .sort((a, b) => b.s - a.s || a.t.length - b.t.length)[0]?.t ||
+    ''
+
+  if (chargedTable) {
+    const title = chargedTable.endsWith('2') ? chargedTable.slice(0, -1) : chargedTable
+    gsPushDetail({ title, kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })
   }
 
   // 2) Add a small number of extra E/Q damage tables when available.
@@ -299,16 +329,16 @@ export function applyGsPostprocess(opts: {
 
   // 3) Elemental reaction variants (amp / catalyze) for key hits.
   const gsEleVariant:
-    | { id: 'vaporize' | 'melt' | 'aggravate' | 'spread'; suffix: string; maxE: number; maxQ: number }
+    | { id: 'vaporize' | 'melt' | 'aggravate' | 'spread'; suffix: string; maxA: number; maxE: number; maxQ: number }
     | null =
     gsIsElem('火', 'pyro') || gsIsElem('水', 'hydro')
-      ? { id: 'vaporize', suffix: '蒸发', maxE: 2, maxQ: 1 }
+      ? { id: 'vaporize', suffix: '蒸发', maxA: 1, maxE: 2, maxQ: 1 }
       : gsIsElem('冰', 'cryo')
-        ? { id: 'melt', suffix: '融化', maxE: 2, maxQ: 1 }
+        ? { id: 'melt', suffix: '融化', maxA: 1, maxE: 2, maxQ: 1 }
         : gsIsElem('雷', 'electro')
-          ? { id: 'aggravate', suffix: '超激化', maxE: 2, maxQ: 2 }
+          ? { id: 'aggravate', suffix: '超激化', maxA: 1, maxE: 2, maxQ: 2 }
           : gsIsElem('草', 'dendro')
-            ? { id: 'spread', suffix: '激化', maxE: 2, maxQ: 2 }
+            ? { id: 'spread', suffix: '激化', maxA: 1, maxE: 2, maxQ: 2 }
             : null
 
   const gsMakeEleTitle = (titleRaw: string, suffix: string): string => {
@@ -386,6 +416,19 @@ export function applyGsPostprocess(opts: {
       const a2 = bases.find((d) => d.talent === 'a' && (d.key === 'a2' || /重击/.test(d.title)))
       if (a2) gsTryAddEleVariant(a2, gsEleVariant)
     }
+
+    const scoreA = (d: CalcSuggestDetail): number => {
+      const title = normalizePromptText(d.title)
+      const table = normalizePromptText(d.table)
+      const s = `${title} ${table}`
+      let sc = scoreBase(d)
+      if (d.key === 'a2' || /(重击|瞄准|蓄力)/.test(s)) sc += 60
+      return sc
+    }
+    const aBases = bases
+      .filter((d) => d.talent === 'a')
+      .sort((a, b) => scoreA(b) - scoreA(a))
+    for (const d of aBases.slice(0, gsEleVariant.maxA)) gsTryAddEleVariant(d, gsEleVariant)
 
     const eBases = bases
       .filter((d) => d.talent === 'e')

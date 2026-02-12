@@ -147,6 +147,47 @@ function buildUidAvatarMap(testdataRootAbs, game, { requireArtis }) {
   return { map, universe, idToName }
 }
 
+function buildMetaUniverse(metaRootAbs, game) {
+  const universe = new Set()
+  const idToName = new Map()
+
+  const charDir = path.join(metaRootAbs, "character")
+  if (!fs.existsSync(charDir)) return { universe, idToName }
+
+  let entries = []
+  try {
+    entries = fs.readdirSync(charDir, { withFileTypes: true })
+  } catch {
+    return { universe, idToName }
+  }
+
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue
+    if (ent.name.startsWith(".")) continue
+    const dataPath = path.join(charDir, ent.name, "data.json")
+    if (!fs.existsSync(dataPath)) continue
+
+    let raw = null
+    try {
+      raw = JSON.parse(fs.readFileSync(dataPath, "utf8"))
+    } catch {
+      continue
+    }
+    const id = String(raw?.id || "").trim()
+    if (!id) continue
+    if (game === "sr") {
+      // SR: playable avatars are 4-digit ids (e.g. 1001..1415, 8005..8006).
+      if (!/^\d+$/.test(id) || Number(id) <= 0 || Number(id) > 9999) continue
+    }
+
+    const name = String(raw?.name || "").trim()
+    universe.add(id)
+    if (name) idToName.set(id, name)
+  }
+
+  return { universe, idToName }
+}
+
 function greedyCover(uidToIds, universe) {
   const remaining = new Set(universe)
   const picked = []
@@ -209,7 +250,7 @@ function renderSummaryMd({ game, cover, perUid, worstAvatars }) {
   const lines = []
   lines.push(`# panel-regression-cover (${game})`)
   lines.push("")
-  lines.push(`- testData avatars: ${cover.universeCount}`)
+  lines.push(`- universe avatars: ${cover.universeCount}`)
   lines.push(`- selected uids (${cover.selectedUids.length}): ${cover.selectedUids.join(", ")}`)
   lines.push(`- covered avatars: ${cover.coveredCount}/${cover.universeCount}`)
   if (cover.missingCount) {
@@ -411,17 +452,43 @@ async function main() {
       ? toAbs(repoRoot, generatedMetaRootArg)
       : path.join(repoRoot, "temp", "metaGenerator", ".output", `meta-${game}`)
 
-    const { map, universe, idToName } = buildUidAvatarMap(testdataRoot, game, { requireArtis })
-    if (universe.size === 0 || map.size === 0) {
-      console.log(`[circaltest] skip game=${game} (no valid testData found under ${path.relative(repoRoot, testdataRoot)}/${game})`)
+    const uidsArgKey = game === "gs" ? "uidsGs" : "uidsSr"
+    const explicitUids = splitCsv(args[uidsArgKey] || args.uids || "")
+    const useMetaUniverse = explicitUids.length > 0 && !args.universeFromTestdata && !args.testdataUniverse
+
+    const { map, universe, idToName } = useMetaUniverse
+      ? { map: new Map(), ...buildMetaUniverse(baselineMetaRoot, game) }
+      : buildUidAvatarMap(testdataRoot, game, { requireArtis })
+
+    if (universe.size === 0 || (!useMetaUniverse && map.size === 0)) {
+      const src = useMetaUniverse
+        ? `baseline meta (${path.relative(repoRoot, baselineMetaRoot)})`
+        : `testData (${path.relative(repoRoot, testdataRoot)}/${game})`
+      console.log(`[circaltest] skip game=${game} (no valid universe found from ${src})`)
       continue
     }
 
-    const uidsArgKey = game === "gs" ? "uidsGs" : "uidsSr"
-    const explicitUids = splitCsv(args[uidsArgKey] || args.uids || "")
+    const ensureUidUsable = (uid) => {
+      if (!uid || uid === "100000000") return false
+      const p = path.join(testdataRoot, game, `${uid}.json`)
+      if (!fs.existsSync(p)) return false
+      if (!requireArtis) return true
+      try {
+        const raw = JSON.parse(fs.readFileSync(p, "utf8"))
+        return hasAnyArtis(raw)
+      } catch {
+        return false
+      }
+    }
+
     const { picked, remaining } = explicitUids.length
-      ? { picked: explicitUids.filter((u) => map.has(u) && u !== "100000000"), remaining: new Set() }
+      ? { picked: explicitUids.filter(ensureUidUsable), remaining: new Set() }
       : greedyCover(map, universe)
+
+    if (explicitUids.length && picked.length === 0) {
+      console.log(`[circaltest] skip game=${game} (no usable --uids found under ${path.relative(repoRoot, testdataRoot)}/${game})`)
+      continue
+    }
 
     if (remaining.size) {
       console.log(
