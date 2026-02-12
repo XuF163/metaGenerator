@@ -184,7 +184,9 @@ function inlineConsts(expr: string, constMap: Record<string, string>): string {
   for (const [k, v] of Object.entries(constMap)) {
     if (!k || !v) continue
     if (!out.includes(k)) continue
-    out = out.replace(new RegExp(`\\b${escapeRegExp(k)}\\b`, 'g'), `(${v})`)
+    // Do not inline when used as a member-access property name (e.g. `params.foo`),
+    // otherwise we'd emit invalid syntax like `params.(...)`.
+    out = out.replace(new RegExp(`(^|[^A-Za-z0-9_.])${escapeRegExp(k)}\\b`, 'g'), (_m0, pre) => `${pre}(${v})`)
   }
   return out
 }

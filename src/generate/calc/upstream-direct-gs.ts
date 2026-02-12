@@ -246,7 +246,9 @@ function hasUnknownFreeIdentifiers(expr: string): boolean {
     const id = m[0] || ''
     if (!id) continue
     const prev = expr[m.index - 1]
-    if (prev === '.') continue
+    const prev2 = expr[m.index - 2]
+    // Ignore member accesses like `Math.min`, but NOT spread operator like `...input`.
+    if (prev === '.' && prev2 !== '.') continue
     if (allowed.has(id)) continue
     return true
   }
@@ -328,6 +330,11 @@ function normalizeExprGs(exprRaw: string): string {
   expr = expr.replace(/\binput\.total\.atk\b/g, 'calc(attr.atk)')
   expr = expr.replace(/\binput\.total\.hp\b/g, 'calc(attr.hp)')
   expr = expr.replace(/\binput\.total\.def\b/g, 'calc(attr.def)')
+  // Best-effort: miao-plugin does not distinguish premod vs total; map both to total panel stats.
+  expr = expr.replace(/\binput\.premod\.atk\b/g, 'calc(attr.atk)')
+  expr = expr.replace(/\binput\.premod\.hp\b/g, 'calc(attr.hp)')
+  expr = expr.replace(/\binput\.premod\.def\b/g, 'calc(attr.def)')
+  expr = expr.replace(/\binput\.premod\.eleMas\b/g, 'calc(attr.mastery)')
   // Best-effort: treat ascension gates as always unlocked (panel regression uses real high-level profiles).
   expr = expr.replace(/\binput\.asc\b/g, '6')
   expr = expr.replace(/\bnaught\b/g, '0')
@@ -520,18 +527,102 @@ function extractObjectBlocksByPrefix(text: string, prefix: string): string[] {
   return blocks
 }
 
-function extractObjectEntryCandidates(text: string, prefix: string): Map<string, string[]> {
-  const out = new Map<string, string[]>()
-  const blocks = extractObjectBlocksByPrefix(text, prefix)
-  for (const block of blocks) {
-    const entries = parseObjectLiteralEntries(block)
-    for (const e of entries) {
-      if (!e.key) continue
-      const list = out.get(e.key) || []
-      list.push(e.value)
-      out.set(e.key, list)
+function extractDataObjOptionsBlock(text: string): string {
+  const idx = text.indexOf('dataObjForCharacterSheet(')
+  if (idx < 0) return ''
+  const brace = text.indexOf('{', idx)
+  if (brace < 0) return ''
+  return extractBraceBlock(text, brace)
+}
+
+function extractTopLevelObjectPropBlock(objText: string, propNameRaw: string): string {
+  const propName = String(propNameRaw || '').trim()
+  if (!propName) return ''
+  const isIdentChar = (ch: string | undefined): boolean => !!ch && /[A-Za-z0-9_]/.test(ch)
+
+  let depth = 0
+  let inStr: '"' | "'" | '`' | null = null
+  for (let i = 0; i < objText.length; i++) {
+    const ch = objText[i]!
+    if (inStr) {
+      if (ch === '\\') {
+        i++
+        continue
+      }
+      if (ch === inStr) inStr = null
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch
+      continue
+    }
+    if (ch === '{') {
+      depth++
+      continue
+    }
+    if (ch === '}') {
+      depth--
+      continue
+    }
+    if (depth !== 1) continue
+
+    if (
+      objText.startsWith(propName, i) &&
+      !isIdentChar(objText[i - 1]) &&
+      !isIdentChar(objText[i + propName.length])
+    ) {
+      let j = i + propName.length
+      while (j < objText.length && /\s/.test(objText[j]!)) j++
+      if (objText[j] !== ':') continue
+      j++
+      while (j < objText.length && /\s/.test(objText[j]!)) j++
+      if (objText[j] !== '{') continue
+      return extractBraceBlock(objText, j)
     }
   }
+  return ''
+}
+
+function pushObjectEntries(out: Map<string, string[]>, block: string): void {
+  if (!block) return
+  const entries = parseObjectLiteralEntries(block)
+  for (const e of entries) {
+    if (!e.key) continue
+    const list = out.get(e.key) || []
+    list.push(e.value)
+    out.set(e.key, list)
+  }
+}
+
+function extractObjectEntryCandidates(
+  text: string,
+  prefix: string,
+  opts?: { includeTeamBuffs?: boolean }
+): Map<string, string[]> {
+  const out = new Map<string, string[]>()
+  const includeTeamBuffs = Boolean(opts?.includeTeamBuffs)
+
+  // Prefer parsing the `dataObjForCharacterSheet(..., { ... })` options object to avoid accidentally
+  // pulling in unrelated blocks (and to make teamBuff inclusion explicit/configurable).
+  const optionsBlock = extractDataObjOptionsBlock(text)
+  if (optionsBlock) {
+    if (prefix === 'premod:') {
+      pushObjectEntries(out, extractTopLevelObjectPropBlock(optionsBlock, 'premod'))
+      if (includeTeamBuffs) {
+        const teamBuffBlock = extractTopLevelObjectPropBlock(optionsBlock, 'teamBuff')
+        pushObjectEntries(out, extractTopLevelObjectPropBlock(teamBuffBlock, 'premod'))
+        // Some upstream sheets place team-wide flat buffs under `teamBuff.total` (e.g. Bennett atk).
+        pushObjectEntries(out, extractTopLevelObjectPropBlock(teamBuffBlock, 'total'))
+      }
+    } else if (prefix === 'base:') {
+      pushObjectEntries(out, extractTopLevelObjectPropBlock(optionsBlock, 'base'))
+    }
+    if (out.size > 0) return out
+  }
+
+  // Fallback: scan all blocks by prefix.
+  const blocks = extractObjectBlocksByPrefix(text, prefix)
+  for (const block of blocks) pushObjectEntries(out, block)
   return out
 }
 
@@ -580,7 +671,8 @@ function translateGsExpr(
   if (!expr) return ''
 
   // Object-spread alias: `const x = { ...y }` (Clorinde: burst_dmgInc mirrors normal_dmgInc).
-  const spread = /^\{\s*\.\.\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*}\s*$/.exec(expr)
+  // Also used in upstream to mark "pivot" nodes (e.g. `infoMut({ ...input.premod.hp }, { pivot: true })`).
+  const spread = /^\{\s*\.\.\.\s*([^}]+?)\s*}\s*$/.exec(expr)
   if (spread) return translateGsExpr(spread[1]!, opts, stack, depth + 1)
 
   // dm.<path> -> numeric skillParam literal
@@ -658,13 +750,28 @@ function translateGsExpr(
     // Upstream-direct cannot faithfully map `*Index` into miao-plugin runtime, so approximate by
     // picking the *highest* numeric entry from the underlying dm array (showcase-like).
     if (fn === 'subscript') {
-      const dmArg = String(args[1] || '').trim().replace(/,$/, '')
-      const mDm = /^dm\.([A-Za-z0-9_.]+)$/.exec(dmArg)
-      if (!mDm) {
-        const v = t(dmArg)
-        return v || '0'
+      const pickDmPath = (raw: string): string | null => {
+        const s = String(raw || '').trim()
+        if (!s) return null
+        const direct = /^dm\.([A-Za-z0-9_.]+)$/.exec(s)
+        if (direct) return direct[1]!
+        const inner = /\bdm\.([A-Za-z0-9_.]+)\b/.exec(s)
+        return inner ? inner[1]! : null
       }
-      const dmPath = mDm[1]!
+
+      const dmArg0 = String(args[1] || '').trim().replace(/,$/, '')
+      const dmArg =
+        /^[A-Za-z_][A-Za-z0-9_]*$/.test(dmArg0) && opts.constInits.has(dmArg0)
+          ? String(opts.constInits.get(dmArg0) || '')
+          : dmArg0
+      const dmPath = pickDmPath(dmArg)
+      if (!dmPath) {
+        const v = t(dmArg0)
+        if (!v) return '0'
+        // Reject array literals/spreads; `subscript()` must resolve to a scalar.
+        if (/\.\.\./.test(v) || /^\s*\[/.test(v) || /^\s*\(\s*\[/.test(v)) return '0'
+        return v
+      }
       const lit = opts.dmConstNums.get(dmPath)
       if (typeof lit === 'number' && Number.isFinite(lit)) return String(lit)
       const access = opts.dmMap.get(dmPath)
@@ -694,7 +801,11 @@ function translateGsExpr(
     }
 
     if (fn === 'sum') {
-      const parts = args.map(t).filter(Boolean)
+      const parts = args
+        .map(t)
+        .filter(Boolean)
+        // Drop unresolved spread fragments like `...0` that are invalid in scalar expressions.
+        .filter((x) => !/\.\.\./.test(x))
       if (parts.length) return `(${parts.join(' + ')})`
       // Team-element counters (`tally.*`) are not representable in miao-plugin's calc.js runtime.
       // For upstream-direct, assume a "showcase-like" party that satisfies teammate-count thresholds,
@@ -703,7 +814,10 @@ function translateGsExpr(
       return '0'
     }
     if (fn === 'prod') {
-      const parts = args.map(t).filter(Boolean)
+      const parts = args
+        .map(t)
+        .filter(Boolean)
+        .filter((x) => !/\.\.\./.test(x))
       return parts.length ? `(${parts.join(' * ')})` : '0'
     }
     if (fn === 'min') {
@@ -896,7 +1010,8 @@ function translateGsExpr(
           const prevCh = i > 0 ? s[i - 1] : ''
           // Do not rewrite member accesses like `Math.min(...)` (otherwise we may emit `Math.(Math.min(...))`).
           // This mirrors the "prev === '.'" rule used by `hasUnknownFreeIdentifiers()`.
-          if (prevCh === '.') {
+          const prev2Ch = i > 1 ? s[i - 2] : ''
+          if (prevCh === '.' && prev2Ch !== '.') {
             out += rep
             i += id.length - 1
             continue
@@ -947,6 +1062,7 @@ export function buildGsUpstreamDirectBuffs(opts: {
   elem: string
   upstream?: {
     genshinOptimizerRoot?: string
+    includeTeamBuffs?: boolean
   }
 }): CalcSuggestBuff[] {
   const id = typeof opts.id === 'number' && Number.isFinite(opts.id) ? Math.trunc(opts.id) : 0
@@ -989,8 +1105,9 @@ export function buildGsUpstreamDirectBuffs(opts: {
   const dmMap = dmBlock ? parseDmMapping(dmBlock) : new Map<string, string>()
   const dmConstNums = dmBlock ? parseDmConstNumbers(dmBlock) : new Map<string, number>()
 
-  const premodCandidates = extractObjectEntryCandidates(text, 'premod:')
-  const baseCandidates = extractObjectEntryCandidates(text, 'base:')
+  const includeTeamBuffs = Boolean(opts.upstream?.includeTeamBuffs)
+  const premodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs })
+  const baseCandidates = extractObjectEntryCandidates(text, 'base:', { includeTeamBuffs })
   if (premodCandidates.size === 0 && baseCandidates.size === 0) return []
 
   const constInits = extractConstInitializers(text)
@@ -1021,6 +1138,8 @@ export function buildGsUpstreamDirectBuffs(opts: {
 
         const t = String(scaled || '').trim()
         if (!t || t === '0' || t === '(0)') continue
+        // Spread/rest fragments are not representable in miao-plugin runtime; keep upstream-direct deterministic.
+        if (/\.\.\./.test(t)) continue
         if (hasUnknownFreeIdentifiers(t)) continue
         data[buffKey] = mergeBuffValue(data[buffKey], t)
         break

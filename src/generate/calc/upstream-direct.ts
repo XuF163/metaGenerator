@@ -10,6 +10,63 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
+function normalizeSpace(text: string): string {
+  return String(text || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+}
+
+function parseNumberLiteral(text: string): number | null {
+  const t = String(text || '').trim()
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(t)) return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : null
+}
+
+function canonicalizeBuffDataPairs(dataRaw: unknown): Array<[string, number | string]> {
+  if (!isRecord(dataRaw)) return []
+  const out: Array<[string, number | string]> = []
+  const keys = Object.keys(dataRaw)
+    .map((k) => String(k || '').trim())
+    .filter(Boolean)
+    .sort()
+  for (const k of keys) {
+    const vRaw = (dataRaw as Record<string, unknown>)[k]
+    if (typeof vRaw === 'number') {
+      if (!Number.isFinite(vRaw)) continue
+      out.push([k, vRaw])
+      continue
+    }
+    if (typeof vRaw === 'string') {
+      const n = parseNumberLiteral(vRaw)
+      if (n != null) out.push([k, n])
+      else {
+        const t = normalizeSpace(vRaw)
+        if (t) out.push([k, t])
+      }
+      continue
+    }
+  }
+  return out
+}
+
+function buffSemanticSignature(buffRaw: unknown): string | null {
+  if (!isRecord(buffRaw)) return null
+  const title = typeof (buffRaw as any).title === 'string' ? String((buffRaw as any).title).trim() : ''
+  if (!title) return null
+
+  const cons = typeof (buffRaw as any).cons === 'number' && Number.isFinite((buffRaw as any).cons) ? Math.trunc((buffRaw as any).cons) : 0
+  const tree = typeof (buffRaw as any).tree === 'number' && Number.isFinite((buffRaw as any).tree) ? Math.trunc((buffRaw as any).tree) : 0
+  const check = typeof (buffRaw as any).check === 'string' ? normalizeSpace((buffRaw as any).check) : ''
+  const dataPairs = canonicalizeBuffDataPairs((buffRaw as any).data)
+
+  // Prefer a title-free signature so we can deduplicate across different sources/titles.
+  // If a buff has no usable `data`, we fall back to including title to avoid collapsing unrelated placeholders.
+  const canon: Record<string, unknown> = { cons, tree, check, data: dataPairs }
+  if (dataPairs.length === 0) canon.title = title
+  return JSON.stringify(canon)
+}
+
 function mergePlanBuffs(opts: {
   base: Array<CalcSuggestBuff | string> | undefined
   upstream: CalcSuggestBuff[]
@@ -17,27 +74,9 @@ function mergePlanBuffs(opts: {
 }): Array<CalcSuggestBuff | string> | undefined {
   const base = Array.isArray(opts.base) ? opts.base : []
   const upstream = Array.isArray(opts.upstream) ? opts.upstream : []
-  if (upstream.length === 0) return base.length ? base : undefined
-
-  const baseKeys = new Set<string>()
-  for (const b of base) {
-    if (!isRecord(b)) continue
-    const data = isRecord((b as any).data) ? ((b as any).data as Record<string, unknown>) : null
-    if (!data) continue
-    for (const k of Object.keys(data)) if (k) baseKeys.add(k)
-  }
-  const upstreamKeys = new Set<string>()
-  for (const b of upstream) {
-    if (!isRecord(b)) continue
-    const data = isRecord((b as any).data) ? ((b as any).data as Record<string, unknown>) : null
-    if (!data) continue
-    for (const k of Object.keys(data)) if (k) upstreamKeys.add(k)
-  }
-
-  const dropFromBase = opts.preferUpstream ? upstreamKeys : new Set<string>()
-  const dropFromUpstream = opts.preferUpstream ? new Set<string>() : baseKeys
-
+  if (base.length === 0 && upstream.length === 0) return undefined
   const seenStr = new Set<string>()
+  const seenBuff = new Map<string, { idx: number; source: 'base' | 'upstream' }>()
   const out: Array<CalcSuggestBuff | string> = []
 
   const pushStr = (s: string): void => {
@@ -48,21 +87,25 @@ function mergePlanBuffs(opts: {
     out.push(t)
   }
 
-  const filterBuff = (buffRaw: unknown, drop: Set<string>): CalcSuggestBuff | null => {
-    if (!isRecord(buffRaw)) return null
-    const title = typeof (buffRaw as any).title === 'string' ? ((buffRaw as any).title as string).trim() : ''
-    if (!title) return null
+  const pushBuff = (buffRaw: unknown, source: 'base' | 'upstream'): void => {
+    if (!isRecord(buffRaw)) return
+    const sig = buffSemanticSignature(buffRaw)
+    if (!sig) return
 
-    const dataIn = isRecord((buffRaw as any).data) ? ((buffRaw as any).data as Record<string, unknown>) : null
-    if (!dataIn) return buffRaw as unknown as CalcSuggestBuff
-
-    const data: Record<string, number | string> = {}
-    for (const [k, v] of Object.entries(dataIn)) {
-      if (!k || drop.has(k)) continue
-      if (typeof v === 'number' || typeof v === 'string') data[k] = v
+    const existing = seenBuff.get(sig)
+    if (!existing) {
+      out.push(buffRaw as unknown as CalcSuggestBuff)
+      seenBuff.set(sig, { idx: out.length - 1, source })
+      return
     }
-    if (Object.keys(data).length === 0) return null
-    return { ...(buffRaw as unknown as CalcSuggestBuff), data }
+
+    const shouldReplace =
+      (opts.preferUpstream && source === 'upstream' && existing.source === 'base') ||
+      (!opts.preferUpstream && source === 'base' && existing.source === 'upstream')
+    if (!shouldReplace) return
+
+    out[existing.idx] = buffRaw as unknown as CalcSuggestBuff
+    seenBuff.set(sig, { idx: existing.idx, source })
   }
 
   for (const b of base) {
@@ -70,13 +113,11 @@ function mergePlanBuffs(opts: {
       pushStr(b)
       continue
     }
-    const filtered = filterBuff(b, dropFromBase)
-    if (filtered) out.push(filtered)
+    pushBuff(b, 'base')
   }
 
   for (const b of upstream) {
-    const filtered = filterBuff(b, dropFromUpstream)
-    if (filtered) out.push(filtered)
+    pushBuff(b, 'upstream')
   }
 
   return out.length ? out : undefined
@@ -113,7 +154,10 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
             projectRootAbs: opts.projectRootAbs,
             id: input.id,
             elem: input.elem,
-            upstream: { genshinOptimizerRoot: opts.upstream?.genshinOptimizerRoot }
+            upstream: {
+              genshinOptimizerRoot: opts.upstream?.genshinOptimizerRoot,
+              includeTeamBuffs: opts.upstream?.includeTeamBuffs
+            }
           })
     const preferUpstream = opts.upstream?.preferUpstream !== false
     const merged = mergePlanBuffs({

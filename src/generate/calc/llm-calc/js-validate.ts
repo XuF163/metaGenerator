@@ -492,13 +492,15 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
       }
       // Extremely negative percent-like values almost always mean a unit/semantics mistake
       // (e.g. `talent.xxx - 100` when talent.xxx is actually a small percent per stack/energy).
-      if (isPercentLikeKey(key) && ret < -80) {
+      const minPercentLike = isCritRateKey(key) ? -100 : -80
+      if (isPercentLikeKey(key) && ret < minPercentLike) {
         throw new Error(`buff.data() returned suspicious negative percent-like value: ${key}=${ret}`)
       }
     }
 
     for (const b of buffs) {
       if (!b || typeof b !== 'object') continue
+      const title = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
       try {
         if (typeof (b as any).check === 'function') {
           const prev = ctx0.currentTalent
@@ -515,7 +517,9 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
-        throw new Error(`[meta-gen] Generated calc.js invalid buff.check() (${passLabel}): ${msg}`)
+        throw new Error(
+          `[meta-gen] Generated calc.js invalid buff.check() (${passLabel}${title ? ` ${title}` : ''}): ${msg}`
+        )
       }
       const data = (b as any).data
       if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -553,7 +557,9 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
             ctx0.currentTalent = prev
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
-            throw new Error(`[meta-gen] Generated calc.js invalid buff.data() (${passLabel}): ${msg}`)
+            throw new Error(
+              `[meta-gen] Generated calc.js invalid buff.data() (${passLabel}${title ? ` ${title}` : ''}[${k}]): ${msg}`
+            )
           }
         }
       }
