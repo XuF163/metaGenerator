@@ -1,5 +1,6 @@
 import type { CalcDetailKind, CalcScaleStat, CalcSuggestDetail, CalcSuggestInput, TalentKeyGs } from '../types.js'
 import { normalizePromptText, normalizeTableList } from '../utils.js'
+import { inferArrayTableSchema } from '../table-schema.js'
 import { normalizeKind } from './normalize.js'
 import { applyGsDerivedTotals } from './gs-totals.js'
 
@@ -213,7 +214,16 @@ export function applyGsPostprocess(opts: {
     if (details.length >= 20) return
     const list = normalizeTableList((tables as any)[talent] || [])
     const candidates = list.filter(gsIsDamageTableName)
-    candidates.sort((a, b) => gsScoreDamageTableName(b) - gsScoreDamageTableName(a))
+    const scoreExtra = (table: string): number => {
+      let s = gsScoreDamageTableName(table)
+      // Prefer per-hit / multi-hit schema tables (e.g. "24%*8" -> `[pct, hits]`), since baseline
+      // often uses them for "单段" showcases and builds totals from them.
+      const schema = inferArrayTableSchema(input, talent, table)
+      if (schema?.kind === 'statTimes') s += 80
+      if (String(table || '').trim().endsWith('2')) s += 10
+      return s
+    }
+    candidates.sort((a, b) => scoreExtra(b) - scoreExtra(a))
     let added = 0
     for (const table of candidates) {
       if (details.length >= 20) break
@@ -502,13 +512,27 @@ export function applyGsPostprocess(opts: {
     let sc = 0
     if (/单次|单段/.test(s)) sc += 6
     if (/释放/.test(s)) sc += 4
-    if (/技能伤害/.test(s)) sc += 3
-    if (String(d.table || '').trim().endsWith('2')) sc += 1
+    if (/技能伤害/.test(s)) sc += 2
+    const table = String(d.table || '').trim()
+    const schema = table ? inferArrayTableSchema(input, 'q', table) : null
+    if (schema?.kind === 'statTimes') sc += 20
+    if (table.endsWith('2')) sc += 8
     return sc
   })
   if (bestQSingle) {
     gsPushAliasByTitle({ ...(bestQSingle as any), title: 'Q单段伤害' } as any)
     gsPushAliasByTitle({ ...(bestQSingle as any), title: 'Q释放伤害' } as any)
+
+    // If this is a `[pct, hits]` multi-hit table (e.g. "126.88%*5"), add a baseline-like "完整" total row
+    // that multiplies by hit count via renderer's statTimes logic.
+    const table = typeof (bestQSingle as any).table === 'string' ? String((bestQSingle as any).table).trim() : ''
+    const schema = table ? inferArrayTableSchema(input, 'q', table) : null
+    const sample = table ? (input.tableSamples as any)?.q?.[table] : null
+    const hits =
+      Array.isArray(sample) && sample.length >= 2 && typeof sample[1] === 'number' ? Math.trunc(Number(sample[1])) : NaN
+    if (schema?.kind === 'statTimes' && Number.isFinite(hits) && hits >= 2) {
+      gsPushAliasByTitle({ ...(bestQSingle as any), title: 'Q完整伤害' } as any)
+    }
   }
 
   // Symmetric: "E释放伤害" helps matching for kits where baseline uses cast-damage wording.

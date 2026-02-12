@@ -147,12 +147,33 @@ function buildSpecForPlaceholder(opts: { text: string; clause: string; before: s
   const near = clause.slice(Math.max(0, localPos - 24), Math.min(clause.length, localPos + 24))
   const nearWide = clause.slice(Math.max(0, localPos - 48), Math.min(clause.length, localPos + 48))
 
-  let keys = inferKeysFromText(near)
-  if (!keys.length) keys = inferKeysFromText(nearWide)
-  if (!keys || keys.length === 0) return null
+  const ctx = text.slice(Math.max(0, pos - 96), Math.min(text.length, pos + 96))
+  const ctxWide = text.slice(Math.max(0, pos - 160), Math.min(text.length, pos + 160))
+
+  const scoreKeys = (keys: string[]): number => {
+    const skillKeys = new Set(['aDmg', 'eDmg', 'qDmg', 'tDmg'])
+    const skillCount = keys.filter((k) => skillKeys.has(k)).length
+    // Strongly prefer skill-bucket mappings (eDmg/qDmg/...) over generic dmg.
+    return skillCount * 100 + keys.length
+  }
+
+  let bestKeys: string[] = []
+  let bestScore = -Infinity
+  for (const cand of [near, nearWide, ctx, ctxWide]) {
+    const keys = inferKeysFromText(cand)
+    if (!keys.length) continue
+    const score = scoreKeys(keys)
+    if (score > bestScore) {
+      bestScore = score
+      bestKeys = keys
+    }
+  }
+  if (!bestKeys.length) return null
+  const keys = bestKeys
 
   // Static buffs are only meaningful for base attrs (AttrData does NOT support skill-bucket keys like qDmg/eDmg).
-  if (keys.length === 1 && STATIC_ATTR_KEYS.has(keys[0]!) && guessIsStatic(before)) {
+  const beforeCtx = text.slice(Math.max(0, pos - 96), pos)
+  if (keys.length === 1 && STATIC_ATTR_KEYS.has(keys[0]!) && guessIsStatic(before, beforeCtx)) {
     return { kind: 'staticIdx', idx, key: keys[0]! }
   }
 
@@ -166,13 +187,37 @@ function buildSpecForPlaceholder(opts: { text: string; clause: string; before: s
   return { kind: 'keyIdxMap', title, map }
 }
 
-function guessIsStatic(before: string): boolean {
+function guessIsStatic(before: string, beforeCtx: string): boolean {
   // If the part before the variable looks like a plain stat statement without triggers,
   // treat it as static; otherwise make it a selectable buff.
-  const triggerWords = ['当', '若', '每', '后', '时', '受到', '施放', '使用', '消灭', '击败', '进入', '解除', '获得']
-  if (!before.includes('提高') && !before.includes('提升') && !before.includes('增加')) return false
+  const hay = `${beforeCtx} ${before}`
+  const triggerWords = [
+    '当',
+    '若',
+    '每',
+    '后',
+    '时',
+    '受到',
+    '被',
+    '施放',
+    '释放',
+    '使用',
+    '入战',
+    '战斗',
+    '回合',
+    '消耗',
+    '损失',
+    '获得',
+    '进入',
+    '解除',
+    '击败',
+    '消灭',
+    '叠加',
+    '持续'
+  ]
+  if (!hay.includes('提高') && !hay.includes('提升') && !hay.includes('增加')) return false
   for (const w of triggerWords) {
-    if (before.includes(w)) return false
+    if (hay.includes(w)) return false
   }
   return true
 }

@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { CalcSuggestBuff } from './llm-calc/types.js'
+import type { CalcSuggestBuff, CalcSuggestInput } from './llm-calc/types.js'
 import { isAllowedMiaoBuffDataKey } from './llm-calc/utils.js'
 import { buildCalcUpstreamContext } from './upstream-follow/context.js'
 
@@ -77,6 +77,10 @@ function normalizeExpr(exprRaw: string): string {
   expr = expr.replace(/\bx\.a\s*\[\s*Key\.(?:BE|BREAK_EFF)\s*]/g, '(attr.stance / 100)')
   // Align common upstream param ids to baseline-like conventions (improves matching and state gating).
   expr = expr.replace(/\bparams\.talentEnhancedState\b/g, 'params.strength')
+  // Baseline meta commonly gates ultimate-field effects with `params.q`.
+  expr = expr.replace(/\bparams\.ultFieldActive\b/g, 'params.q')
+  // Baseline meta commonly gates skill-state buffs with `params.eBuff` (unset => off).
+  expr = expr.replace(/\bparams\.skillOvertoneBuff\b/g, 'params.eBuff')
   return expr
 }
 
@@ -306,6 +310,62 @@ function mapSrParamKey(kRaw: string): string {
   return k
 }
 
+function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { ...defaults }
+
+  const set = (k: string, v: string): void => {
+    const key = String(k || '').trim()
+    const val = String(v || '').trim()
+    if (!key || !val) return
+    out[key] = val
+  }
+
+  for (const k0 of Object.keys(out)) {
+    const k = String(k0 || '').trim()
+    if (!k) continue
+    const lower = k.toLowerCase()
+    const v = String(out[k] || '').trim()
+    if (!v) continue
+
+    // Upstream defaults are curated for optimizer UI, but baseline meta treats some knobs as *stateful toggles*
+    // (unset => off) to avoid inflating damage outside the intended state rows.
+    //
+    // - "enhanced/state/mode/stance" flags: default to false (state is enabled per-row via params).
+    // - generic stack counters: default to 0, except talent-like stacks (often showcased at max in baseline).
+    if (v === 'true') {
+      const isStateLike = /(enhanced|state|mode|stance|active|field)/.test(lower)
+      if (isStateLike) {
+        set(k, 'false')
+        continue
+      }
+    }
+
+    const looksLikeStack = /stacks?/.test(lower) || /\bstack\b/.test(lower)
+    const isEidolonLike = /^[eq]\d/.test(lower)
+    const isEnemyLike = /(enemy|target|weakness)/.test(lower)
+    const isTalentLike = /talent/.test(lower)
+    if (looksLikeStack && !isEidolonLike && !isEnemyLike && !isTalentLike) {
+      // Keep cons-dependent max defaults (common in showcase-style rows, e.g. memoSpdStacksMax = e>=4?7:6).
+      // Otherwise, treat stack counters as stateful knobs (unset => 0) to avoid inflating baseline comparisons.
+      const n = isNumberLiteral(v)
+      const isConsDependent = /\bcons\b/.test(v)
+      if (n != null || !isConsDependent) {
+        set(k, '0')
+        continue
+      }
+    }
+
+    // Tribbie-like "alliesMaxHp" knobs: baseline typically uses a single-character showcase approximation.
+    // Defaulting to own HP reduces drift vs baseline while keeping the param overrideable per row.
+    if (/(allies|maxhp)/.test(lower) && /(allies|max|team|ally)/.test(lower)) {
+      set(k, 'calc(attr.hp)')
+      continue
+    }
+  }
+
+  return out
+}
+
 function extractDefaultsExprMap(text: string, constMap: Record<string, string>): Record<string, string> {
   const idx = text.indexOf('const defaults')
   if (idx < 0) return {}
@@ -344,7 +404,7 @@ function extractDefaultsExprMap(text: string, constMap: Record<string, string>):
     if (hasUnknownFreeIdentifiers(expr)) continue
     out[key] = expr
   }
-  return out
+  return applySrDefaultsExprOverrides(out)
 }
 
 function applyDefaultsToParamsExpr(expr: string, defaults: Record<string, string>): string {
@@ -441,9 +501,13 @@ function mapStatVarToBuffKey(varName: string): StatVarMap | null {
   if (/_TOUGHNESS/.test(v)) return null
 
   if (v === 'ATK_P') return { key: 'atkPct', scale: 100 }
+  if (v === 'ATK') return { key: 'atkPlus', scale: 1 }
   if (v === 'HP_P') return { key: 'hpPct', scale: 100 }
+  if (v === 'HP') return { key: 'hpPlus', scale: 1 }
   if (v === 'DEF_P') return { key: 'defPct', scale: 100 }
+  if (v === 'DEF') return { key: 'defPlus', scale: 1 }
   if (v === 'SPD_P') return { key: 'speedPct', scale: 100 }
+  if (v === 'SPD') return { key: 'speedPlus', scale: 1 }
   if (v === 'CR') return { key: 'cpct', scale: 100 }
   if (v === 'CD') return { key: 'cdmg', scale: 100 }
   if (v === 'ERR') return { key: 'recharge', scale: 100 }
@@ -498,9 +562,11 @@ function extractBuffsFromBlock(
   opts?: { includeTeamBuffs?: boolean }
 ): CalcSuggestBuff[] {
   const buffs: CalcSuggestBuff[] = []
-  const push = (title: string, dataKey: string, value: number | string): void => {
+  const push = (title: string, dataKey: string, value: number | string, extra?: Pick<CalcSuggestBuff, 'tree'>): void => {
     if (!isAllowedMiaoBuffDataKey('sr', dataKey)) return
-    buffs.push({ title, data: { [dataKey]: value } })
+    const b: CalcSuggestBuff = { title, data: { [dataKey]: value } }
+    if (extra?.tree) b.tree = extra.tree
+    buffs.push(b)
   }
 
   const statRe = /\bx\.([A-Z][A-Z0-9_]+)\.(buff|buffSingle|buffTeam)\s*\(/g
@@ -529,11 +595,17 @@ function extractBuffsFromBlock(
     if (!raw0) continue
     // We can translate a subset of `x.*` reads into attr/calc (see normalizeExpr()), so do not early-drop on `x.`.
     if (/\baction\b/.test(raw0) || /\bcontext\b/.test(raw0)) continue
+    const srcUpper = String(rawSource || '').trim().toUpperCase()
+    // Baseline parity: upstream `SOURCE_TRACE` effects often map to SR major traces (tree buffs),
+    // but miao-plugin forks in the wild may not apply `buff.tree` consistently.
+    // Mark them as `tree`-gated so they won't be applied unconditionally and blow up showcase rows.
+    const tree = /\bSOURCE_TRACE\b/.test(srcUpper) ? 1 : undefined
 
     // `_SCALING` stats: only keep extra components (eidolons/traces/etc), not base talent multipliers.
     if (mapped.kind === 'scaling') {
-      const src = String(rawSource || '').trim().toUpperCase()
-      const isExtra = /\bSOURCE_(?:E\d+|TRACE|MEMO)\b/.test(src)
+      // NOTE: upstream sometimes tags core kit scaling as SOURCE_MEMO (memosprite base scaling).
+      // Our meta already models base scalings via Hakush talent tables, so including SOURCE_MEMO would double-count.
+      const isExtra = /\bSOURCE_(?:E\d+|TRACE)\b/.test(srcUpper)
       if (!isExtra) continue
     }
 
@@ -572,7 +644,21 @@ function extractBuffsFromBlock(
       if (hasUnknownFreeIdentifiers(s)) continue
       scaled = `calc(attr.${mapped.baseStat}) * (${s})`
     }
-    push(`upstream:${varName}[${mapped.key}]`, mapped.key, scaled)
+
+    let dataKey = mapped.key
+    // Upstream collapses DEF shred and DEF ignore into `DEF_PEN`. Baseline meta distinguishes:
+    // - `enemyDef`: debuff "降低防御力"
+    // - `ignore`: penetration "无视防御"
+    // Use the param naming convention to disambiguate common "decrease debuff" toggles.
+    if (varName.toUpperCase() === 'DEF_PEN' && dataKey === 'ignore') {
+      const hint = `${raw0} ${gateExpr}`.toLowerCase()
+      // `DEF_PEN` in upstream is a unified "defense penetration" bucket and is often used for true "ignore DEF" buffs.
+      // Only map it to baseline-style "enemyDef" when we have strong signals that it is a DEF *reduction* debuff.
+      // (Many kits name their ignore-DEF toggles as "defShred", so do NOT treat "defshred" as debuff by default.)
+      if (/(defdecrease|defreduc(?:tion|e)|defdown|debuff)/.test(hint)) dataKey = 'enemyDef'
+    }
+
+    push(`upstream:${varName}[${dataKey}]`, dataKey, scaled, tree ? { tree } : undefined)
   }
 
   const scanAbilityBuff = (
@@ -751,9 +837,142 @@ function extractDynamicStatConversions(text: string, constMap: Record<string, st
   return out
 }
 
+function extractMemoBaseSpdScaling(text: string): number | null {
+  try {
+    const m = text.match(/\bx\.MEMO_BASE_SPD_SCALING\.buff\(\s*([0-9]+(?:\.[0-9]+)?)\s*,/i)
+    if (!m) return null
+    const n = Number(m[1])
+    return Number.isFinite(n) && n >= 0 && n <= 5 ? n : null
+  } catch {
+    return null
+  }
+}
+
+function extractMemoSpdFlatExpr(text: string, constMap: Record<string, string>, defaultsExpr: Record<string, string>): string {
+  try {
+    // Pattern: x.m.SPD.buff(r.memoSpdStacks * memoTalentSpd, SOURCE_MEMO)
+    const m = text.match(/\bx\.m\.SPD\.buff\(\s*r\.([A-Za-z0-9_]+)\s*\*\s*([A-Za-z0-9_]+)\s*,/i)
+    if (!m) return ''
+    const stacksKey = String(m[1] || '').trim()
+    const perStackVar = String(m[2] || '').trim()
+    if (!stacksKey || !perStackVar) return ''
+
+    let perStackExpr = normalizeExpr(perStackVar)
+    perStackExpr = inlineConsts(perStackExpr, constMap)
+    if (!perStackExpr || hasUnknownFreeIdentifiers(perStackExpr)) return ''
+
+    const stacksExpr = applyDefaultsToParamsExpr(`params.${stacksKey}`, defaultsExpr)
+    const out = `(${stacksExpr}) * (${perStackExpr})`
+    return hasUnknownFreeIdentifiers(out) ? '' : out
+  } catch {
+    return ''
+  }
+}
+
+function pickSrTalentTable(input: CalcSuggestInput | undefined, talentKey: string, re: RegExp): string {
+  const list = input?.tables && (input.tables as any)[talentKey]
+  const arr = Array.isArray(list) ? list : []
+  for (const s of arr) {
+    const t = String(s || '').trim()
+    if (!t) continue
+    if (re.test(t)) return t
+  }
+  return ''
+}
+
+function extractDynamicConditionalAtkPlusFromSpd(
+  text: string,
+  constMap: Record<string, string>,
+  defaultsExpr: Record<string, string>,
+  input?: CalcSuggestInput
+): CalcSuggestBuff[] {
+  const out: CalcSuggestBuff[] = []
+  // Pattern from hsr-optimizer dynamicConditionals:
+  //   const buffValue = 7.20 * x.a[Key.SPD] + 3.60 * x.m.a[Key.SPD]
+  //   x.ATK.buffDynamic(...)
+  const re = /\bconst\s+buffValue\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*\*\s*x\.a\[Key\.SPD\]\s*\+\s*([0-9]+(?:\.[0-9]+)?)\s*\*\s*x\.m\.a\[Key\.SPD\]/g
+  let m: RegExpExecArray | null
+  const memoBaseSpd = extractMemoBaseSpdScaling(text) ?? 0
+  const memoFlatExpr = extractMemoSpdFlatExpr(text, constMap, defaultsExpr)
+  const stacksKey = (() => {
+    try {
+      const mm = text.match(/\bx\.m\.SPD\.buff\(\s*r\.([A-Za-z0-9_]+)\s*\*/i)
+      return String(mm?.[1] || '').trim()
+    } catch {
+      return ''
+    }
+  })()
+
+  // Best-effort: map upstream constants to runtime talent tables to keep outputs talent-level dependent.
+  // This is critical for matching baseline when user skills are not maxed.
+  const qSpdBoostTable = pickSrTalentTable(input, 'q', /速度.*提高|速度提高|速度提升/)
+  const mtSpdPerStackTable = pickSrTalentTable(input, 'mt', /速度.*提高|速度提高|速度提升/)
+
+  while ((m = re.exec(text))) {
+    const a = Number(m[1])
+    const b = Number(m[2])
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a < 0 || b < 0) continue
+
+    // Ensure this is actually used to buff ATK dynamically in the nearby window.
+    const tail = text.slice(m.index, Math.min(text.length, m.index + 1400))
+    if (!/\bx\.ATK\.buffDynamic\s*\(/.test(tail)) continue
+
+    // Best-effort gate: find the closest `if (!r.xxx) return` above this line.
+    const head = text.slice(Math.max(0, m.index - 1400), m.index)
+    const gates = Array.from(head.matchAll(/\bif\s*\(\s*!\s*r\.([A-Za-z0-9_]+)\s*\)\s*\{\s*return\s*\}/g))
+    const gateKey = String(gates.length ? gates[gates.length - 1]?.[1] : '').trim()
+
+    const speedBaseExpr = `calc(attr.speed)`
+
+    // Use the same stack counter as upstream (usually memoSpdStacks).
+    const stacksExpr = stacksKey ? applyDefaultsToParamsExpr(`params.${stacksKey}`, defaultsExpr) : ''
+
+    // Main SPD: baseline models this as baseSpeed * (1 + ultSpdBoost * stacks) under the state gate.
+    // When we can map ultSpdBoost to `talent.q[...]`, use it instead of hardcoded upstream constants.
+    const speedExpr =
+      qSpdBoostTable && stacksExpr
+        ? `(${speedBaseExpr}) * (1 + (talent.q[${JSON.stringify(qSpdBoostTable)}] || 0) * (${stacksExpr}))`
+        : speedBaseExpr
+
+    // Memo SPD: baseline models this as baseSpeed * memoBaseSpd + memoSpdPerStack * stacks.
+    const memoBaseExpr = memoBaseSpd ? `(${speedBaseExpr}) * ${memoBaseSpd}` : '0'
+    const memoFlatExpr2 =
+      mtSpdPerStackTable && stacksExpr
+        ? `(talent.mt[${JSON.stringify(mtSpdPerStackTable)}] || 0) * (${stacksExpr})`
+        : memoFlatExpr
+    const memoExpr = memoFlatExpr2 ? `${memoBaseExpr} + (${memoFlatExpr2})` : memoBaseExpr
+
+    const buffExpr0 = `${a} * (${speedExpr}) + ${b} * (${memoExpr})`
+
+    let buffExpr = normalizeExpr(buffExpr0)
+    buffExpr = inlineConsts(buffExpr, constMap)
+    buffExpr = applyDefaultsToParamsExpr(buffExpr, defaultsExpr)
+    if (!buffExpr || hasUnknownFreeIdentifiers(buffExpr)) continue
+
+    if (gateKey) {
+      const gateExpr = applyDefaultsToParamsExpr(`params.${gateKey}`, defaultsExpr)
+      if (gateExpr && !hasUnknownFreeIdentifiers(gateExpr)) {
+        buffExpr = `(${gateExpr}) ? (${buffExpr}) : 0`
+      }
+    }
+
+    if (!isAllowedMiaoBuffDataKey('sr', 'atkPlus')) continue
+    out.push({
+      title: `upstream:dynamicConditional(SPD->ATK)[atkPlus]`,
+      // This conversion is tagged as SOURCE_TRACE in upstream (a major trace-like mechanic).
+      // Gate it to avoid unconditional over-buffing when profile trace mapping is incomplete.
+      tree: 1,
+      data: { atkPlus: buffExpr }
+    })
+  }
+
+  return out
+}
+
 export function buildSrUpstreamDirectBuffs(opts: {
   projectRootAbs: string
   id?: number
+  input?: CalcSuggestInput
   upstream?: {
     hsrOptimizerRoot?: string
     includeTeamBuffs?: boolean
@@ -817,5 +1036,24 @@ export function buildSrUpstreamDirectBuffs(opts: {
     buffs.push(...extractBuffsFromBlock(mutual, constMap, defaultsExpr, { includeTeamBuffs: true }))
   }
   buffs.push(...extractDynamicStatConversions(text, constMap, defaultsExpr))
+  const dyn = extractDynamicConditionalAtkPlusFromSpd(text, constMap, defaultsExpr, opts.input)
+  buffs.push(...dyn)
+
+  // If we successfully mapped SPD->ATK conversion to runtime talent tables, drop the raw SPD_P speedPct buff
+  // to avoid double-counting and to keep memo base-speed math aligned with baseline conventions.
+  const usedTalentSpdTables = dyn.some((b) => {
+    if (!b || typeof b !== 'object') return false
+    const expr = (b as any)?.data?.atkPlus
+    return typeof expr === 'string' && /\btalent\.q\b/.test(expr)
+  })
+  if (usedTalentSpdTables) {
+    for (let i = buffs.length - 1; i >= 0; i--) {
+      const b: any = buffs[i]
+      if (!b || typeof b !== 'object') continue
+      const title = typeof b.title === 'string' ? b.title : ''
+      const hasSpeedPct = b.data && typeof b.data === 'object' && Object.prototype.hasOwnProperty.call(b.data, 'speedPct')
+      if (hasSpeedPct && /\bSPD_P\b/.test(title)) buffs.splice(i, 1)
+    }
+  }
   return buffs
 }

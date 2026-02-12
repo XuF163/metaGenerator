@@ -86,7 +86,15 @@ export interface ScaffoldMetaOptions {
   outputRootAbs: string
   games: Game[]
   types: MetaType[]
-  /** When true, removes `meta-{game}` output dirs before scaffolding. */
+  /**
+   * When true, removes output dirs before scaffolding.
+   *
+   * NOTE:
+   * - We ONLY wipe the selected `types` dirs (artifact/character/material/weapon) so
+   *   `gen --force --types character` won't accidentally delete weapon/artifact meta
+   *   that is required by runtime panel regression.
+   * - To fully reset a game output, pass all types (default config uses all types).
+   */
   force: boolean
 }
 
@@ -98,8 +106,13 @@ export function scaffoldMeta(opts: ScaffoldMetaOptions): void {
     const templateRoot = scaffoldTemplateRoot(opts.ctx, game)
     const outMetaDir = path.join(opts.outputRootAbs, `meta-${game}`)
 
-    if (opts.force && fs.existsSync(outMetaDir)) {
-      fs.rmSync(outMetaDir, { recursive: true, force: true })
+    if (opts.force) {
+      for (const type of opts.types) {
+        const dstTypeDir = path.join(outMetaDir, type)
+        if (fs.existsSync(dstTypeDir)) {
+          fs.rmSync(dstTypeDir, { recursive: true, force: true })
+        }
+      }
     }
 
     ensureDir(outMetaDir)

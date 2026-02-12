@@ -107,21 +107,166 @@ function inferTimesFromDesc(descRaw: unknown, tokenRaw: string): number | null {
   if (!desc || !token || token.length < 2) return null
 
   const esc = escapeRegExp(token)
-  const re1 = new RegExp(`(\\d{1,3})\\s*(?:次|段|枚)\\s*${esc}`)
-  const m1 = desc.match(re1)
-  if (m1) {
-    const n = Math.trunc(Number(m1[1]))
-    return Number.isFinite(n) && n >= 1 && n <= 60 ? n : null
+  const cnNumToInt = (s: string): number | null => {
+    const t = String(s || '').trim()
+    if (!t) return null
+    if (/^\d+$/.test(t)) {
+      const n = Math.trunc(Number(t))
+      return Number.isFinite(n) ? n : null
+    }
+    const map: Record<string, number> = {
+      零: 0,
+      〇: 0,
+      一: 1,
+      二: 2,
+      两: 2,
+      三: 3,
+      四: 4,
+      五: 5,
+      六: 6,
+      七: 7,
+      八: 8,
+      九: 9
+    }
+    if (t === '十') return 10
+    if (t.length === 1 && t in map) return map[t]!
+
+    const m = t.match(/^([一二两三四五六七八九])?十([一二两三四五六七八九])?$/)
+    if (m) {
+      const tens = m[1] ? map[m[1]] ?? NaN : 1
+      const ones = m[2] ? map[m[2]] ?? NaN : 0
+      const n = tens * 10 + ones
+      return Number.isFinite(n) ? n : null
+    }
+    // Rare in-game, but keep small support (e.g. "二十一").
+    const m2 = t.match(/^([一二两三四五六七八九])十([一二两三四五六七八九])$/)
+    if (m2) {
+      const n = (map[m2[1]] ?? NaN) * 10 + (map[m2[2]] ?? NaN)
+      return Number.isFinite(n) ? n : null
+    }
+    return null
   }
 
-  const re2 = new RegExp(`${esc}[^\\d]{0,16}?(\\d{1,3})\\s*(?:次|段|枚)`)
+  const num = '(?:\\d{1,3}|[一二两三四五六七八九十]{1,3})'
+  const unit = '(?:次|段|枚|柄|个)'
+
+  const re1 = new RegExp(`(${num})\\s*${unit}\\s*${esc}`)
+  const m1 = desc.match(re1)
+  if (m1) {
+    const n = cnNumToInt(m1[1] || '')
+    return n != null && Number.isFinite(n) && n >= 1 && n <= 60 ? n : null
+  }
+
+  const re2 = new RegExp(`${esc}[^\\d一二两三四五六七八九十]{0,16}?(${num})\\s*${unit}`)
   const m2 = desc.match(re2)
   if (m2) {
-    const n = Math.trunc(Number(m2[1]))
-    return Number.isFinite(n) && n >= 1 && n <= 60 ? n : null
+    const n = cnNumToInt(m2[1] || '')
+    return n != null && Number.isFinite(n) && n >= 1 && n <= 60 ? n : null
   }
 
   return null
+}
+
+function inferAnyHitCountFromDesc(descRaw: unknown): number | null {
+  const desc = normalizePromptText(descRaw).replace(/\s+/g, '')
+  if (!desc) return null
+
+  const cnNumToInt = (s: string): number | null => {
+    const t = String(s || '').trim()
+    if (!t) return null
+    if (/^\d+$/.test(t)) {
+      const n = Math.trunc(Number(t))
+      return Number.isFinite(n) ? n : null
+    }
+    const map: Record<string, number> = {
+      零: 0,
+      〇: 0,
+      一: 1,
+      二: 2,
+      两: 2,
+      三: 3,
+      四: 4,
+      五: 5,
+      六: 6,
+      七: 7,
+      八: 8,
+      九: 9
+    }
+    if (t === '十') return 10
+    if (t.length === 1 && t in map) return map[t]!
+    const m = t.match(/^([一二两三四五六七八九])?十([一二两三四五六七八九])?$/)
+    if (m) {
+      const tens = m[1] ? map[m[1]] ?? NaN : 1
+      const ones = m[2] ? map[m[2]] ?? NaN : 0
+      const n = tens * 10 + ones
+      return Number.isFinite(n) ? n : null
+    }
+    return null
+  }
+
+  const num = '(\\d{1,2}|[一二两三四五六七八九十]{1,3})'
+  const unit = '(?:次|段|枚|柄|个)'
+  const patterns: RegExp[] = [
+    new RegExp(`连续[^\\n]{0,28}?${num}\\s*${unit}`),
+    new RegExp(`(?:依次|分别)[^\\n]{0,28}?${num}\\s*${unit}`),
+    new RegExp(`(?:召唤出|召唤|发射|射出|释放|挥出|落下|造成)[^\\n]{0,28}?${num}\\s*${unit}`)
+  ]
+  for (const re of patterns) {
+    const m = desc.match(re)
+    if (!m) continue
+    const n = cnNumToInt(m[1] || '')
+    if (n != null && Number.isFinite(n) && n >= 2 && n <= 20) return n
+  }
+  return null
+}
+
+function inferExtraHitsFromBuffHints(hintsRaw: unknown): { cons: number; extra: number } | null {
+  const hints = Array.isArray(hintsRaw) ? hintsRaw : []
+  if (!hints.length) return null
+
+  const cnNumToInt = (s: string): number | null => {
+    const t = String(s || '').trim()
+    if (!t) return null
+    if (/^\d+$/.test(t)) {
+      const n = Math.trunc(Number(t))
+      return Number.isFinite(n) ? n : null
+    }
+    const map: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 }
+    if (t === '十') return 10
+    if (t.length === 1 && t in map) return map[t]!
+    const m = t.match(/^([一二两三四五六七八九])?十([一二两三四五六七八九])?$/)
+    if (m) {
+      const tens = m[1] ? map[m[1]] ?? NaN : 1
+      const ones = m[2] ? map[m[2]] ?? NaN : 0
+      const n = tens * 10 + ones
+      return Number.isFinite(n) ? n : null
+    }
+    return null
+  }
+
+  const num = '(\\d{1,2}|[一二两三四五六七八九十]{1,3})'
+  const unit = '(?:次|段|枚|柄|个)'
+  let best: { cons: number; extra: number } | null = null
+
+  for (const h0 of hints) {
+    const h = normalizePromptText(h0).replace(/\s+/g, '')
+    if (!h) continue
+    const mCons = h.match(/^([1-6])命[:：]/)
+    if (!mCons) continue
+    const cons = Number(mCons[1])
+    if (!Number.isFinite(cons) || cons < 1 || cons > 6) continue
+    if (!/额外/.test(h)) continue
+
+    let m = h.match(new RegExp(`${num}\\s*${unit}[^\\n]{0,16}?额外`))
+    if (!m) m = h.match(new RegExp(`额外[^\\n]{0,16}?${num}\\s*${unit}`))
+    if (!m) continue
+    const extra = cnNumToInt(m[1] || '')
+    if (extra == null || !Number.isFinite(extra) || extra < 1 || extra > 20) continue
+
+    if (!best || cons > best.cons || (cons === best.cons && extra > best.extra)) best = { cons, extra }
+  }
+
+  return best
 }
 
 function inferMaxCountFromDesc(descRaw: unknown): number | null {
@@ -460,8 +605,53 @@ export function applyGsDerivedTotals(opts: {
     }
   }
 
+  // Fallback for "single dmg table but multi-hit description" Qs (e.g. Chongyun Q blades):
+  // - Some kits only expose one Q damage coefficient table (often called "技能伤害"), while the description
+  //   clearly states N hits/blades. Baseline commonly showcases the *total* by multiplying that coefficient.
+  // - Also supports simple cons-based extra hits when constellation hints say "召唤/造成...额外一段/一柄/一次...".
+  const addTotalFromSingleDmgTableDesc = (): void => {
+    if (hasTitle('Q总伤害')) return
+    const descQHits = inferAnyHitCountFromDesc(descQ)
+    if (!descQHits || descQHits < 2) return
+
+    const baseTables = qDetails
+      .filter((d: any) => !String(d?.ele || '').trim())
+      .filter((d: any) => isDamageLikeTableName(d.table))
+      .map((d: any) => String(d.table || '').trim())
+      .filter(Boolean)
+    const uniq = Array.from(new Set(baseTables))
+    if (uniq.length !== 1) return
+
+    const table = uniq[0]!
+    const key = (() => {
+      const d = qDetails.find((x: any) => String(x?.table || '').trim() === table && (!x.ele || String(x.ele).trim() === ''))
+      const k = d && typeof d.key === 'string' && d.key.trim() ? d.key.trim() : 'q'
+      return k
+    })()
+    const call = makeDmgCallExpr(input, { talent: 'q', table, key })
+    if (!call) return
+
+    const extra = inferExtraHitsFromBuffHints(input.buffHints)
+    const hitsExpr =
+      extra && Number.isFinite(extra.cons) && Number.isFinite(extra.extra)
+        ? `(${descQHits} + (cons >= ${extra.cons} ? ${extra.extra} : 0))`
+        : `(${descQHits})`
+
+    pushPrefer({
+      title: 'Q总伤害',
+      kind: 'dmg',
+      talent: 'q',
+      table,
+      key,
+      params: { q: true },
+      dmgExpr: `({ dmg: (${call}).dmg * ${hitsExpr}, avg: (${call}).avg * ${hitsExpr} })`
+    } as any)
+  }
+
   // Prefer count-table driven totals (more deterministic and update-proof).
   if (countTables.length) addTotalByCountTable()
   // Fallback: parse hit counts from the official talent description.
   addTotalsFromDescCounts()
+  // Final fallback: single damage table + explicit multi-hit count in description.
+  addTotalFromSingleDmgTableDesc()
 }

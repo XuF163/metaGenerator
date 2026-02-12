@@ -906,22 +906,20 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         if (/记忆/.test(path) && baseInferred === 'atk') baseInferred = 'hp'
       }
     }
-    // SR: Basic attacks are ATK-scaling for the vast majority of kits. Some official descriptions mention HP/DEF
-    // for other parts of the kit, and we often lack per-table unit hints. To avoid exploding/imploding A-dmg by
-    // over-trusting broad descriptions, only allow non-ATK scaling for talent.a when the path strongly suggests it
-    // (e.g. Preservation/Abundance/Memory) OR when the basic-attack description itself strongly indicates HP/DEF scaling.
+    // SR: Basic attacks are ATK-scaling for the vast majority of kits. Some descriptions mention HP/DEF for other
+    // parts of the kit, and upstream tables often lack per-table unit hints. To avoid exploding/imploding A-dmg by
+    // over-trusting broad descriptions, default talent.a to ATK unless the path strongly suggests non-ATK scaling
+    // (Preservation/Abundance/Memory).
     if (input.game === 'sr' && kind === 'dmg' && talent === 'a' && !hasPerTableHint) {
       const path = normalizePromptText(input.weapon)
-      const descA = normalizePromptText((input.talentDesc as any)?.[talent])
-      const strongNonAtkFromDesc =
-        !!descA &&
-        /伤害/.test(descA) &&
-        !/(治疗|护盾|回复)/.test(descA) &&
-        /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
-      // Baseline meta treats most SR basic attacks as ATK-scaling.
-      // Do NOT allow non-ATK scaling purely from description heuristics; only allow it for specific paths.
       const allowNonAtk = /(存护|丰饶|记忆)/.test(path)
-      if (!allowNonAtk && baseInferred !== 'atk') baseInferred = 'atk'
+      if (!allowNonAtk && baseInferred !== 'atk') {
+        // Basic attack descriptions are usually specific enough: if they explicitly state HP/DEF-scaling,
+        // keep it even for non-Preservation/Abundance/Memory paths (rare kits exist).
+        const strongNonAtkFromDesc =
+          descBase !== 'atk' && !!descNorm && /(生命上限|生命值上限|最大生命值|生命值|防御)/.test(descNorm)
+        if (!strongNonAtkFromDesc) baseInferred = 'atk'
+      }
     }
     // SR: allow validated plan.stat overrides for HP/DEF-scaling kits.
     // (Tables often lack per-table unit markers; relying only on description heuristics can still miss.)
@@ -932,14 +930,12 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         : ''
     if (input.game === 'sr' && kind === 'dmg' && talent === 'a' && !hasPerTableHint) {
       const path = normalizePromptText(input.weapon)
-      const descA = normalizePromptText((input.talentDesc as any)?.[talent])
-      const strongNonAtkFromDesc =
-        !!descA &&
-        /伤害/.test(descA) &&
-        !/(治疗|护盾|回复)/.test(descA) &&
-        /(?:造成|使).{0,18}(?:等同于|基于|按).{0,18}(?:生命上限|生命值上限|最大生命值|生命值|防御力)/.test(descA)
       const allowNonAtk = /(存护|丰饶|记忆)/.test(path)
-      if (!allowNonAtk && statOverride && statOverride !== 'atk') statOverride = ''
+      if (!allowNonAtk && statOverride && statOverride !== 'atk') {
+        const strongNonAtkFromDesc =
+          descBase !== 'atk' && !!descNorm && /(生命上限|生命值上限|最大生命值|生命值|防御)/.test(descNorm)
+        if (!strongNonAtkFromDesc) statOverride = ''
+      }
     }
     const base = (statOverride || baseInferred) as 'atk' | 'hp' | 'def' | 'mastery'
     const useBasic = base !== 'atk'
@@ -1115,12 +1111,12 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	          `        return dmg.basic(calc(attr.${s0}) * toRatio(t[0]) + calc(attr.${s1}) * toRatio(t[1]), ${keyArg}${eleArg})`
 	        )
 	      } else if (schema?.kind === 'statTimes') {
-	        // e.g. [pct, hits] from `...2` tables where text sample is like "1.41%HP*5".
+          // e.g. [pct, hits] from `...2` tables where text sample is like "1.41%HP*5".
           // Default to per-hit output unless the title explicitly says "总/合计/一轮...".
           // (Baseline often compares per-hit rows; total rows should opt-in via title wording.)
           const titleHint = String(d.title || '')
           const wantsTotal =
-            /(?:合计|总计|总伤|一轮|总)/.test(titleHint) &&
+            /(?:合计|总计|总伤|一轮|总|完整)/.test(titleHint) &&
             !/(?:单次|单段|每段|每跳|每次)/.test(titleHint)
           if (wantsTotal) {
             if (schema.stat === 'atk' && !useBasic) {

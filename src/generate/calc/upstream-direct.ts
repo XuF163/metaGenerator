@@ -96,12 +96,14 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
   const { input, createdBy } = opts
 
   let plan: CalcSuggestResult = heuristicPlan(input)
+  let upstreamBuffs: CalcSuggestBuff[] = []
   try {
-    const upstreamBuffs =
+    upstreamBuffs =
       input.game === 'sr'
         ? buildSrUpstreamDirectBuffs({
             projectRootAbs: opts.projectRootAbs,
             id: input.id,
+            input,
             upstream: {
               hsrOptimizerRoot: opts.upstream?.hsrOptimizerRoot,
               includeTeamBuffs: opts.upstream?.includeTeamBuffs
@@ -127,6 +129,21 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
     plan = validatePlan(input, plan)
   } catch {
     // keep heuristic plan as-is
+  }
+  // validatePlan() may inject additional buffs (e.g. special mechanics) that can overlap with upstream-derived keys.
+  // Re-merge once more to prevent double-counting and keep `preferUpstream` behavior stable.
+  try {
+    if (upstreamBuffs.length) {
+      const preferUpstream = opts.upstream?.preferUpstream !== false
+      const merged = mergePlanBuffs({
+        base: Array.isArray(plan.buffs) ? plan.buffs : undefined,
+        upstream: upstreamBuffs,
+        preferUpstream
+      })
+      if (merged) (plan as any).buffs = merged
+    }
+  } catch {
+    // best-effort
   }
 
   try {

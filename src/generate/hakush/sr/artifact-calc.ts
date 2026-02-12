@@ -438,6 +438,38 @@ function parseSkillText(textRaw: string): Buff[] {
 
   const out: Buff[] = []
 
+  const applyMaxStacks = (data: Record<string, number>, segText: string): void => {
+    if (!data || Object.keys(data).length === 0) return
+    const m = segText.match(/\u6700\u591a\u53e0\u52a0(\d+(?:\.\d+)?)\u5c42/)
+    if (!m) return
+    const n = Math.trunc(num(m[1]))
+    if (!Number.isFinite(n) || n <= 1 || n > 10) return
+    const stackable = new Set([
+      'atkPct',
+      'hpPct',
+      'defPct',
+      'speedPct',
+      'speed',
+      'cpct',
+      'cdmg',
+      'recharge',
+      'heal',
+      'shield',
+      'stance',
+      'effPct',
+      'effDef',
+      'dmg',
+      'aDmg',
+      'eDmg',
+      'qDmg',
+      'tDmg'
+    ])
+    for (const k of Object.keys(data)) {
+      if (!stackable.has(k)) continue
+      data[k] = (data[k] || 0) * n
+    }
+  }
+
   for (const seg of segs) {
     // If the sentence contains an explicit conditional marker, try to:
     // 1) parse the prefix part as unconditional buffs
@@ -479,12 +511,13 @@ function parseSkillText(textRaw: string): Buff[] {
         // Baseline meta often approximates these as always-on showcase buffs; keep them *only* when the
         // trigger is action/battle-flow related (not status/threshold), to avoid wrong unconditional buffs.
         const isActionLike =
-          /\u65bd\u653e|\u91ca\u653e|\u4f7f\u7528|\u5165\u6218|\u6218\u6597\u5f00\u59cb|\u56de\u5408\u5f00\u59cb/.test(
+          /\u65bd\u653e|\u91ca\u653e|\u4f7f\u7528|\u5165\u6218|\u6218\u6597\u5f00\u59cb|\u56de\u5408\u5f00\u59cb|\u53d7\u5230\u653b\u51fb|\u88ab\u653b\u51fb|\u53d7\u5230\u4f24\u5bb3|\u53d7\u4f24|\u6d88\u8017\u751f\u547d|\u635f\u5931\u751f\u547d/.test(
             condPart
           )
         if (isActionLike) {
           const effectText = splitEffectTextFromConditionalSentence(condPart)
           const data = parseData(effectText)
+          applyMaxStacks(data, condPart)
           if (Object.keys(data).length > 0) {
             out.push({
               title: seg,
@@ -498,6 +531,7 @@ function parseSkillText(textRaw: string): Buff[] {
     }
 
     const data = parseData(seg)
+    applyMaxStacks(data, seg)
     if (Object.keys(data).length === 0) continue
     out.push({
       title: seg,

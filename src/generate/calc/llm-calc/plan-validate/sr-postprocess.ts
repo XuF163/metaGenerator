@@ -827,10 +827,48 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
       // This is a major source of underestimation vs baseline for some SR kits.
       const repeat = inferRepeatCount((main as any).talent)
 
+      // IMPORTANT: Prefer a single combined dmg() call for the "(完整)" total:
+      // - Baseline meta commonly models blast totals as `dmg(main + adj*2)` instead of summing separate dmg() calls.
+      // - Summing separate calls can double-count non-linear terms (e.g. Plus damage) and drift badly vs baseline.
+      const tkMain = String((main as any).talent || '').trim()
+      const tkAdj = String((adj as any).talent || '').trim()
+      const tblMain = String((main as any).table || '').trim()
+      const tblAdj = String((adj as any).table || '').trim()
+      const key0 = typeof (main as any).key === 'string' && String((main as any).key).trim() ? String((main as any).key).trim() : tkMain || 'e'
+      const ele0 = typeof (main as any).ele === 'string' && String((main as any).ele).trim() ? String((main as any).ele).trim() : ''
+      const pickMain = typeof (main as any).pick === 'number' && Number.isFinite((main as any).pick) ? Math.trunc((main as any).pick) : undefined
+      const pickAdj = typeof (adj as any).pick === 'number' && Number.isFinite((adj as any).pick) ? Math.trunc((adj as any).pick) : undefined
+      const stat0 = typeof (main as any).stat === 'string' ? String((main as any).stat).trim() : ''
+      const stat = stat0 && stat0 !== 'atk' ? stat0 : inferScaleStat(tkMain, tblMain)
+
+      const ratioExpr = (tk: string, table: string, pick?: number): string => {
+        const acc = `talent.${tk}[${jsString(table)}]`
+        if (typeof pick === 'number' && Number.isFinite(pick) && pick >= 0 && pick <= 12) {
+          return `toRatio(Array.isArray(${acc}) ? ${acc}[${pick}] : ${acc})`
+        }
+        return `toRatio(Array.isArray(${acc}) ? ${acc}[0] : ${acc})`
+      }
+
+      let blastCall = ''
+      if (tkMain && tkAdj === tkMain && tblMain && tblAdj) {
+        const mult = `(${ratioExpr(tkMain, tblMain, pickMain)} + ${ratioExpr(tkMain, tblAdj, pickAdj)} * 2)`
+        const keyArg = jsString(key0)
+        const eleArg = ele0 ? `, ${jsString(ele0)}` : ''
+        if (!stat || stat === 'atk') {
+          blastCall = `dmg(${mult}, ${keyArg}${eleArg})`
+        } else if (stat === 'hp' || stat === 'def' || stat === 'mastery') {
+          blastCall = `dmg.basic(calc(attr.${stat}) * ${mult}, ${keyArg}${eleArg})`
+        }
+      }
+      if (!blastCall) {
+        // Fallback to summing separate calls (best-effort).
+        blastCall = `({ dmg: (${callMain}).dmg + (${callAdj}).dmg * 2, avg: (${callMain}).avg + (${callAdj}).avg * 2 })`
+      }
+
       const dmgExpr =
         repeat > 1
-          ? `({ dmg: ((${callMain}).dmg + (${callAdj}).dmg * 2) * ${repeat}, avg: ((${callMain}).avg + (${callAdj}).avg * 2) * ${repeat} })`
-          : `({ dmg: (${callMain}).dmg + (${callAdj}).dmg * 2, avg: (${callMain}).avg + (${callAdj}).avg * 2 })`
+          ? `({ dmg: (${blastCall}).dmg * ${repeat}, avg: (${blastCall}).avg * ${repeat} })`
+          : blastCall
 
       // Patch existing "(完整)" rows: many LLMs emit a "(完整)" title but forget the adjacent*2 factor, causing
       // systematic drift vs baseline. Always prefer the derived blast total when main+adj are present.

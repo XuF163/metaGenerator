@@ -586,6 +586,7 @@ function guessSrParamName(opts: {
   descSrc: string
   descPlain: string
   charId: number
+  talentKey?: string
   varCount: number
   outIdx: number
   origIdx: number
@@ -735,6 +736,16 @@ function guessSrParamName(opts: {
     if (local.includes('持续伤害')) return '持续伤害'
     if (/每段/.test(around)) return '每段伤害'
     if (/每次/.test(around)) return '每次伤害'
+    // Blast skills: the first damage placeholder usually represents the *main target* even if the same clause mentions adjacent targets.
+    // Prefer baseline-like naming for the main target table; the adjacent table (if any) will be captured by its own placeholder.
+    if (tagCn === '扩散' && outIdx === 1 && /相邻目标|相邻敌方/.test(descPlain)) {
+      // Servant/memosprite skills (talentKey=me*) in baseline use "目标伤害/相邻目标伤害" naming,
+      // while normal blast skills commonly use the generic "技能伤害". Keep them separated for compatibility.
+      const tk = typeof opts.talentKey === 'string' ? opts.talentKey.trim() : ''
+      const preferTargetName = /^me\d*$/.test(tk) || tk.startsWith('me')
+      const base = preferTargetName || srBlastTargetDamageNameCompatIds.has(String(charId)) ? '目标伤害' : '技能伤害'
+      return withMemospriteSuffix(base)
+    }
     if (isAllTargetDamage) return '所有目标伤害'
     if (isAdjacentDamage) return withMemospriteSuffix('相邻目标伤害')
     if (isCounterDamage) return '反击伤害'
@@ -745,10 +756,6 @@ function guessSrParamName(opts: {
       return '附加伤害'
     }
     if (tagCn === '单体') return '单体伤害'
-    if (tagCn === '扩散' && outIdx === 1 && /相邻目标|相邻敌方/.test(descPlain)) {
-      const base = srBlastTargetDamageNameCompatIds.has(String(charId)) ? '目标伤害' : '技能伤害'
-      return withMemospriteSuffix(base)
-    }
     return withMemospriteSuffix('技能伤害')
   }
 
@@ -799,7 +806,14 @@ function skillDescAndTables(
   spBase: unknown,
   showStanceList: unknown,
   elemCn: string,
-  opts?: { levelCap?: number; tagCn?: string; noElemSpan?: boolean; charId?: number; memospriteName?: string }
+  opts?: {
+    levelCap?: number
+    tagCn?: string
+    noElemSpan?: boolean
+    charId?: number
+    memospriteName?: string
+    talentKey?: string
+  }
 ): { desc: string; tables: Record<string, { name: string; isSame: boolean; values: number[] }> } {
   const descSrc = typeof rawDesc === 'string' ? rawDesc : ''
   const descPlain = normalizeTextInline(stripSrTextForParamName(descSrc))
@@ -874,6 +888,7 @@ function skillDescAndTables(
       descSrc,
       descPlain,
       charId: opts?.charId ?? 0,
+      talentKey: opts?.talentKey,
       varCount: varMap.size,
       outIdx,
       origIdx,
@@ -1522,7 +1537,8 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       tagCn,
       charId,
       noElemSpan,
-      memospriteName
+      memospriteName,
+      talentKey: key
     })
     const talentIdValue: string | number = srTalentBlockIdStringCompatIds.has(String(charId)) ? String(pointId) : pointId
     talent[key] = {
@@ -1561,7 +1577,12 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
       talentId[String(pointId)] = key
       const tagCn = tagLabel(s.Tag)
       const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
-      const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, { tagCn, charId, noElemSpan })
+      const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, {
+        tagCn,
+        charId,
+        noElemSpan,
+        talentKey: key
+      })
       const type = key === 'me2' && charId === 1415 ? '忆灵技[专属]' : typeLabelFromKey(key)
       talent[key] = {
         id: pointId,
@@ -1609,7 +1630,12 @@ function buildTalentAndIdMap(detail: Record<string, unknown>, charId: number, el
         const pointId = charId * 1000 + 300 + suffix2
         const tagCn = tagLabel(s.Tag)
         const noElemSpan = String(charId) === '1014' || String(charId) === '1015'
-        const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, { tagCn, charId, noElemSpan })
+        const { desc, tables } = skillDescAndTables(s.Desc, s.Level, s.SPBase, s.ShowStanceList, elemCn, {
+          tagCn,
+          charId,
+          noElemSpan,
+          talentKey: 'me2list'
+        })
         list[String(outIdx)] = {
           id: pointId,
           name: typeof s.Name === 'string' ? s.Name : '',
