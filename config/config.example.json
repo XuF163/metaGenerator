@@ -29,7 +29,7 @@
   },
   "calc": {
     "//": "calc.js 生成渠道：llm（默认）或 upstream（追随上游项目 genshin-optimizer/hsr-optimizer 生成/修补）",
-    "//channelOptions": "支持：llm / upstream / upstream-direct（非 LLM；优先同步 baselineRoot 下的基线脚本以保证面板回归一致性）",
+    "//channelOptions": "支持：llm / upstream / upstream-direct（非 LLM，上游脚本直出）",
     "channel": "llm",
     "upstream": {
       "//genshinOptimizerRoot": "可选：genshin-optimizer 子模块路径（默认 upstream/genshin-optimizer）",

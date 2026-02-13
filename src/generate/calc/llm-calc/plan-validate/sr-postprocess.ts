@@ -1072,9 +1072,25 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
           if (/\d+\s*层/.test(t) || isFullTitle(t)) return false
           return true
         }) || null
-      if (!perHit) continue
+      const perHitFallback =
+        perHit ||
+        (() => {
+          // Fallback: when there's only one dmg row for that talent key (common for heuristic plans),
+          // use it as the per-hit row even if the title does not mention the entity name.
+          const cands = details.filter((d) => {
+            if (!isDmg(d)) return false
+            if (d.talent !== ent.tk) return false
+            const t = norm(String((d as any).title || ''))
+            if (!t) return false
+            if (isAdjTitle(t)) return false
+            if (/\d+\s*层/.test(t) || isFullTitle(t)) return false
+            return true
+          })
+          return cands.length === 1 ? cands[0]! : null
+        })()
+      if (!perHitFallback) continue
 
-      const call = makeDmgCallExpr(perHit)
+      const call = makeDmgCallExpr(perHitFallback)
       if (!call) continue
 
       type Ramp = { cons: number; pct: number; stacks: number }
@@ -1100,12 +1116,12 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
         ({
           title,
           kind: 'dmg',
-          talent: perHit.talent,
-          table: perHit.table,
-          key: perHit.key,
-          ele: perHit.ele,
-          stat: (perHit as any).stat,
-          params: (perHit as any).params,
+          talent: perHitFallback.talent,
+          table: perHitFallback.table,
+          key: perHitFallback.key,
+          ele: perHitFallback.ele,
+          stat: (perHitFallback as any).stat,
+          params: (perHitFallback as any).params,
           ...(check ? { check } : {}),
           dmgExpr: `({ dmg: (${call}).dmg * ${factor}, avg: (${call}).avg * ${factor} })`
         }) as any

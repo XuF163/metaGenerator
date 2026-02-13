@@ -285,6 +285,7 @@ export function applyGsPostprocess(opts: {
     const prefix = talent === 'e' ? 'E' : 'Q'
     const out: CalcSuggestDetail = { title: `${prefix}${table}`, kind: 'dmg', talent, table, key: talent }
     if (talent === 'q') (out as any).params = { q: true }
+    if (talent === 'e') (out as any).params = { e: true }
 
     if (details.length < 20) {
       gsPushDetail(out)
@@ -330,12 +331,34 @@ export function applyGsPostprocess(opts: {
       if (!Object.prototype.hasOwnProperty.call(p, 'q')) p.q = true
       ;(out as any).params = p
     }
+    if (talent === 'e') {
+      const p0 = (out as any).params
+      const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
+      if (!Object.prototype.hasOwnProperty.call(p, 'e')) p.e = true
+      ;(out as any).params = p
+    }
 
     gsPushAliasByTitle(out)
   }
 
   gsEnsureCoreTitleAlias('e')
   gsEnsureCoreTitleAlias('q')
+
+  // 2b) GS skill-state convention: many baseline calc.js use `params.e===true` to represent "E state active".
+  // Ensure E-sourced damage rows opt into this state so upstream/heuristic buffs gated by `params.e` can apply.
+  try {
+    for (const d of details as any[]) {
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind(d.kind) !== 'dmg') continue
+      if (d.talent !== 'e') continue
+      const p0 = d.params
+      const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
+      if (!Object.prototype.hasOwnProperty.call(p, 'e')) p.e = true
+      d.params = p
+    }
+  } catch {
+    // best-effort
+  }
 
   // 3) Elemental reaction variants (amp / catalyze) for key hits.
   const gsEleVariant:

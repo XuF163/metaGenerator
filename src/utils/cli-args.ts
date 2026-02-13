@@ -64,7 +64,7 @@ function getHelpText(): string {
     '  --output-root <path>     output root (default: temp/metaGenerator/.output)',
     '  --games <gs|sr|all|csv>  default: all',
     '  --types <type|all|csv>   artifact,character,material,weapon (default: all)',
-    '  --force                  gen: wipe output meta-{game} before generating; calc: upgrade empty auto-generated calc.js',
+    '  --force                  gen: wipe output meta-{game} before generating; calc: overwrite all character calc.js',
     '  --force-cache            gen: refresh cached upstream JSON (Hakush); calc: bypass LLM disk cache',
     '  --force-assets           gen: re-download assets (images) if they exist',
     '  --baseline-overlay       gen: overlay baseline meta while generating (debug; default: false)',

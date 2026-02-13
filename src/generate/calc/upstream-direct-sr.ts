@@ -81,6 +81,8 @@ function normalizeExpr(exprRaw: string): string {
   expr = expr.replace(/\bparams\.ultFieldActive\b/g, 'params.q')
   // Baseline meta commonly gates skill-state buffs with `params.eBuff` (unset => off).
   expr = expr.replace(/\bparams\.skillOvertoneBuff\b/g, 'params.eBuff')
+  // Common upstream "enhanced/transformed state" flag.
+  expr = expr.replace(/\bparams\.enhancedStateActive\b/g, 'params.eBuff')
   return expr
 }
 

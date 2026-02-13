@@ -167,17 +167,92 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     table: string
     key: string
     ele?: string
+    title?: string
   }): string | null => {
     if (input.game !== 'sr') return null
     const talent = String(opts.talent || '').trim()
     const table = String(opts.table || '').trim()
     const key = String(opts.key || '').trim()
     const ele = typeof opts.ele === 'string' && opts.ele.trim() ? opts.ele.trim() : ''
+    const title = typeof opts.title === 'string' ? normalizePromptText(opts.title) : ''
     if (!talent || !table) return null
 
     const allTablesRaw = (input.tables as any)?.[talent]
     const allTables = normalizeTableList(Array.isArray(allTablesRaw) ? allTablesRaw : [])
     if (allTables.length === 0) return null
+
+    // Explicit component ratio tables (common in SR meta):
+    // - 攻击倍率 / 生命倍率 / 防御倍率 / 已损失生命值倍率 ...
+    // These do not follow the "...2/...3" variant naming convention, but still represent mixed-stat damage.
+    const srBuildExplicitRatioDmgExpr = (): string | null => {
+      const wantBlastTotal = /(扩散|完整|全体)/.test(title)
+
+      const normKey = (s: string): string => normalizePromptText(s).replace(/\s+/g, '')
+      const isAdj = (s: string): boolean => /相邻目标/.test(normKey(s))
+
+      const pick = (kw: string, adjacent: boolean): string | null => {
+        for (const tn of allTables) {
+          const n = normKey(tn)
+          if (!n.includes(kw)) continue
+          if (adjacent !== isAdj(tn)) continue
+          return tn
+        }
+        return null
+      }
+
+      const pickLostHp = (adjacent: boolean): string | null =>
+        pick('已损失生命值倍率', adjacent) || pick('累计已损失生命值倍率', adjacent)
+
+      const atkMain = pick('攻击倍率', false)
+      const hpMain = pick('生命倍率', false)
+      const defMain = pick('防御倍率', false)
+      const lostMain = pickLostHp(false)
+
+      const atkAdj = pick('攻击倍率', true)
+      const hpAdj = pick('生命倍率', true)
+      const defAdj = pick('防御倍率', true)
+      const lostAdj = pickLostHp(true)
+
+      const hasAny = atkMain || hpMain || defMain || lostMain
+      if (!hasAny) return null
+
+      const ratioAcc = (tn: string): string => `talent.${talent}[${jsString(tn)}]`
+      const ratioExpr = (tn: string): string => {
+        const acc = ratioAcc(tn)
+        return `toRatio(Array.isArray(${acc}) ? ${acc}[0] : ${acc})`
+      }
+
+      const sumRatio = (main: string | null, adj: string | null): string | null => {
+        if (!main && !adj) return null
+        const a = main ? ratioExpr(main) : '0'
+        if (!wantBlastTotal || !adj) return a
+        return `(${a} + ((${ratioExpr(adj)}) * 2))`
+      }
+
+      const terms: string[] = []
+
+      const atkRatio = sumRatio(atkMain, atkAdj)
+      if (atkRatio) terms.push(`calc(attr.atk) * (${atkRatio})`)
+
+      const hpRatio = sumRatio(hpMain, hpAdj)
+      if (hpRatio) terms.push(`calc(attr.hp) * (${hpRatio})`)
+
+      const defRatio = sumRatio(defMain, defAdj)
+      if (defRatio) terms.push(`calc(attr.def) * (${defRatio})`)
+
+      const lostRatio = sumRatio(lostMain, lostAdj)
+      if (lostRatio) {
+        const descRaw = (input.talentDesc as any)?.[talent]
+        const cap0 = srPickLostHpCapRatio(descRaw)
+        const cap = typeof cap0 === 'number' && Number.isFinite(cap0) && cap0 > 0 ? Math.min(2, Math.max(0, cap0)) : 1
+        terms.push(`(calc(attr.hp) * ${cap.toFixed(6)}) * (${lostRatio})`)
+      }
+
+      if (terms.length === 0) return null
+      const keyArg = jsString(key || talent)
+      const eleArg = ele ? `, ${jsString(ele)}` : ''
+      return `dmg.basic(${terms.join(' + ')}, ${keyArg}${eleArg})`
+    }
 
     const { base: baseNameRaw } = srParseVariantName(table)
     const baseName = baseNameRaw.trim()
@@ -194,7 +269,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       variants.push({ idx, name: tn })
     }
     variants.sort((a, b) => a.idx - b.idx)
-    if (variants.length < 2) return null
+    if (variants.length < 2) return srBuildExplicitRatioDmgExpr()
 
     const descRaw = (input.talentDesc as any)?.[talent]
     const wantAdjacent = /相邻/.test(baseName)
@@ -696,7 +771,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       const tableName = typeof d.table === 'string' && d.table ? d.table.trim() : ''
       const key = typeof d.key === 'string' && d.key.trim() ? d.key.trim() : talentKey || 'e'
       const ele = typeof d.ele === 'string' && d.ele.trim() ? d.ele.trim() : ''
-      const auto = srBuildMixedStatDmgExpr({ talent: talentKey, table: tableName, key, ele })
+      const auto = srBuildMixedStatDmgExpr({ talent: talentKey, table: tableName, key, ele, title: String(d.title || '') })
       if (auto) dmgExpr = auto
     }
     if (dmgExpr) {

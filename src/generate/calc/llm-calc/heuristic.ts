@@ -15,6 +15,13 @@ export function pickDamageTable(tables: string[]): string | undefined {
     /(提高|提升|增加|降低|减少|加成|增伤|穿透|抗性穿透|无视|概率|几率|命中|抵抗|击破效率|削韧|冷却|能量|回合|持续时间)/.test(t)
   const dmg = list.find((t) => /伤害/.test(t) && !isBuffLike(t))
   if (dmg) return dmg
+  // SR often uses explicit multiplier components instead of a single "技能伤害" table:
+  // - 攻击倍率 / 生命倍率 / 防御倍率 / 已损失生命值倍率 ...
+  // These are still damage multipliers and should be considered as anchors for auto dmgExpr generation.
+  const ratio = list.find(
+    (t) => /(攻击倍率|生命倍率|防御倍率|已损失生命值倍率|累计已损失生命值倍率)/.test(t) && !isBuffLike(t)
+  )
+  if (ratio) return ratio
   // If no obvious damage table exists, skip (prevents generating nonsense like "战技伤害" -> "生命上限提高").
   return undefined
 }
@@ -75,6 +82,24 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
   const a = pickDamageTable(aTables)
   if (a) details.push({ title: '普攻伤害', talent: 'a', table: a, key: 'a' })
 
+  // A2 (enhanced basic)
+  const a2Tables = normalizeTableList((input.tables as any).a2)
+  // Heuristic: some SR kits enter a persistent "skill state" that globally buffs subsequent damage
+  // and swaps in enhanced multipliers (a2/e2/q2...). Use a baseline-like convention `params.eBuff=true` for showcase rows.
+  const eHasGlobalDmgBuff = eTables.some((t) => /(伤害|造成.{0,8}伤害).*(提高|提升|增加|加成|增伤)/.test(t))
+  const useEBuffParams = eHasGlobalDmgBuff && a2Tables.length > 0
+  const eBuffParams = useEBuffParams ? ({ eBuff: true } as Record<string, number | boolean | string>) : undefined
+  const a2 = pickDamageTable(a2Tables)
+  if (a2) {
+    const hasAdj = a2Tables.some((t) => /相邻目标/.test(t))
+    if (hasAdj) {
+      details.push({ title: '强化普攻(单体)', talent: 'a2', table: a2, key: 'a', params: eBuffParams })
+      details.push({ title: '强化普攻(扩散)', talent: 'a2', table: a2, key: 'a', params: eBuffParams })
+    } else {
+      details.push({ title: '强化普攻伤害', talent: 'a2', table: a2, key: 'a', params: eBuffParams })
+    }
+  }
+
   // E
   const eDesc = descText('e')
   const isHealLike = (text: string): boolean =>
@@ -89,6 +114,11 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
   const e = pickDamageTable(eTables)
   if (e) details.push({ title: '战技伤害', talent: 'e', table: e, key: 'e' })
 
+  // E2 (common enhanced skill block)
+  const e2Tables = normalizeTableList((input.tables as any).e2)
+  const e2 = pickDamageTable(e2Tables)
+  if (e2) details.push({ title: '强化战技伤害', talent: 'e2', table: e2, key: 'e' })
+
   // Q
   const qDesc = descText('q')
   const qHasHeal = isHealLike(qDesc) || qTables.some((t) => /(治疗|回复)/.test(t))
@@ -99,7 +129,15 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
     pickSrHealOrShield('q', qTables, 'heal', '终结技治疗量')
   }
   const q = pickDamageTable(qTables)
-  if (q) details.push({ title: '终结技伤害', talent: 'q', table: q, key: 'q' })
+  if (q) {
+    const hasAdj = qTables.some((t) => /相邻目标/.test(t))
+    if (hasAdj) {
+      details.push({ title: '终结技伤害(单体)', talent: 'q', table: q, key: 'q', params: eBuffParams })
+      details.push({ title: '终结技伤害(扩散)', talent: 'q', table: q, key: 'q', params: eBuffParams })
+    } else {
+      details.push({ title: '终结技伤害', talent: 'q', table: q, key: 'q', params: eBuffParams })
+    }
+  }
   // Extra Q damage tables (e.g. 冻结回合开始伤害 -> 冻结附加伤害)
   const qMain = details.find((d) => d.talent === 'q' && d.kind !== 'heal' && d.kind !== 'shield')?.table || ''
   for (const tn of qTables) {
@@ -114,7 +152,7 @@ export function heuristicPlan(input: CalcSuggestInput): CalcSuggestResult {
   const t = pickDamageTable(tTables)
   if (t) {
     const title = /反击/.test(t) ? '反击伤害' : '天赋伤害'
-    details.push({ title, talent: 't', table: t, key: 't' })
+    details.push({ title, talent: 't', table: t, key: 't', params: eBuffParams })
   }
 
   const mainAttrParts = ['atk', 'cpct', 'cdmg']
