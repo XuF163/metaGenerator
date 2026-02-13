@@ -75,6 +75,20 @@ function mergePlanBuffs(opts: {
   const base = Array.isArray(opts.base) ? opts.base : []
   const upstream = Array.isArray(opts.upstream) ? opts.upstream : []
   if (base.length === 0 && upstream.length === 0) return undefined
+  const baseDataKeys = (() => {
+    const keys = new Set<string>()
+    for (const b of base) {
+      if (!isRecord(b)) continue
+      const data = (b as any).data
+      if (!isRecord(data)) continue
+      for (const k of Object.keys(data)) {
+        const kk = String(k || '').trim()
+        if (!kk) continue
+        keys.add(kk)
+      }
+    }
+    return keys
+  })()
   const seenStr = new Set<string>()
   const seenBuff = new Map<string, { idx: number; source: 'base' | 'upstream' }>()
   const out: Array<CalcSuggestBuff | string> = []
@@ -117,7 +131,26 @@ function mergePlanBuffs(opts: {
   }
 
   for (const b of upstream) {
-    pushBuff(b, 'upstream')
+    // Upstream total-stat nodes (e.g. Hu Tao's E: HP->ATK) can duplicate heuristic buffs that already
+    // model the same conversion with proper params gating. Treat upstream `(...total)` as a fallback:
+    // if base already defines the same data keys, drop those keys from the upstream entry to avoid double counting.
+    const filtered = (() => {
+      if (!isRecord(b)) return null
+      const title = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+      if (!/\(total\)\s*$/.test(title)) return b
+      const data = (b as any).data
+      if (!isRecord(data)) return b
+      const next: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(data)) {
+        const kk = String(k || '').trim()
+        if (!kk) continue
+        if (baseDataKeys.has(kk)) continue
+        next[kk] = v
+      }
+      if (Object.keys(next).length === 0) return null
+      return { ...(b as any), data: next } as CalcSuggestBuff
+    })()
+    if (filtered) pushBuff(filtered, 'upstream')
   }
 
   return out.length ? out : undefined
@@ -174,17 +207,54 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
   } catch {
     // keep heuristic plan as-is
   }
-  // validatePlan() may inject additional buffs (e.g. special mechanics) that can overlap with upstream-derived keys.
-  // Re-merge once more to prevent double-counting and keep `preferUpstream` behavior stable.
+  // NOTE: validatePlan() postprocesses buff expressions (clamps, gating, etc.).
+  // Re-merging raw upstream buffs after validation would re-introduce pre-validated variants and double-count.
+  //
+  // However, validatePlan() may also inject derived/heuristic buffs AFTER we merged upstream-direct,
+  // which can create double-counting for certain keys. Treat upstream "(total)" buffs as a fallback:
+  // if other buffs already define the same data keys, drop those keys from upstream total entries.
   try {
-    if (upstreamBuffs.length) {
-      const preferUpstream = opts.upstream?.preferUpstream !== false
-      const merged = mergePlanBuffs({
-        base: Array.isArray(plan.buffs) ? plan.buffs : undefined,
-        upstream: upstreamBuffs,
-        preferUpstream
-      })
-      if (merged) (plan as any).buffs = merged
+    const buffs = Array.isArray((plan as any).buffs) ? ((plan as any).buffs as Array<CalcSuggestBuff | string>) : []
+    if (buffs.length) {
+      const isUpstreamTotal = (b: unknown): boolean => {
+        if (!isRecord(b)) return false
+        const t = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+        return /^upstream:.*\(\s*total\s*\)\s*$/i.test(t)
+      }
+
+      const otherKeys = new Set<string>()
+      for (const b of buffs) {
+        if (isUpstreamTotal(b)) continue
+        if (!isRecord(b)) continue
+        const data = (b as any).data
+        if (!isRecord(data)) continue
+        for (const k of Object.keys(data)) {
+          const kk = String(k || '').trim()
+          if (kk) otherKeys.add(kk)
+        }
+      }
+
+      if (otherKeys.size) {
+        const next: Array<CalcSuggestBuff | string> = []
+        for (const b of buffs) {
+          if (!isUpstreamTotal(b)) {
+            next.push(b)
+            continue
+          }
+          if (!isRecord(b)) continue
+          const data = (b as any).data
+          if (!isRecord(data)) continue
+          const filtered: Record<string, unknown> = {}
+          for (const [k, v] of Object.entries(data)) {
+            const kk = String(k || '').trim()
+            if (!kk) continue
+            if (otherKeys.has(kk)) continue
+            filtered[kk] = v
+          }
+          if (Object.keys(filtered).length) next.push({ ...(b as any), data: filtered } as CalcSuggestBuff)
+        }
+        ;(plan as any).buffs = next
+      }
     }
   } catch {
     // best-effort

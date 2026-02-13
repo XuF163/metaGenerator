@@ -38,6 +38,20 @@ function isRecord(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v)
 }
 
+function normalizeAvatarId(game, id) {
+  const s = String(id || "").trim()
+  if (!s) return ""
+  if (game === "gs") {
+    // Baseline meta uses the unified traveler id=20000000, while many datasets store traveler as:
+    // - 10000005 (空)
+    // - 10000007 (荧)
+    // Treat them as the same logical avatar for cover statistics.
+    const n = Number(s)
+    if (n === 20000000 || n === 10000005 || n === 10000007) return "20000000"
+  }
+  return s
+}
+
 function splitCsv(v) {
   return String(v || "")
     .split(",")
@@ -60,14 +74,22 @@ function withinRatio(r, pct = 0.025) {
   return r >= lo && r <= hi
 }
 
-function scoreAvatar(d) {
-  const cands = [d?.maxAvg?.ratio, d?.maxAvgMatched?.ratio, d?.worst?.ratio]
-  let best = 0
-  for (const r of cands) {
-    const v = absLogRatio(r)
-    if (typeof v === "number" && v > best) best = v
+function pickWorstRatioForScore(d) {
+  const cands = [
+    { src: "maxAvg", ratio: d?.maxAvg?.ratio },
+    { src: "maxAvgMatched", ratio: d?.maxAvgMatched?.ratio },
+    { src: "worst", ratio: d?.worst?.ratio }
+  ]
+  let best = { src: "", ratio: null, score: 0 }
+  for (const c of cands) {
+    const v = absLogRatio(c.ratio)
+    if (typeof v === "number" && v > best.score) best = { src: c.src, ratio: c.ratio, score: v }
   }
   return best
+}
+
+function scoreAvatar(d) {
+  return pickWorstRatioForScore(d).score
 }
 
 function getPrimaryRatio(d) {
@@ -84,7 +106,10 @@ function extractAvatarIds(raw, { game }) {
   if (!isRecord(raw)) return []
   const avatars = isRecord(raw.avatars) ? raw.avatars : null
   if (!avatars) return []
-  const ids = Object.keys(avatars).filter(Boolean)
+  const ids = Object.keys(avatars)
+    .filter(Boolean)
+    .map((id) => normalizeAvatarId(game, id))
+    .filter(Boolean)
   if (game === "sr") {
     // SR: playable avatars are 4-digit ids (e.g. 1001..1415, 8005..8006).
     // Some datasets contain internal “加强/强化” variants (e.g. 100500/120500), which do not have meta/calc.
@@ -138,9 +163,10 @@ function buildUidAvatarMap(testdataRootAbs, game, { requireArtis }) {
     const avatars = isRecord(raw.avatars) ? raw.avatars : null
     if (avatars) {
       for (const [id, av] of Object.entries(avatars)) {
-        if (!id || idToName.has(id)) continue
-        if (!set.has(String(id))) continue
-        if (isRecord(av) && typeof av.name === "string" && av.name.trim()) idToName.set(id, av.name.trim())
+        const idNorm = normalizeAvatarId(game, id)
+        if (!idNorm || idToName.has(idNorm)) continue
+        if (!set.has(String(idNorm))) continue
+        if (isRecord(av) && typeof av.name === "string" && av.name.trim()) idToName.set(idNorm, av.name.trim())
       }
     }
   }
@@ -173,7 +199,8 @@ function buildMetaUniverse(metaRootAbs, game) {
     } catch {
       continue
     }
-    const id = String(raw?.id || "").trim()
+    const idRaw = String(raw?.id || "").trim()
+    const id = normalizeAvatarId(game, idRaw)
     if (!id) continue
     if (game === "sr") {
       // SR: playable avatars are 4-digit ids (e.g. 1001..1415, 8005..8006).
@@ -328,6 +355,7 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
         missing++
         continue
       }
+      const idNorm = normalizeAvatarId(game, d?.id)
       const matched = Number(d?.matchSummary?.matched || d?.maxAvgMatched?.matched || 0)
       if (!matched) matched0++
       rowsMatched += matched
@@ -343,17 +371,18 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
         }
       }
 
-      const score = scoreAvatar(d)
-      const prev = worstMap.get(String(d?.id || ""))
+      const scorePick = pickWorstRatioForScore(d)
+      const score = scorePick.score
+      const prev = worstMap.get(String(idNorm || d?.id || ""))
       if (!prev || score > prev.score) {
         const hintParts = []
         if (typeof d?.worst?.title === "string" && d.worst.title.trim()) hintParts.push(d.worst.title.trim())
         if (typeof d?.weapon === "string" && d.weapon.trim()) hintParts.push(d.weapon.trim())
-        worstMap.set(String(d?.id || ""), {
+        worstMap.set(String(idNorm || d?.id || ""), {
           uid,
-          id: String(d?.id || ""),
-          name: String(d?.name || ""),
-          ratio: getPrimaryRatio(d),
+          id: String(idNorm || d?.id || ""),
+          name: (idNorm && idToName?.get?.(String(idNorm))) || String(d?.name || ""),
+          ratio: scorePick.ratio,
           score,
           hint: hintParts.slice(0, 2).join(" / ")
         })
@@ -384,7 +413,10 @@ function buildSummaryForGame({ repoRoot, evidenceRootAbs, game, selectedUids, un
     if (!fs.existsSync(diffPath)) continue
     const payload = JSON.parse(fs.readFileSync(diffPath, "utf8"))
     const diffs = Array.isArray(payload?.diffs) ? payload.diffs : []
-    for (const d of diffs) if (d?.id) covered.add(String(d.id))
+    for (const d of diffs) {
+      const idNorm = normalizeAvatarId(game, d?.id)
+      if (idNorm) covered.add(String(idNorm))
+    }
   }
 
   const universeIds = Array.from(universe).sort((a, b) => Number(a) - Number(b))

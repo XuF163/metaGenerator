@@ -167,6 +167,7 @@ function mapPremodKeyToMiaoBuffKey(elem: string, key: string): string | null {
   if (k === 'dmg_' || k === 'all_dmg_') return 'dmg'
   if (k === 'dmgInc' || k === 'all_dmgInc') return 'dmgPlus'
   if (k === 'physical_dmg_') return 'phy'
+  if (k === 'eleMas') return 'mastery'
   if (k === 'atk_') return 'atkPct'
   if (k === 'hp_') return 'hpPct'
   if (k === 'def_') return 'defPct'
@@ -193,6 +194,14 @@ function mapPremodKeyToMiaoBuffKey(elem: string, key: string): string | null {
     if (k === `${prefix}_dmgInc`) return `${bucket}Plus`
     if (k === `${prefix}_critRate_`) return `${bucket}Cpct`
     if (k === `${prefix}_critDMG_`) return `${bucket}Cdmg`
+    // Common upstream variants: `plunging_impact_dmgInc`, `skill_hit_dmg_`, ...
+    // Treat these as the corresponding talent bucket to better align with baseline-style calc.js.
+    if (k.startsWith(`${prefix}_`)) {
+      if (k.endsWith('_dmg_')) return `${bucket}Dmg`
+      if (k.endsWith('_dmgInc')) return `${bucket}Plus`
+      if (k.endsWith('_critRate_')) return `${bucket}Cpct`
+      if (k.endsWith('_critDMG_')) return `${bucket}Cdmg`
+    }
   }
 
   return null
@@ -240,17 +249,37 @@ function hasUnknownFreeIdentifiers(expr: string): boolean {
     'Infinity',
     'NaN'
   ])
-  const re = /\b[A-Za-z_][A-Za-z0-9_]*\b/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(expr))) {
-    const id = m[0] || ''
-    if (!id) continue
-    const prev = expr[m.index - 1]
-    const prev2 = expr[m.index - 2]
+  const isStart = (ch: string | undefined): boolean => !!ch && /[A-Za-z_]/.test(ch)
+  const isChar = (ch: string | undefined): boolean => !!ch && /[A-Za-z0-9_]/.test(ch)
+  let inStr: '"' | "'" | '`' | null = null
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]!
+    if (inStr) {
+      if (ch === '\\') {
+        i++
+        continue
+      }
+      if (ch === inStr) inStr = null
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch
+      continue
+    }
+    if (!isStart(ch)) continue
+
+    let j = i + 1
+    while (j < expr.length && isChar(expr[j])) j++
+    const id = expr.slice(i, j)
+
+    const prev = i > 0 ? expr[i - 1] : ''
+    const prev2 = i > 1 ? expr[i - 2] : ''
     // Ignore member accesses like `Math.min`, but NOT spread operator like `...input`.
-    if (prev === '.' && prev2 !== '.') continue
-    if (allowed.has(id)) continue
-    return true
+    if (!(prev === '.' && prev2 !== '.')) {
+      if (!allowed.has(id)) return true
+    }
+
+    i = j - 1
   }
   return false
 }
@@ -295,6 +324,96 @@ function extractCallArgs(text: string, openParenIdx: number, maxArgs = 8): strin
   return out
 }
 
+type CondVarInfo = { condKey: string; section?: string; nameKey?: string }
+
+function extractCondVarDecls(text: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const m of text.matchAll(
+    /\bconst\s*\[\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*]\s*=\s*cond\s*\(\s*key\s*,\s*['"]([^'"]+)['"]/g
+  )) {
+    const varName = String(m[1] || '').trim()
+    const condKey = String(m[2] || '').trim()
+    if (varName && condKey) out.set(varName, condKey)
+  }
+  return out
+}
+
+function extractCondTemInfo(
+  text: string,
+  condVarToKey: Map<string, string>
+): Map<string, Pick<CondVarInfo, 'section' | 'nameKey'>> {
+  const out = new Map<string, Pick<CondVarInfo, 'section' | 'nameKey'>>()
+  const re = /\bct\.condTem\s*\(\s*['"]([^'"]+)['"]\s*,/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text))) {
+    const section = String(m[1] || '').trim()
+    if (!section) continue
+
+    const brace = text.indexOf('{', re.lastIndex)
+    if (brace < 0) continue
+    const block = extractBraceBlock(text, brace)
+    if (!block) continue
+
+    const mValue = /\bvalue\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\b/.exec(block)
+    const varName = String(mValue?.[1] || '').trim()
+    if (!varName || !condVarToKey.has(varName)) {
+      re.lastIndex = brace + block.length
+      continue
+    }
+
+    const mNameKey = /\bname\s*:\s*st\s*\(\s*['"]([^'"]+)['"]/.exec(block)
+    const nameKey = String(mNameKey?.[1] || '').trim() || undefined
+
+    out.set(varName, { section, nameKey })
+    re.lastIndex = brace + block.length
+  }
+  return out
+}
+
+function sanitizeParamKey(raw: string): string {
+  let t = String(raw || '').trim()
+  if (!t) return ''
+  t = t.replace(/[^A-Za-z0-9_]/g, '_')
+  t = t.replace(/_+/g, '_').replace(/^_+|_+$/g, '')
+  if (!t) return ''
+  if (!/^[A-Za-z_]/.test(t)) t = `p_${t}`
+  return t
+}
+
+function parseStringLiteral(text: string): string | null {
+  const s = String(text || '').trim()
+  const m = /^(['"])(.*)\1$/.exec(s)
+  return m ? m[2]! : null
+}
+
+function renderParamAccess(keyRaw: string): string {
+  const key = String(keyRaw || '').trim()
+  if (!key) return 'params'
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) ? `params.${key}` : `params[${JSON.stringify(key)}]`
+}
+
+function inferCondStateParamKey(info: CondVarInfo, stateKey: string, varNameRaw: string): string {
+  const varName = String(varNameRaw || '').trim()
+  const state = String(stateKey || '').trim()
+
+  // Baseline convention: HP<=50% toggles commonly use `halfHp`.
+  if (info.condKey === 'SanguineRouge') return 'halfHp'
+  if (info.nameKey === 'lessEqPercentHP' && state === 'on') return 'halfHp'
+
+  if (state === 'on') {
+    if (info.section === 'skill') return 'e'
+    if (info.section === 'burst') return 'q'
+    const k = sanitizeParamKey(info.condKey) || sanitizeParamKey(varName)
+    return k || 'cond'
+  }
+
+  const condKey = sanitizeParamKey(info.condKey) || sanitizeParamKey(varName)
+  const st = sanitizeParamKey(state)
+  if (condKey && st && condKey === st) return condKey
+  if (condKey && st) return `${condKey}_${st}`
+  return condKey || st || 'cond'
+}
+
 function findMatchingParen(text: string, openParenIdx: number): number {
   if (openParenIdx < 0 || openParenIdx >= text.length || text[openParenIdx] !== '(') return -1
   let depth = 0
@@ -322,14 +441,76 @@ function findMatchingParen(text: string, openParenIdx: number): number {
   return -1
 }
 
+function stripJsComments(text: string): string {
+  const s = String(text || '')
+  if (!s) return ''
+  let out = ''
+  let inStr: '"' | "'" | '`' | null = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!
+    const next = s[i + 1]
+
+    if (inStr) {
+      out += ch
+      if (ch === '\\') {
+        if (next) {
+          out += next
+          i++
+        }
+        continue
+      }
+      if (ch === inStr) inStr = null
+      continue
+    }
+
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch
+      out += ch
+      continue
+    }
+
+    // Line comment: `// ...`
+    if (ch === '/' && next === '/') {
+      i += 2
+      while (i < s.length && s[i] !== '\n' && s[i] !== '\r') i++
+      out += ' '
+      i -= 1
+      continue
+    }
+
+    // Block comment: `/* ... */`
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < s.length - 1 && !(s[i] === '*' && s[i + 1] === '/')) i++
+      i += 1
+      out += ' '
+      continue
+    }
+
+    out += ch
+  }
+  return out
+}
+
 function normalizeExprGs(exprRaw: string): string {
   let expr = String(exprRaw || '').trim()
   if (!expr) return ''
   expr = expr.replace(/\binput\.constellation\b/g, 'cons')
+  // Base stats are available as `attr.xxx.base` in miao-plugin runtime.
+  expr = expr.replace(/\binput\.base\.atk\b/g, 'attr.atk.base')
+  expr = expr.replace(/\binput\.base\.hp\b/g, 'attr.hp.base')
+  expr = expr.replace(/\binput\.base\.def\b/g, 'attr.def.base')
   // In miao-plugin runtime, `attr.xxx` is an AttrItem-like object and must be converted via `calc(attr.xxx)` when used as a number.
   expr = expr.replace(/\binput\.total\.atk\b/g, 'calc(attr.atk)')
   expr = expr.replace(/\binput\.total\.hp\b/g, 'calc(attr.hp)')
   expr = expr.replace(/\binput\.total\.def\b/g, 'calc(attr.def)')
+  expr = expr.replace(/\binput\.total\.eleMas\b/g, 'calc(attr.mastery)')
+  // Upstream `*_` total stats are typically ratios (e.g. enerRech_=1.8 for 180%).
+  // miao-plugin stores them as percent points (e.g. recharge=180), so convert to ratios when used in formulas.
+  expr = expr.replace(/\binput\.total\.enerRech_\b/g, '(calc(attr.recharge) / 100)')
+  expr = expr.replace(/\binput\.total\.critRate_\b/g, '(calc(attr.cpct) / 100)')
+  expr = expr.replace(/\binput\.total\.critDMG_\b/g, '(calc(attr.cdmg) / 100)')
+  expr = expr.replace(/\binput\.total\.heal_\b/g, '(calc(attr.heal) / 100)')
   // Best-effort: miao-plugin does not distinguish premod vs total; map both to total panel stats.
   expr = expr.replace(/\binput\.premod\.atk\b/g, 'calc(attr.atk)')
   expr = expr.replace(/\binput\.premod\.hp\b/g, 'calc(attr.hp)')
@@ -413,9 +594,41 @@ function parseObjectLiteralEntries(block: string): Array<{ key: string; value: s
 
   const end = t.length - 1
   let i = 1
+  const skipUntilComma = (): void => {
+    let depth = 0
+    let inStr: '"' | "'" | '`' | null = null
+    for (; i < end; i++) {
+      const ch = t[i]!
+      if (inStr) {
+        if (ch === '\\') {
+          i++
+          continue
+        }
+        if (ch === inStr) inStr = null
+        continue
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inStr = ch
+        continue
+      }
+      if (ch === '(' || ch === '[' || ch === '{') depth++
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth > 0) depth--
+      }
+      if (depth === 0 && ch === ',') break
+    }
+  }
   while (i < end) {
     while (i < end && /[\s,]/.test(t[i]!)) i++
     if (i >= end) break
+
+    // spread entries: `...foo` / `...Object.fromEntries(...)`
+    if (t.startsWith('...', i)) {
+      i += 3
+      skipUntilComma()
+      if (t[i] === ',') i++
+      continue
+    }
 
     // key
     let key = ''
@@ -436,14 +649,29 @@ function parseObjectLiteralEntries(block: string): Array<{ key: string; value: s
       i++ // skip quote
     } else {
       const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(t.slice(i))
-      if (!m) break
+      if (!m) {
+        // Skip unsupported fragments like `[x]: y` instead of aborting the whole parse.
+        skipUntilComma()
+        if (t[i] === ',') i++
+        continue
+      }
       key = m[0]!
       i += m[0]!.length
     }
-    if (!key) break
+    if (!key) {
+      skipUntilComma()
+      if (t[i] === ',') i++
+      continue
+    }
 
     while (i < end && /\s/.test(t[i]!)) i++
-    if (t[i] !== ':') break
+    if (t[i] !== ':') {
+      // shorthand entry: `{ foo, bar }` means `{ foo: foo, bar: bar }`
+      out.push({ key, value: key })
+      while (i < end && /\s/.test(t[i]!)) i++
+      if (t[i] === ',') i++
+      continue
+    }
     i++ // skip ':'
     while (i < end && /\s/.test(t[i]!)) i++
 
@@ -528,11 +756,20 @@ function extractObjectBlocksByPrefix(text: string, prefix: string): string[] {
 }
 
 function extractDataObjOptionsBlock(text: string): string {
+  const got = extractDataObjOptionsBlockWithRange(text)
+  return got?.block || ''
+}
+
+function extractDataObjOptionsBlockWithRange(
+  text: string
+): { block: string; startIdx: number; endIdx: number } | null {
   const idx = text.indexOf('dataObjForCharacterSheet(')
-  if (idx < 0) return ''
+  if (idx < 0) return null
   const brace = text.indexOf('{', idx)
-  if (brace < 0) return ''
-  return extractBraceBlock(text, brace)
+  if (brace < 0) return null
+  const block = extractBraceBlock(text, brace)
+  if (!block) return null
+  return { block, startIdx: brace, endIdx: brace + block.length }
 }
 
 function extractTopLevelObjectPropBlock(objText: string, propNameRaw: string): string {
@@ -597,14 +834,16 @@ function pushObjectEntries(out: Map<string, string[]>, block: string): void {
 function extractObjectEntryCandidates(
   text: string,
   prefix: string,
-  opts?: { includeTeamBuffs?: boolean }
+  opts?: { includeTeamBuffs?: boolean; includeNodeLocal?: boolean }
 ): Map<string, string[]> {
   const out = new Map<string, string[]>()
   const includeTeamBuffs = Boolean(opts?.includeTeamBuffs)
+  const includeNodeLocal = Boolean(opts?.includeNodeLocal)
 
   // Prefer parsing the `dataObjForCharacterSheet(..., { ... })` options object to avoid accidentally
   // pulling in unrelated blocks (and to make teamBuff inclusion explicit/configurable).
-  const optionsBlock = extractDataObjOptionsBlock(text)
+  const optionsBlockInfo = extractDataObjOptionsBlockWithRange(text)
+  const optionsBlock = optionsBlockInfo?.block || ''
   if (optionsBlock) {
     if (prefix === 'premod:') {
       pushObjectEntries(out, extractTopLevelObjectPropBlock(optionsBlock, 'premod'))
@@ -616,13 +855,54 @@ function extractObjectEntryCandidates(
       }
     } else if (prefix === 'base:') {
       pushObjectEntries(out, extractTopLevelObjectPropBlock(optionsBlock, 'base'))
+    } else if (prefix === 'total:') {
+      pushObjectEntries(out, extractTopLevelObjectPropBlock(optionsBlock, 'total'))
+      if (includeTeamBuffs) {
+        const teamBuffBlock = extractTopLevelObjectPropBlock(optionsBlock, 'teamBuff')
+        pushObjectEntries(out, extractTopLevelObjectPropBlock(teamBuffBlock, 'total'))
+      }
     }
-    if (out.size > 0) return out
   }
 
-  // Fallback: scan all blocks by prefix.
-  const blocks = extractObjectBlocksByPrefix(text, prefix)
-  for (const block of blocks) pushObjectEntries(out, block)
+  // IMPORTANT:
+  // - For upstream-direct, do NOT treat node-local `{ premod: { ... } }` blocks (e.g. inside `dmgNode(...)`)
+  //   as global buffs. Those premods are scoped to a specific formula row; merging them globally causes severe
+  //   over-buffing drift (e.g. Mualani's wave stacks applied to every normal hit).
+  // - Keep this behind a flag for potential future use in upstream-follow (LLM) as *hints*, not as globals.
+  if (includeNodeLocal) {
+    // Scan node-local blocks by prefix (e.g. dmgNode(..., { premod: { ... } })), but skip occurrences
+    // inside the already-parsed `dataObjForCharacterSheet` options object to avoid unintentionally including
+    // teamBuff when `includeTeamBuffs=false`.
+    const skipStart = typeof optionsBlockInfo?.startIdx === 'number' ? optionsBlockInfo.startIdx : -1
+    const skipEnd = typeof optionsBlockInfo?.endIdx === 'number' ? optionsBlockInfo.endIdx : -1
+
+    let from = 0
+    while (true) {
+      const idx = text.indexOf(prefix, from)
+      if (idx < 0) break
+      const brace = text.indexOf('{', idx)
+      if (brace < 0) break
+
+      if (skipStart >= 0 && skipEnd > skipStart && idx >= skipStart && idx < skipEnd) {
+        from = brace + 1
+        continue
+      }
+
+      const block = extractBraceBlock(text, brace)
+      if (block) pushObjectEntries(out, block)
+      from = brace + 1
+    }
+  }
+  return out
+}
+
+function extractTeamBuffEntryCandidates(text: string, prop: 'premod' | 'total'): Map<string, string[]> {
+  const out = new Map<string, string[]>()
+  const optionsBlock = extractDataObjOptionsBlock(text)
+  if (!optionsBlock) return out
+  const teamBuffBlock = extractTopLevelObjectPropBlock(optionsBlock, 'teamBuff')
+  if (!teamBuffBlock) return out
+  pushObjectEntries(out, extractTopLevelObjectPropBlock(teamBuffBlock, prop))
   return out
 }
 
@@ -632,6 +912,15 @@ function mapBaseKeyToMiaoBuffKey(key: string): string | null {
   if (k === 'atk') return 'atkBase'
   if (k === 'hp') return 'hpBase'
   if (k === 'def') return 'defBase'
+  return null
+}
+
+function mapTotalKeyToMiaoBuffKey(key: string): string | null {
+  const k = String(key || '').trim()
+  if (!k) return null
+  if (k === 'atk') return 'atkPlus'
+  if (k === 'hp') return 'hpPlus'
+  if (k === 'def') return 'defPlus'
   return null
 }
 
@@ -662,13 +951,29 @@ function translateGsExpr(
     dmMap: Map<string, string>
     dmConstNums: Map<string, number>
     skillParam: any
+    condVarInfo?: Map<string, CondVarInfo>
   },
   stack = new Set<string>(),
   depth = 0
 ): string {
   if (depth > 20) return ''
-  let expr = normalizeExprGs(exprRaw).replace(/,$/, '').trim()
+  let expr = normalizeExprGs(stripJsComments(exprRaw)).replace(/,$/, '').trim()
   if (!expr) return ''
+
+  // `tally.*` represents teammate-count / team-aggregate values in genshin-optimizer.
+  // miao-plugin runtime has no such concept; approximate with "showcase-like" assumptions:
+  // - teammate counts: assume thresholds are satisfied (use 3)
+  // - max stat across team: approximate with self panel stat
+  const tally = /^tally\.([A-Za-z0-9_]+)$/.exec(expr)
+  if (tally) {
+    const k = String(tally[1] || '').trim()
+    const lower = k.toLowerCase()
+    if (/max.*(elemas|em|mastery)/.test(lower)) return 'calc(attr.mastery)'
+    if (/max.*hp/.test(lower)) return 'calc(attr.hp)'
+    if (/max.*atk/.test(lower)) return 'calc(attr.atk)'
+    if (/max.*def/.test(lower)) return 'calc(attr.def)'
+    return '3'
+  }
 
   // Object-spread alias: `const x = { ...y }` (Clorinde: burst_dmgInc mirrors normal_dmgInc).
   // Also used in upstream to mark "pivot" nodes (e.g. `infoMut({ ...input.premod.hp }, { pivot: true })`).
@@ -727,6 +1032,56 @@ function translateGsExpr(
     const out = translateGsExpr(init, opts, stack, depth + 1)
     stack.delete(name)
     return out
+  }
+
+  // constObj.propA.propB -> inline from const initializer object literal when possible.
+  // (Common in upstream options blocks: `skill_dmgInc: dmgFormulas.constellation2.skill_dmgInc`.)
+  const member = /^([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.exec(expr)
+  if (member) {
+    const parts = expr.split('.').map((s) => s.trim()).filter(Boolean)
+    const base = parts.shift() || ''
+    if (base && opts.constInits.has(base) && !stack.has(base)) {
+      const extractObjBlock = (raw: string): string | null => {
+        const s = String(raw || '').trim()
+        if (!s) return null
+        const idx = s.indexOf('{')
+        if (idx < 0) return null
+        const block = extractBraceBlock(s, idx)
+        return block && block.trim().startsWith('{') ? block : null
+      }
+
+      stack.add(base)
+      let cur = String(opts.constInits.get(base) || '')
+      for (const seg of parts) {
+        if (!seg) {
+          cur = ''
+          break
+        }
+        // Allow indirection: `{ foo: bar }` where `bar` is another const object.
+        const idOnly = /^[A-Za-z_][A-Za-z0-9_]*$/.test(cur.trim()) ? cur.trim() : ''
+        if (idOnly && opts.constInits.has(idOnly) && !stack.has(idOnly)) {
+          stack.add(idOnly)
+          cur = String(opts.constInits.get(idOnly) || '')
+          stack.delete(idOnly)
+        }
+
+        const obj = extractObjBlock(cur)
+        if (!obj) {
+          cur = ''
+          break
+        }
+        const entries = parseObjectLiteralEntries(obj)
+        const hit = entries.find((e) => e.key === seg) || null
+        if (!hit?.value) {
+          cur = ''
+          break
+        }
+        cur = hit.value
+      }
+      stack.delete(base)
+      const resolved = String(cur || '').trim()
+      if (resolved) return translateGsExpr(resolved, opts, stack, depth + 1)
+    }
   }
 
   // function call
@@ -806,7 +1161,7 @@ function translateGsExpr(
         .filter(Boolean)
         // Drop unresolved spread fragments like `...0` that are invalid in scalar expressions.
         .filter((x) => !/\.\.\./.test(x))
-      if (parts.length) return `(${parts.join(' + ')})`
+      if (parts.length) return `(${parts.map((p) => `(${p})`).join(' + ')})`
       // Team-element counters (`tally.*`) are not representable in miao-plugin's calc.js runtime.
       // For upstream-direct, assume a "showcase-like" party that satisfies teammate-count thresholds,
       // which aligns better with baseline meta expectations.
@@ -818,7 +1173,7 @@ function translateGsExpr(
         .map(t)
         .filter(Boolean)
         .filter((x) => !/\.\.\./.test(x))
-      return parts.length ? `(${parts.join(' * ')})` : '0'
+      return parts.length ? `(${parts.map((p) => `(${p})`).join(' * ')})` : '0'
     }
     if (fn === 'min') {
       const parts = args.map(t).filter(Boolean)
@@ -856,26 +1211,93 @@ function translateGsExpr(
 
     if (fn === 'equal') {
       const v1Raw = String(args[0] || '').trim()
-      const v2 = t(args[1] || '')
+      const v2Raw = String(args[1] || '').trim()
       const pass = t(args[2] || '')
       if (!pass) return '0'
-      // If the lhs is not a core input (often a condition path), assume the buff is active (baseline-like).
-      if (!/^cons\b|^attr\b|^[0-9(]/.test(normalizeExprGs(v1Raw))) return pass
+
+      const cond = (raw: string): { varName: string; info: CondVarInfo } | null => {
+        const varName = String(raw || '').trim()
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) return null
+        const info = opts.condVarInfo?.get(varName)
+        return info ? { varName, info } : null
+      }
+
+      const c1 = cond(v1Raw)
+      const c2 = cond(v2Raw)
+      const s1 = parseStringLiteral(v1Raw)
+      const s2 = parseStringLiteral(v2Raw)
+      if ((c1 && s2) || (c2 && s1)) {
+        const picked = c1 && s2 ? { c: c1, state: s2 } : { c: c2!, state: s1! }
+        const key = inferCondStateParamKey(picked.c.info, picked.state, picked.c.varName)
+        const access = renderParamAccess(key)
+        return `((${access}) ? (${pass}) : 0)`
+      }
+
       const v1 = t(v1Raw)
-      if (!v1 || !v2) return pass
+      const v2 = t(v2Raw)
+      if (!v1 || !v2) return '0'
       return `((${v1}) == (${v2}) ? (${pass}) : 0)`
     }
 
     if (fn === 'unequal') {
       const v1Raw = String(args[0] || '').trim()
-      const v2 = t(args[1] || '')
+      const v2Raw = String(args[1] || '').trim()
       const pass = t(args[2] || '')
       if (!pass) return '0'
-      // If the lhs is not a core input (often a condition path), assume the buff is active (baseline-like).
-      if (!/^cons\b|^attr\b|^[0-9(]/.test(normalizeExprGs(v1Raw))) return pass
+
+      const cond = (raw: string): { varName: string; info: CondVarInfo } | null => {
+        const varName = String(raw || '').trim()
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) return null
+        const info = opts.condVarInfo?.get(varName)
+        return info ? { varName, info } : null
+      }
+
+      const c1 = cond(v1Raw)
+      const c2 = cond(v2Raw)
+      const s1 = parseStringLiteral(v1Raw)
+      const s2 = parseStringLiteral(v2Raw)
+      if ((c1 && s2) || (c2 && s1)) {
+        const picked = c1 && s2 ? { c: c1, state: s2 } : { c: c2!, state: s1! }
+        const key = inferCondStateParamKey(picked.c.info, picked.state, picked.c.varName)
+        const access = renderParamAccess(key)
+        return `(!(${access}) ? (${pass}) : 0)`
+      }
+
       const v1 = t(v1Raw)
-      if (!v1 || !v2) return pass
+      const v2 = t(v2Raw)
+      if (!v1 || !v2) return '0'
       return `((${v1}) != (${v2}) ? (${pass}) : 0)`
+    }
+
+    if (fn === 'compareEq') {
+      const v1Raw = String(args[0] || '').trim()
+      const v2Raw = String(args[1] || '').trim()
+      const eq = t(args[2] || '')
+      const neq = t(args[3] || '') || '0'
+      if (!eq && !neq) return '0'
+
+      const cond = (raw: string): { varName: string; info: CondVarInfo } | null => {
+        const varName = String(raw || '').trim()
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) return null
+        const info = opts.condVarInfo?.get(varName)
+        return info ? { varName, info } : null
+      }
+
+      const c1 = cond(v1Raw)
+      const c2 = cond(v2Raw)
+      const s1 = parseStringLiteral(v1Raw)
+      const s2 = parseStringLiteral(v2Raw)
+      if ((c1 && s2) || (c2 && s1)) {
+        const picked = c1 && s2 ? { c: c1, state: s2 } : { c: c2!, state: s1! }
+        const key = inferCondStateParamKey(picked.c.info, picked.state, picked.c.varName)
+        const access = renderParamAccess(key)
+        return `((${access}) ? (${eq || '0'}) : (${neq || '0'}))`
+      }
+
+      const v1 = t(v1Raw)
+      const v2 = t(v2Raw)
+      if (!v1 || !v2) return neq || '0'
+      return `((${v1}) == (${v2}) ? (${eq || '0'}) : (${neq || '0'}))`
     }
 
     if (fn === 'lookup') {
@@ -1106,16 +1528,43 @@ export function buildGsUpstreamDirectBuffs(opts: {
   const dmConstNums = dmBlock ? parseDmConstNumbers(dmBlock) : new Map<string, number>()
 
   const includeTeamBuffs = Boolean(opts.upstream?.includeTeamBuffs)
-  const premodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs })
-  const baseCandidates = extractObjectEntryCandidates(text, 'base:', { includeTeamBuffs })
-  if (premodCandidates.size === 0 && baseCandidates.size === 0) return []
+  const premodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs: false })
+  const baseCandidates = extractObjectEntryCandidates(text, 'base:', { includeTeamBuffs: false })
+  const totalCandidates = extractObjectEntryCandidates(text, 'total:', { includeTeamBuffs: false })
+  const teamPremodCandidates = extractTeamBuffEntryCandidates(text, 'premod')
+  const teamTotalCandidates = extractTeamBuffEntryCandidates(text, 'total')
+  const nodeLocalPremodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs: false, includeNodeLocal: true })
+  if (
+    premodCandidates.size === 0 &&
+    baseCandidates.size === 0 &&
+    totalCandidates.size === 0 &&
+    teamPremodCandidates.size === 0 &&
+    teamTotalCandidates.size === 0 &&
+    nodeLocalPremodCandidates.size === 0
+  ) {
+    return []
+  }
 
   const constInits = extractConstInitializers(text)
-  const data: Record<string, number | string> = {}
+  const condVarToKey = extractCondVarDecls(text)
+  const condTemInfo = condVarToKey.size
+    ? extractCondTemInfo(text, condVarToKey)
+    : new Map<string, Pick<CondVarInfo, 'section' | 'nameKey'>>()
+  const condVarInfo = new Map<string, CondVarInfo>()
+  for (const [varName, condKey] of condVarToKey.entries()) condVarInfo.set(varName, { condKey })
+  for (const [varName, meta] of condTemInfo.entries()) {
+    const existing = condVarInfo.get(varName)
+    if (!existing) continue
+    if (meta.section) existing.section = meta.section
+    if (meta.nameKey) existing.nameKey = meta.nameKey
+  }
+  const dataPremod: Record<string, number | string> = {}
+  const dataTotal: Record<string, number | string> = {}
 
   const applyCandidates = (
     candidates: Map<string, string[]>,
-    mapKey: (rawKey: string) => string | null
+    mapKey: (rawKey: string) => string | null,
+    dataOut: Record<string, number | string>
   ): void => {
     for (const [rawKey, values] of candidates.entries()) {
       const buffKey = mapKey(rawKey)
@@ -1126,13 +1575,13 @@ export function buildGsUpstreamDirectBuffs(opts: {
       // Prefer later occurrences (dataObjForCharacterSheet premod/base blocks tend to come later than node-local ones).
       for (let i = values.length - 1; i >= 0; i--) {
         const value = values[i]!
-        const expr = translateGsExpr(value, { constInits, dmMap, dmConstNums, skillParam })
+        const expr = translateGsExpr(value, { constInits, dmMap, dmConstNums, skillParam, condVarInfo })
         if (!expr) continue
 
         const scaled = scaleExpr(expr, buffScale(buffKey))
         if (typeof scaled === 'number') {
           if (!Number.isFinite(scaled) || scaled === 0) continue
-          data[buffKey] = mergeBuffValue(data[buffKey], scaled)
+          dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], scaled)
           break
         }
 
@@ -1141,16 +1590,82 @@ export function buildGsUpstreamDirectBuffs(opts: {
         // Spread/rest fragments are not representable in miao-plugin runtime; keep upstream-direct deterministic.
         if (/\.\.\./.test(t)) continue
         if (hasUnknownFreeIdentifiers(t)) continue
-        data[buffKey] = mergeBuffValue(data[buffKey], t)
+        dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], t)
         break
       }
     }
   }
 
-  applyCandidates(baseCandidates, mapBaseKeyToMiaoBuffKey)
-  applyCandidates(premodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k))
+  applyCandidates(baseCandidates, mapBaseKeyToMiaoBuffKey, dataPremod)
+  applyCandidates(premodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
+  if (includeTeamBuffs) {
+    applyCandidates(teamPremodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
+    applyCandidates(teamTotalCandidates, mapTotalKeyToMiaoBuffKey, dataTotal)
+  } else {
+    // Keep a conservative subset: teamBuff entries that map to ability-scoped buckets (a/a2/a3/e/q).
+    const isAbilityScoped = (buffKey: string): boolean => /^(a|a2|a3|e|q|nightsoul)/.test(buffKey)
+    const applyTeamAbilityOnly = (
+      candidates: Map<string, string[]>,
+      mapKey: (rawKey: string) => string | null,
+      dataOut: Record<string, number | string>
+    ): void => {
+      const filtered = new Map<string, string[]>()
+      for (const [rawKey, values] of candidates.entries()) {
+        const buffKey = mapKey(rawKey)
+        if (!buffKey) continue
+        if (!isAbilityScoped(buffKey)) continue
+        filtered.set(rawKey, values)
+      }
+      applyCandidates(filtered, mapKey, dataOut)
+    }
+    applyTeamAbilityOnly(teamPremodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
+  }
 
-  const keys = Object.keys(data)
-  if (!keys.length) return []
-  return [{ title: 'upstream:genshin-optimizer(premod)', data }]
+  // Best-effort: lift a conservative subset of node-local premods into global buffs to match baseline expectations.
+  // Keep this narrow to avoid over-buffing (node-local premods can be hit-scoped).
+  try {
+    for (const [rawKey0, values] of nodeLocalPremodCandidates.entries()) {
+      const rawKey = String(rawKey0 || '').trim()
+      if (!rawKey) continue
+      if (!/^(skill|burst)_/i.test(rawKey)) continue
+      if (!Array.isArray(values) || values.length === 0) continue
+
+      const buffKey = mapPremodKeyToMiaoBuffKey(opts.elem, rawKey)
+      if (!buffKey) continue
+      if (!isAllowedMiaoBuffDataKey('gs', buffKey)) continue
+      // Fallback-only: do not override global premod.
+      if (Object.prototype.hasOwnProperty.call(dataPremod, buffKey)) continue
+
+      const uniq = new Map<string, number | string>()
+      for (const vRaw of values) {
+        const expr = translateGsExpr(vRaw, { constInits, dmMap, dmConstNums, skillParam, condVarInfo })
+        if (!expr) continue
+
+        const scaled = scaleExpr(expr, buffScale(buffKey))
+        if (typeof scaled === 'number') {
+          if (!Number.isFinite(scaled) || scaled === 0) continue
+          uniq.set(`n:${scaled}`, scaled)
+          continue
+        }
+
+        const t = String(scaled || '').trim()
+        if (!t || t === '0' || t === '(0)') continue
+        if (/\.\.\./.test(t)) continue
+        if (hasUnknownFreeIdentifiers(t)) continue
+        uniq.set(`s:${t}`, t)
+      }
+
+      if (uniq.size !== 1) continue
+      dataPremod[buffKey] = Array.from(uniq.values())[0]!
+    }
+  } catch {
+    // best-effort
+  }
+
+  applyCandidates(totalCandidates, mapTotalKeyToMiaoBuffKey, dataTotal)
+
+  const buffs: CalcSuggestBuff[] = []
+  if (Object.keys(dataPremod).length) buffs.push({ title: 'upstream:genshin-optimizer(premod)', data: dataPremod })
+  if (Object.keys(dataTotal).length) buffs.push({ title: 'upstream:genshin-optimizer(total)', data: dataTotal })
+  return buffs
 }

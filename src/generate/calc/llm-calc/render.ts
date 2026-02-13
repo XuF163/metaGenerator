@@ -36,6 +36,22 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       if (key && /nightsoul/.test(key)) hasNightByTalent.add(tk)
     }
 
+    // Heuristic/Upstream-direct plans often set `defParams.Nightsoul=true` but do not tag detail keys.
+    // When the kit text clearly indicates "夜魂" mechanics, force-tag all dmg buckets for this character.
+    const wantsNight = (() => {
+      const hit = (s: unknown): boolean => typeof s === 'string' && /(夜魂|nightsoul)/i.test(s)
+      for (const v of Object.values((input as any)?.talentDesc || {})) if (hit(v)) return true
+      for (const v of (input as any)?.buffHints || []) if (hit(v)) return true
+      for (const d of details) if (hit((d as any)?.title)) return true
+      return false
+    })()
+    if (wantsNight) {
+      for (const d of details) {
+        const tk = (d as any)?.talent
+        if (tk === 'a' || tk === 'e' || tk === 'q') hasNightByTalent.add(tk)
+      }
+    }
+
     if (hasNightByTalent.size) {
       for (const d of details) {
         const tk = (d as any)?.talent
@@ -690,11 +706,6 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       if (talentKey) {
         detailsLines.push(`    talent: ${jsString(talentKey)},`)
       }
-      // Baseline calc.js typically omits dmgKey for non-damage rows (heal/shield/reaction)
-      // to avoid accidental key-based buffs and to keep signatures stable.
-      if (kind === 'dmg') {
-        detailsLines.push(`    dmgKey: ${jsString(d.key || talentKey || 'e')},`)
-      }
       if (typeof d.cons === 'number' && Number.isFinite(d.cons)) {
         detailsLines.push(`    cons: ${Math.trunc(d.cons)},`)
       }
@@ -752,8 +763,6 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	    const talent = d.talent as TalentKey
 	    const tableName = d.table as string
 	    const table = jsString(tableName)
-
-	    const dmgKeyProp = jsString(d.key || talent)
 	    const pick = typeof (d as any).pick === 'number' && Number.isFinite((d as any).pick) ? Math.trunc((d as any).pick) : undefined
 	    const keyArgRaw = typeof d.key === 'string' ? d.key : undefined
 	    const eleRaw = typeof d.ele === 'string' ? d.ele.trim() : ''
@@ -837,7 +846,9 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     const inferDescBaseFor = (tkRaw: unknown): 'atk' | 'hp' | 'def' | 'mastery' => {
       const tk = String(tkRaw || '').trim()
       if (!tk) return 'atk'
-      if (input.game === 'gs' && tk === 'a') return 'atk'
+      // Normal attacks often have the broadest/least-structured descriptions (and can mention other mechanics
+      // that do not affect the basic scaling table). Default to ATK unless per-table hints override it.
+      if (tk === 'a') return 'atk'
       return inferDmgBase((input.talentDesc as any)?.[tk])
     }
     const baseTalentOf = (tkRaw: unknown): string | null => {
@@ -1080,7 +1091,6 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	    detailsLines.push('  {')
 	    detailsLines.push(`    title: ${title},`)
 	    detailsLines.push(`    talent: ${jsString(talent)},`)
-	    detailsLines.push(`    dmgKey: ${dmgKeyProp},`)
     if (typeof d.cons === 'number' && Number.isFinite(d.cons)) {
       detailsLines.push(`    cons: ${Math.trunc(d.cons)},`)
     }
@@ -1093,13 +1103,14 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       )
     }
 	    detailsLines.push(`    dmg: ({ talent, attr, calc }, dmg) => {`)
+	    detailsLines.push(`      const { basic } = dmg`)
 	    detailsLines.push(`      const t = talent.${talent}[${table}]`)
 	    detailsLines.push(`      if (Array.isArray(t)) {`)
 	    if (typeof pick === 'number' && Number.isFinite(pick)) {
 	      // Array variant selector (e.g. "低空/高空..." or "X/Y..." tables).
 	      detailsLines.push(`        const v = Number(t[${Math.max(0, Math.min(10, pick))}]) || 0`)
 	      if (useBasic) {
-	        detailsLines.push(`        return dmg.basic(calc(attr.${base}) * toRatio(v), ${keyArg}${eleArg})`)
+	        detailsLines.push(`        return basic(calc(attr.${base}) * toRatio(v), ${keyArg}${eleArg})`)
 	      } else {
 	        detailsLines.push(`        return dmg(v, ${keyArg}${eleArg})`)
 	      }
@@ -1108,7 +1119,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	      if (schema?.kind === 'statStat') {
 	        const [s0, s1] = schema.stats
 	        detailsLines.push(
-	          `        return dmg.basic(calc(attr.${s0}) * toRatio(t[0]) + calc(attr.${s1}) * toRatio(t[1]), ${keyArg}${eleArg})`
+	          `        return basic(calc(attr.${s0}) * toRatio(t[0]) + calc(attr.${s1}) * toRatio(t[1]), ${keyArg}${eleArg})`
 	        )
 	      } else if (schema?.kind === 'statTimes') {
           // e.g. [pct, hits] from `...2` tables where text sample is like "1.41%HP*5".
@@ -1123,14 +1134,14 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
               detailsLines.push(`        return dmg((Number(t[0]) || 0) * (Number(t[1]) || 0), ${keyArg}${eleArg})`)
             } else {
               detailsLines.push(
-                `        return dmg.basic(calc(attr.${schema.stat}) * toRatio(t[0]) * (Number(t[1]) || 0), ${keyArg}${eleArg})`
+                `        return basic(calc(attr.${schema.stat}) * toRatio(t[0]) * (Number(t[1]) || 0), ${keyArg}${eleArg})`
               )
             }
           } else {
             if (schema.stat === 'atk' && !useBasic) {
               detailsLines.push(`        return dmg(Number(t[0]) || 0, ${keyArg}${eleArg})`)
             } else {
-              detailsLines.push(`        return dmg.basic(calc(attr.${schema.stat}) * toRatio(t[0]), ${keyArg}${eleArg})`)
+              detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(t[0]), ${keyArg}${eleArg})`)
             }
           }
 	      } else if (schema?.kind === 'pctList') {
@@ -1138,18 +1149,18 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	        if (schema.stat === 'atk' && !useBasic) {
 	          detailsLines.push(`        return dmg(sum, ${keyArg}${eleArg})`)
 	        } else {
-	          detailsLines.push(`        return dmg.basic(calc(attr.${schema.stat}) * toRatio(sum), ${keyArg}${eleArg})`)
+	          detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(sum), ${keyArg}${eleArg})`)
 	        }
 	      } else if (schema?.kind === 'statFlat') {
           // "[pct, flat]" (e.g. "%HP + 800" / "%ATK + 500"). Always render as a basic damage number.
           // NOTE: miao-plugin's `dmg()` does NOT accept array pctNum; passing arrays can yield NaN damage.
           detailsLines.push(
-            `        return dmg.basic(calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
+            `        return basic(calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
           )
 	      } else if (useBasic) {
 	        detailsLines.push(`        const base = calc(attr.${base})`)
 	        detailsLines.push(`        const v = Number(t[0]) || 0`)
-	        detailsLines.push(`        return dmg.basic(base * toRatio(v), ${keyArg}${eleArg})`)
+	        detailsLines.push(`        return basic(base * toRatio(v), ${keyArg}${eleArg})`)
 	      } else {
           // Fallback: treat unknown arrays as variant lists and pick the first component as pctNum.
           // (Passing arrays into `dmg()` would yield NaN in miao-plugin runtime.)
@@ -1160,7 +1171,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	    detailsLines.push(`      }`)
 	    if (useBasic) {
 	      detailsLines.push(`      const base = calc(attr.${base})`)
-	      detailsLines.push(`      return dmg.basic(base * toRatio(t), ${keyArg}${eleArg})`)
+	      detailsLines.push(`      return basic(base * toRatio(t), ${keyArg}${eleArg})`)
 	    } else {
 	      detailsLines.push(`      return dmg(t, ${keyArg}${eleArg})`)
 	    }

@@ -77,6 +77,173 @@ function sanitizePlayerInfo(raw, uid) {
   return out
 }
 
+function normalizeGsEleOrReaction(raw) {
+  const s = String(raw || "").trim()
+  if (!s) return ""
+
+  // Common CN reaction keywords in baseline calc.js.
+  const cn = {
+    蒸发: "vaporize",
+    融化: "melt",
+    扩散: "swirl",
+    结晶: "crystallize",
+    燃烧: "burning",
+    超载: "overloaded",
+    感电: "electroCharged",
+    超导: "superConduct",
+    碎冰: "shatter",
+    绽放: "bloom",
+    烈绽放: "burgeon",
+    超绽放: "hyperBloom",
+    超激化: "aggravate",
+    蔓激化: "spread",
+    物理: "phy"
+  }
+  if (cn[s]) return cn[s]
+
+  const low = s.toLowerCase()
+  const en = {
+    electrocharged: "electroCharged",
+    superconduct: "superConduct",
+    hyperbloom: "hyperBloom",
+    burgeon: "burgeon",
+    overloaded: "overloaded",
+    crystallize: "crystallize",
+    swirl: "swirl",
+    shatter: "shatter",
+    bloom: "bloom",
+    burning: "burning",
+    vaporize: "vaporize",
+    melt: "melt",
+    aggravate: "aggravate",
+    spread: "spread",
+    physical: "phy",
+    phys: "phy"
+  }
+  return en[low] || s
+}
+
+function parseStringLiteral(argRaw) {
+  const s = String(argRaw || "").trim()
+  const m = /^(['"])(.*)\1$/.exec(s)
+  return m ? m[2] : null
+}
+
+function splitCallArgs(src, openParenIdx) {
+  const args = []
+  let cur = ""
+  let depthParen = 0
+  let depthBrace = 0
+  let depthBracket = 0
+  let quote = null
+  let escaped = false
+
+  for (let i = openParenIdx + 1; i < src.length; i++) {
+    const ch = src[i]
+    if (quote) {
+      cur += ch
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === "\\") {
+        escaped = true
+        continue
+      }
+      if (ch === quote) quote = null
+      continue
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch
+      cur += ch
+      continue
+    }
+
+    if (ch === "(") {
+      depthParen++
+      cur += ch
+      continue
+    }
+    if (ch === "{") {
+      depthBrace++
+      cur += ch
+      continue
+    }
+    if (ch === "[") {
+      depthBracket++
+      cur += ch
+      continue
+    }
+
+    if (ch === ")") {
+      if (depthParen === 0 && depthBrace === 0 && depthBracket === 0) {
+        args.push(cur.trim())
+        return { args, endIdx: i }
+      }
+      depthParen = Math.max(0, depthParen - 1)
+      cur += ch
+      continue
+    }
+    if (ch === "}") {
+      depthBrace = Math.max(0, depthBrace - 1)
+      cur += ch
+      continue
+    }
+    if (ch === "]") {
+      depthBracket = Math.max(0, depthBracket - 1)
+      cur += ch
+      continue
+    }
+
+    if (ch === "," && depthParen === 0 && depthBrace === 0 && depthBracket === 0) {
+      args.push(cur.trim())
+      cur = ""
+      continue
+    }
+
+    cur += ch
+  }
+  return null
+}
+
+function extractDamageKeyAndEleFromFn(fnSrc) {
+  const keys = new Set()
+  const eles = new Set()
+
+  const re = /\b(dmg(?:\.basic|\.dynamic)?|basic|dynamic)\s*\(/g
+  for (const m of fnSrc.matchAll(re)) {
+    const callee = String(m?.[1] || "").trim()
+    if (!callee) continue
+    const openParenIdx = (m.index ?? -1) + m[0].length - 1
+    if (!(openParenIdx >= 0 && fnSrc[openParenIdx] === "(")) continue
+
+    const parsed = splitCallArgs(fnSrc, openParenIdx)
+    if (!parsed) continue
+    const args = parsed.args
+
+    // dmg(..., key, ele?)
+    // dmg.basic(..., key, ele?)
+    // basic(..., key, ele?)
+    // dmg.dynamic(..., key, opts, ele?)
+    // dynamic(..., key, opts, ele?)
+    const keyArg = parseStringLiteral(args[1])
+    if (keyArg) keys.add(keyArg)
+
+    let eleArg = null
+    if (callee.endsWith(".dynamic") || callee === "dynamic") {
+      eleArg = parseStringLiteral(args[3]) || parseStringLiteral(args[2])
+    } else {
+      eleArg = parseStringLiteral(args[2])
+    }
+    if (eleArg) eles.add(normalizeGsEleOrReaction(eleArg))
+  }
+
+  const key = keys.size === 1 ? Array.from(keys)[0] : keys.size ? Array.from(keys)[0] : ""
+  const ele = eles.size === 1 ? Array.from(eles)[0] : eles.size ? Array.from(eles)[0] : ""
+  return { key, ele }
+}
+
 function buildDetailSig(detail) {
   try {
     if (!detail || typeof detail !== "object") return ""
@@ -91,16 +258,9 @@ function buildDetailSig(detail) {
     })()
 
     const dmgKeyProp = typeof d.dmgKey === "string" ? d.dmgKey.trim() : ""
-    const keyFromFn = (() => {
-      const m = /\bdmg(?:\.basic)?\s*\([^)]*?,\s*['"]([^'"]+)['"]/.exec(fn)
-      return m?.[1]?.trim() || ""
-    })()
-    const key = dmgKeyProp || keyFromFn
-
-    const eleFromFn = (() => {
-      const m = /\bdmg(?:\.basic)?\s*\([^)]*?,\s*['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]/.exec(fn)
-      return m?.[1]?.trim() || ""
-    })()
+    const parsed = extractDamageKeyAndEleFromFn(fn)
+    const key = dmgKeyProp || parsed.key || ""
+    const eleFromFn = parsed.ele || ""
 
     const paramsPart = (() => {
       const p = d.params

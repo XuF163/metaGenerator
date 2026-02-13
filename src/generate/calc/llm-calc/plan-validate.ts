@@ -23,6 +23,7 @@ import { rewriteGsAdditiveCoeffDmgExpr } from './plan-validate/gs-dmgexpr-fixup.
 import { rewriteGsDmgExprFixArrayDmgCalls } from './plan-validate/gs-dmgexpr-array-call-fixup.js'
 import { rewriteDmgExprRemoveCritExpectation } from './plan-validate/dmgexpr-crit-fixup.js'
 import { applyGsBuffFilterTowardsBaseline } from './plan-validate/gs-buff-filter.js'
+import { expandGsArrayVariantDetails } from './plan-validate/gs-array-expand.js'
 import { applyGsArrayVariantPicksFromTitles } from './plan-validate/gs-array-pick.js'
 import { applyGsBurstAltAttackKeyMapping } from './plan-validate/gs-qstate.js'
 import { applyGsPostprocess } from './plan-validate/gs-postprocess.js'
@@ -1103,13 +1104,25 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
     for (const d of details) {
       if (!d || typeof d !== 'object') continue
+      const title = String(d.title || '')
+      const p0 = isParamsObject(d.params) ? d.params : null
+      const hasHalf0 = !!p0 && (((p0 as any).halfHp === true) || ((p0 as any).half === true))
+      const lowTitle = isLowHpLike(title)
+
+      // If the row title clearly indicates a low-HP showcase, always tag params.halfHp so buffs gated by halfHp can apply.
+      // (Baseline often uses params.halfHp for passive/cons buffs, even when the talent table already encodes the low-HP variant.)
+      if (lowTitle && !hasHalf0) {
+        const params = (p0 || {}) as Record<string, any>
+        params.halfHp = true
+        d.params = params
+      }
+
       if (typeof d.table !== 'string' || !d.table.trim()) continue
       if (!isLowHpLike(d.table)) continue
 
-      const title = String(d.title || '')
       const p = isParamsObject(d.params) ? d.params : null
       const hasHalf = !!p && (((p as any).halfHp === true) || ((p as any).half === true))
-      if (hasHalf || isLowHpLike(title)) continue
+      if (hasHalf || lowTitle) continue
 
       const tk = typeof d.talent === 'string' ? String(d.talent) : ''
       if (!tk) continue
@@ -1175,6 +1188,12 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (conv) gsConvKeyByTalent[tk] = conv
     }
     const gsEActsAsNa = gsConvKeyByTalent.e === 'a'
+    const gsEDesc = normalizePromptText((input.talentDesc as any)?.e)
+    const gsEHasAltAttackConversion =
+      !!gsEDesc &&
+      /(普通攻击|普攻|重击|下落攻击)/.test(gsEDesc) &&
+      /(转化为|转换为|替换为|变为|转化|转换|替换|变为)/.test(gsEDesc)
+    const gsEAllowsNaKeyByName = gsEHasAltAttackConversion && gsConvKeyByTalent.e !== 'e' && gsConvKeyByTalent.e !== 'q'
 
     const isNaLikeTable = (t: string): boolean => {
       const s0 = t.trim()
@@ -1193,6 +1212,84 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (!parts[0]) return key
       parts[0] = newBase
       return parts.filter(Boolean).join(',')
+    }
+
+    // Some GS kits convert a specific attack type into a named move whose damage is still routed as
+    // normal/charged/plunge in baseline meta (even though the multiplier table lives under talent.e/q).
+    // Example: 闲云 E converts plunge into "闲云冲击波", and the damage is "视为下落攻击伤害" -> key=a3.
+    type GsAltAttackKey = 'a' | 'a2' | 'a3'
+    type GsAltTarget = { key: GsAltAttackKey; tokenNorm: string }
+    const gsAltTargetsByTalent: Partial<Record<'e' | 'q', GsAltTarget[]>> = {}
+
+    const normKeyText = (s: unknown): string => {
+      let t = normalizePromptText(s)
+      if (!t) return ''
+      t = t.replace(/\s+/g, '')
+      t = t.replace(/[·•･・…?？、，,。．：:；;!！"'“”‘’()（）【】\[\]{}《》〈〉<>「」『』]/g, '')
+      t = t.replace(/[=+~`^|\\]/g, '')
+      t = t.replace(/[-_—–]/g, '')
+      return t
+    }
+
+    const hasAnyTableToken = (tk: 'e' | 'q', tokenNorm: string): boolean => {
+      if (!tokenNorm) return false
+      const list = tables[tk] || []
+      return list.some((t) => normKeyText(t).includes(tokenNorm))
+    }
+
+    const pushAltTarget = (tk: 'e' | 'q', key: GsAltAttackKey, tokenRaw: string): void => {
+      const tokenNorm = normKeyText(tokenRaw)
+      if (!tokenNorm || tokenNorm.length < 2) return
+      if (!hasAnyTableToken(tk, tokenNorm)) return
+      const list = gsAltTargetsByTalent[tk] || []
+      if (list.some((x) => x.key === key && x.tokenNorm === tokenNorm)) return
+      list.push({ key, tokenNorm })
+      gsAltTargetsByTalent[tk] = list
+    }
+
+    const extractAltTargetsFromDesc = (tk: 'e' | 'q'): void => {
+      const desc = normalizePromptText((input.talentDesc as any)?.[tk])
+      if (!desc) return
+
+      const wantsA = /视为(?:普通攻击|普攻)(?:造成的)?伤害/.test(desc) || /伤害视为(?:普通攻击|普攻)(?:造成的)?伤害/.test(desc)
+      const wantsA2 = /视为重击(?:造成的)?伤害/.test(desc) || /伤害视为重击(?:造成的)?伤害/.test(desc)
+      const wantsA3 = /视为下落攻击(?:造成的)?伤害/.test(desc) || /伤害视为下落攻击(?:造成的)?伤害/.test(desc)
+
+      const extract = (attackPat: string, key: GsAltAttackKey): void => {
+        const re = new RegExp(
+          `${attackPat}[^。]{0,120}?(?:将)?(?:转化为|转换为|替换为|变为)\\s*(?:「|“|『|\"|')?([^，。；;\\n]{2,30})(?:」|”|』|\"|')?`,
+          'g'
+        )
+        for (const m of desc.matchAll(re)) {
+          let token = String(m?.[1] || '').trim()
+          if (!token) continue
+          token = token.replace(/^(?:「|“|『|\"|')+/, '').replace(/(?:」|”|』|\"|')+$/, '').trim()
+          token = token.split(/造成|并|且/)[0]?.trim() || token
+          if (!token) continue
+          pushAltTarget(tk, key, token)
+        }
+      }
+
+      if (wantsA) extract('(?:普通攻击|普攻)', 'a')
+      if (wantsA2) extract('重击', 'a2')
+      if (wantsA3) extract('下落攻击', 'a3')
+    }
+
+    extractAltTargetsFromDesc('e')
+    extractAltTargetsFromDesc('q')
+
+    const inferAltKeyForDetail = (d: CalcSuggestDetail): GsAltAttackKey | null => {
+      if (!d || typeof d !== 'object') return null
+      if (normalizeKind((d as any).kind) !== 'dmg') return null
+      const tk = typeof (d as any).talent === 'string' ? String((d as any).talent).trim() : ''
+      if (tk !== 'e' && tk !== 'q') return null
+      const list = (gsAltTargetsByTalent as any)[tk] as GsAltTarget[] | undefined
+      if (!list || list.length === 0) return null
+      const hay = `${normKeyText((d as any).table)} ${normKeyText((d as any).title)}`
+      for (const t of list) {
+        if (t && t.tokenNorm && hay.includes(t.tokenNorm)) return t.key
+      }
+      return null
     }
 
     const inferMultiKeyFromUnit = (unitRaw: unknown): (typeof multiUnitTables)[number]['multiKey'] | null => {
@@ -1356,10 +1453,43 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         }
       }
 
+      const altKey = inferAltKeyForDetail(d)
+      if (altKey) {
+        const key0 = typeof d.key === 'string' ? d.key.trim() : ''
+        const base0 = (key0.split(',')[0] || '').trim()
+        if (!key0) {
+          d.key = altKey
+        } else if (base0 === d.talent) {
+          d.key = rewriteKeyBase(key0, altKey)
+        }
+      }
+
+      // Skill stance conversions: when talent.e tables look like NA/charged/plunge tables,
+      // and the skill description suggests attacks are converted, route the dmg key bucket like baseline.
+      if (
+        !altKey &&
+        gsEAllowsNaKeyByName &&
+        d.talent === 'e' &&
+        normalizeKind((d as any).kind) === 'dmg' &&
+        typeof d.table === 'string' &&
+        d.table.trim() &&
+        isNaLikeTable(d.table)
+      ) {
+        const t = d.table.endsWith('2') ? d.table.slice(0, -1) : d.table
+        const inferred: 'a' | 'a2' | 'a3' = /重击|瞄准|蓄力/.test(t) ? 'a2' : /下落|坠地|低空|高空/.test(t) ? 'a3' : 'a'
+        const key0 = typeof d.key === 'string' ? d.key.trim() : ''
+        const base0 = (key0.split(',')[0] || '').trim()
+        if (!key0) {
+          d.key = inferred
+        } else if (base0 === 'e') {
+          d.key = rewriteKeyBase(key0, inferred)
+        }
+      }
+
       // If this is a skill table, avoid accidentally categorizing it as normal/charged/plunge.
       if (d.talent === 'e' && typeof d.key === 'string') {
         const keyBase = d.key.split(',')[0]?.trim()
-        const allowNaKeyOnE = gsEActsAsNa || (d.table && isNaLikeTable(d.table))
+        const allowNaKeyOnE = gsEActsAsNa || (d.table && isNaLikeTable(d.table)) || !!altKey
         if ((keyBase === 'a' || keyBase === 'a2' || keyBase === 'a3') && d.table && !allowNaKeyOnE) {
           d.key = rewriteKeyBase(d.key, 'e')
         }
@@ -1674,6 +1804,70 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         const d = details[i]!
         const k = keyOf(d)
         if (keepByKey.get(k) !== d) details.splice(i, 1)
+      }
+
+      while (details.length > 20) details.pop()
+    }
+
+    // Mualani showcase rows (Natlan nightsoul bite stacks).
+    // Detected via unique official table names; no baseline code reuse.
+    const isMualaniLike =
+      input.name === '玛拉妮' ||
+      (eTables2.includes('鲨波撒咬基础伤害') &&
+        eTables2.includes('浪势充能伤害提升') &&
+        eTables2.includes('巨浪鲨波撒咬伤害额外提升') &&
+        qTables.includes('技能伤害'))
+
+    if (isMualaniLike) {
+      const norm = (s: string): string =>
+        s
+          .trim()
+          .replace(/\s+/g, '')
+          .replace(/[·!?！？…\-_—–()（）【】\[\]「」『』《》〈〉“”‘’"']/g, '')
+
+      const hasTitle = (title: string): boolean => details.some((d) => norm(d.title) === norm(title))
+      const pushFront = (d: CalcSuggestDetail): void => {
+        if (hasTitle(d.title)) return
+        details.unshift(d)
+      }
+
+      const biteBase = 'calc(attr.hp) * toRatio(talent.e["鲨波撒咬基础伤害"])'
+      const biteStackAdd =
+        '(params.buffCount ? (calc(attr.hp) * (toRatio(talent.e["浪势充能伤害提升"]) * params.buffCount + (params.buffCount === 3 ? toRatio(talent.e["巨浪鲨波撒咬伤害额外提升"]) : 0))) : 0)'
+      const biteC1Add = '(cons >= 1 && params.cons1 ? (calc(attr.hp) * 0.66) : 0)'
+      const biteExpr = `dmg.basic((${biteBase}) + (${biteStackAdd}) + (${biteC1Add}), "a,nightsoul")`
+      const biteVapeExpr = `dmg.basic((${biteBase}) + (${biteStackAdd}) + (${biteC1Add}), "a,nightsoul", "蒸发")`
+
+      pushFront({ title: 'E后巨浪鲨鲨撕咬蒸发', kind: 'dmg', talent: 'e', key: 'a,nightsoul', params: { buffCount: 3, cons1: true }, dmgExpr: biteVapeExpr })
+      pushFront({ title: 'E后巨浪鲨鲨撕咬伤害', kind: 'dmg', talent: 'e', key: 'a,nightsoul', params: { buffCount: 3, cons1: true }, dmgExpr: biteExpr })
+      pushFront({ title: 'E后鲨鲨撕咬二层伤害', kind: 'dmg', talent: 'e', key: 'a,nightsoul', params: { buffCount: 2 }, dmgExpr: biteExpr })
+      pushFront({ title: 'E后鲨鲨撕咬一层伤害', kind: 'dmg', talent: 'e', key: 'a,nightsoul', params: { buffCount: 1 }, dmgExpr: biteExpr })
+      pushFront({ title: 'E后鲨鲨撕咬基础伤害', kind: 'dmg', talent: 'e', key: 'a,nightsoul', dmgExpr: biteExpr })
+
+      const qBase = 'calc(attr.hp) * toRatio(talent.q["技能伤害"])'
+      const qPassive = 'calc(attr.hp) * 0.15'
+      const qExpr = `dmg.basic((${qBase}) + (${qPassive}) + (${biteC1Add}), "q,nightsoul")`
+      const qVapeExpr = `dmg.basic((${qBase}) + (${qPassive}) + (${biteC1Add}), "q,nightsoul", "蒸发")`
+
+      pushFront({ title: 'Q爆瀑飞弹蒸发', kind: 'dmg', talent: 'q', key: 'q,nightsoul', params: { cons1: true }, dmgExpr: qVapeExpr })
+      pushFront({ title: 'Q爆瀑飞弹伤害', kind: 'dmg', talent: 'q', key: 'q,nightsoul', params: { cons1: true }, dmgExpr: qExpr })
+
+      // Prune to the baseline-like showcase set for stability.
+      const keep = new Set(
+        [
+          'E后鲨鲨撕咬基础伤害',
+          'E后鲨鲨撕咬一层伤害',
+          'E后鲨鲨撕咬二层伤害',
+          'E后巨浪鲨鲨撕咬伤害',
+          'E后巨浪鲨鲨撕咬蒸发',
+          'Q爆瀑飞弹伤害',
+          'Q爆瀑飞弹蒸发'
+        ].map(norm)
+      )
+      for (let i = details.length - 1; i >= 0; i--) {
+        const d = details[i]
+        if (!d || typeof d !== 'object') continue
+        if (!keep.has(norm(d.title || ''))) details.splice(i, 1)
       }
 
       while (details.length > 20) details.pop()
@@ -4828,7 +5022,11 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
   // If official passive/cons hints contain "抗性降低xx%", normalize to a single baseline-like max-tier `kx` buff.
   // (LLMs frequently omit or mis-model kx gating, leading to systematic underestimation in comparisons.)
-  if (input.game === 'gs') {
+  // NOTE: This is primarily an LLM-plan repair heuristic.
+  // When upstream context is present (upstream / upstream-direct channels), prefer upstream-derived semantics
+  // over CN-text parsing to avoid injecting baseline-incompatible unconditional res-shred (e.g. conditional kx
+  // lines that baseline omits from calc.js for simplicity).
+  if (input.game === 'gs' && !input.upstream) {
     const hints = (input.buffHints || []).filter((s) => typeof s === 'string') as string[]
     const hasKx = buffsOut.some((b) => {
       const data = (b as any)?.data
@@ -4891,7 +5089,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   // (LLMs frequently omit these, which can make panel regression drift low by ~40-60% for some accounts.)
   if (input.game === 'gs') {
     const hints = (input.buffHints || []).filter((s) => typeof s === 'string') as string[]
-    const elemRe = /(火|水|雷|冰|风|岩|草)元素伤害加成/g
+    // Some sources shorten "火元素伤害加成" -> "火伤加成" (omit "元素" and sometimes "害").
+    const elemRe = /(火|水|雷|冰|风|岩|草)(?:元素)?伤(?:害)?加成/g
     for (const h of hints) {
       const hn = normalizePromptText(h)
       // Skip stat-derived conversions like:
@@ -4926,9 +5125,9 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         const out: number[] = []
         const pats = [
           new RegExp(`(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]\\\\s*${elem}元素伤害加成`, 'g'),
-          new RegExp(`(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]\\\\s*${elem}伤害加成`, 'g'),
+          new RegExp(`(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]\\\\s*${elem}伤(?:害)?加成`, 'g'),
           new RegExp(`${elem}元素伤害加成\\\\s*(?:提高|提升|增加|加成)?\\\\s*(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]`, 'g'),
-          new RegExp(`${elem}伤害加成\\\\s*(?:提高|提升|增加|加成)?\\\\s*(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]`, 'g')
+          new RegExp(`${elem}伤(?:害)?加成\\\\s*(?:提高|提升|增加|加成)?\\\\s*(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*[%％]`, 'g')
         ]
         for (const re of pats) {
           for (const m of t.matchAll(re)) {
@@ -4989,7 +5188,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
           const b = buffsOut[i]!
           const t0 = normalizePromptText((b as any)?.title)
           if (!t0) continue
-          const isElemBonusTitle = t0.includes(`${e}元素伤害加成`) || t0.includes(`${e}伤害加成`)
+          const isElemBonusTitle =
+            t0.includes(`${e}元素伤害加成`) || t0.includes(`${e}伤害加成`) || t0.includes(`${e}伤加成`)
           const isHalfHpLikeTitle =
             isHalfHpCond &&
             t0.includes(e) &&
@@ -5562,7 +5762,25 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     // Prune buff.data entries that derive non-Plus stats from `attr.*` (highly likely to be wrong).
     const pruneDerivedNonPlusBuffData = (): void => {
       const usesAttrValue = (expr: string): boolean => /\bcalc\s*\(\s*attr\./.test(expr) || /\battr\.[A-Za-z_]/.test(expr)
-      const allowsAttr = (k: string): boolean => /plus$/i.test(k)
+      const hasTrustedUpstream = !!(input as any).upstream
+      const isSafeAttrDerivedKey = (kRaw: string): boolean => {
+        const k = String(kRaw || '').trim()
+        if (!k || k.startsWith('_')) return false
+        if (/plus$/i.test(k)) return true
+        if (k === 'healInc' || k === 'shieldInc') return true
+        // Allow stat-derived percent-like buckets commonly used by baseline meta.
+        if (/^(mastery|recharge|cpct|cdmg|dmg|phy|enemydmg|kx|fykx|multi|elevated)(Plus|Pct|Inc)?$/.test(k)) return true
+        if (/^(enemyDef|enemyIgnore|ignore)$/.test(k)) return true
+        // Skill-scoped percent-like buckets (A/A2/A3/E/Q/Nightsoul).
+        if (/^(a|a2|a3|e|q|nightsoul)(Dmg|Enemydmg|Cpct|Cdmg|Multi|Pct|Inc|Elevated)$/.test(k)) return true
+        return false
+      }
+      const hasExplicitStatDerivedEvidence = (titleRaw: unknown): boolean => {
+        const t = normalizePromptText(titleRaw)
+        if (!t) return false
+        return /(基于|根据|按|相当于|每点|每\s*1\s*点|超过|超出)/.test(t)
+      }
+      const allowsAttr = (k: string, evidenceOk: boolean): boolean => /plus$/i.test(k) || (evidenceOk && isSafeAttrDerivedKey(k))
       const usesTriggeredValueTalentTable = (expr: string): boolean => {
         // Heuristic: buff keys like `heal`/`shield` represent *bonus multipliers* in miao-plugin.
         // Triggered effects (healing amounts / absorption values) are stored in tables named "...回复/固定值/吸收量"
@@ -5581,6 +5799,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
       for (let i = buffsOut.length - 1; i >= 0; i--) {
         const b = buffsOut[i]!
+        const evidenceOk = hasTrustedUpstream || hasExplicitStatDerivedEvidence((b as any)?.title)
         const data = b.data
         if (!data || typeof data !== 'object') continue
 
@@ -5601,7 +5820,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
           }
 
           if (!usesAttrValue(expr)) continue
-          if (allowsAttr(k)) continue
+          if (allowsAttr(k, evidenceOk)) continue
           delete (data as any)[k0]
         }
 
@@ -6777,6 +6996,10 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     while (details.length > 20) details.pop()
   }
 
+  // GS: expand small numeric-array damage tables into multiple segment rows.
+  // This helps align baseline segment details (e.g. 1/2/3-hit arrays) when the plan omitted picks/rows.
+  expandGsArrayVariantDetails(input, details)
+
   // GS: infer missing `pick` for non-slash variant array tables (e.g. BondOfLife low/high variants).
   applyGsArrayVariantPicksFromTitles(input, details)
 
@@ -7175,8 +7398,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
   }
 
-  // GS: If an important E-state buff (gated by `params.e`) affects global stats / Q damage,
-  // ensure Q showcase rows also enable `params.e` (baseline often assumes "E后" rotation for such kits).
+  // GS: If an important E-state buff (gated by `params.e`) affects global stats / A/Q damage,
+  // ensure showcase rows also enable `params.e` (baseline often assumes "E后/开E" rotation for such kits).
   if (input.game === 'gs') {
     const affectsQ = (data: Record<string, number | string>): boolean => {
       for (const k of Object.keys(data || {})) {
@@ -7193,6 +7416,21 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       }
       return false
     }
+    const affectsA = (data: Record<string, number | string>): boolean => {
+      for (const k of Object.keys(data || {})) {
+        // Global stats / dmg bonus / enemy modifiers
+        if (
+          /^(atk|hp|def)(Base|Plus|Pct|Inc)?$/.test(k) ||
+          /^(mastery|recharge|cpct|cdmg|heal|dmg|phy|shield)(Plus|Pct|Inc)?$/.test(k) ||
+          /^(enemyDef|enemyIgnore|ignore|kx|fykx|multi|elevated)$/.test(k)
+        ) {
+          return true
+        }
+        // Direct A-scope keys (including charged/plunge variants)
+        if (/^a(?:2|3)?(Def|Ignore|Dmg|Enemydmg|Plus|Pct|Cpct|Cdmg|Multi|Elevated)$/.test(k)) return true
+      }
+      return false
+    }
 
     const needsEOnQ = buffsOut.some((b) => {
       const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
@@ -7201,10 +7439,31 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (!data || typeof data !== 'object') return false
       return affectsQ(data)
     })
+    const needsEOnA = buffsOut.some((b) => {
+      const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
+      if (!/\bparams\.e\b/.test(check)) return false
+      const data = b.data
+      if (!data || typeof data !== 'object') return false
+      return affectsA(data as any)
+    })
 
     if (needsEOnQ) {
       for (const d of details) {
         if (d.talent !== 'q') continue
+        const p0 = d.params
+        const p: Record<string, unknown> =
+          p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, unknown>) } : {}
+        if (Object.prototype.hasOwnProperty.call(p, 'e')) continue
+        p.e = true
+        d.params = p as any
+      }
+    }
+    // Some kits (e.g. Hu Tao) rely on an E-state buff that is conceptually global, but upstream/baseline
+    // may only expose Q-side showcase rows. If we detected any important params.e-gated buff for Q, also
+    // enable `params.e` for A rows to keep "开E/E后" showcases closer to baseline.
+    if (needsEOnA || needsEOnQ) {
+      for (const d of details) {
+        if (d.talent !== 'a') continue
         const p0 = d.params
         const p: Record<string, unknown> =
           p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, unknown>) } : {}
@@ -7312,6 +7571,42 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (!hasMastery) {
         parts.push('mastery')
         mainAttr = parts.join(',')
+      }
+    }
+  }
+
+  // GS: Final param fixups (run late so rows inserted by any GS postprocess are covered).
+  if (input.game === 'gs') {
+    const isLowHpLike = (s: string): boolean => /(低血|低生命|低于50%|半血|生命值低于|生命值少于)/.test(normalizePromptText(s))
+
+    // 1) If a row title indicates low HP, always mark `params.halfHp=true` so buffs gated by halfHp can apply.
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (!isLowHpLike(String((d as any).title || ''))) continue
+      const p0 = (d as any).params
+      const p: Record<string, any> =
+        p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, any>) } : {}
+      if (!Object.prototype.hasOwnProperty.call(p, 'halfHp')) p.halfHp = true
+      ;(d as any).params = p
+    }
+
+    // 2) If any buff is gated by `params.e`, enable `params.e=true` for A/Q dmg rows by default (showcase rotation).
+    const hasECheckedBuff = buffsOut.some((b) => {
+      const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
+      return /\bparams\.e\b/.test(check)
+    })
+    if (hasECheckedBuff) {
+      for (const d of details) {
+        if (!d || typeof d !== 'object') continue
+        if (normalizeKind((d as any).kind) !== 'dmg') continue
+        const tk = typeof (d as any).talent === 'string' ? String((d as any).talent).trim() : ''
+        if (tk !== 'a' && tk !== 'q') continue
+        const p0 = (d as any).params
+        const p: Record<string, any> =
+          p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, any>) } : {}
+        if (Object.prototype.hasOwnProperty.call(p, 'e')) continue
+        p.e = true
+        ;(d as any).params = p
       }
     }
   }

@@ -335,7 +335,10 @@ function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<
     // - "enhanced/state/mode/stance" flags: default to false (state is enabled per-row via params).
     // - generic stack counters: default to 0, except talent-like stacks (often showcased at max in baseline).
     if (v === 'true') {
-      const isStateLike = /(enhanced|state|mode|stance|active|field)/.test(lower)
+      // Keep this conservative: many upstream knobs end with "...State" but are effectively "kit baseline"
+      // assumptions in CNB-style showcase calcs (e.g. `vendettaState`). Only force-disable the obviously
+      // transient/enhanced toggles by default.
+      const isStateLike = /(enhanced|mode|stance|active|field)/.test(lower)
       if (isStateLike) {
         set(k, 'false')
         continue
@@ -359,7 +362,9 @@ function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<
 
     // Tribbie-like "alliesMaxHp" knobs: baseline typically uses a single-character showcase approximation.
     // Defaulting to own HP reduces drift vs baseline while keeping the param overrideable per row.
-    if (/(allies|maxhp)/.test(lower) && /(allies|max|team|ally)/.test(lower)) {
+    // NOTE: Do NOT match generic "MaxHp" substrings (e.g. `e4MaxHpIncreaseStacks`), otherwise we'd default a
+    // numeric stack counter to `calc(attr.hp)` and massively inflate damage via `hpPct` buffs.
+    if (/(allies|ally|team)/.test(lower) && /(maxhp|max_hp)/.test(lower)) {
       set(k, 'calc(attr.hp)')
       continue
     }

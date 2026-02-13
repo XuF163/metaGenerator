@@ -73,7 +73,11 @@ function inferKeysFromText(text: string): string[] {
   if (!s) return []
 
   // Enemy DEF ignore (e.g. "无视目标50%的防御力"). Must be checked before the generic "防御力" stat branch.
-  if ((s.includes('无视') || s.toLowerCase().includes('ignore')) && s.includes('防御')) return ['ignore']
+  if ((s.includes('无视') || s.toLowerCase().includes('ignore')) && s.includes('防御')) {
+    // DoT ignore (e.g. "造成的持续伤害无视目标X%防御力") must map to `dotIgnore` (not global `ignore`).
+    if (/(持续伤害|\bdot\b)/i.test(s)) return ['dotIgnore']
+    return ['ignore']
+  }
 
   // Prefer the most local + specific signal.
   if (s.includes('暴击率')) return ['cpct']
@@ -249,6 +253,105 @@ function tryBuildEnergyCapBuff(text: string): { expr: string; usedIdx: number } 
   return { expr, usedIdx: idx }
 }
 
+function tryBuildStackCapBuff(text: string): { expr: string; usedIdx: number[] } | null {
+  // Baseline convention: when a buff can stack up to N layers and each layer provides the same bonus,
+  // weapon calc.js often models the showcase at max stacks: value = tables[idx] * N.
+  //
+  // Examples:
+  // - "晚安与睡颜": "最多叠加3层" -> dmg = tables[1] * 3
+  // - "重塑时光之忆": "最多叠加4层 ... 每层...攻击力提高$2% ... 持续伤害无视$3%防御" -> atkPct/dotIgnore = tables[*] * 4
+  const mStack = text.match(/(?:最多叠加|至多叠加|最多拥有|至多拥有)\s*(\d{1,2})\s*层/)
+  if (!mStack) return null
+  const maxStacks = Math.trunc(Number(mStack[1]))
+  if (!Number.isFinite(maxStacks) || maxStacks <= 1 || maxStacks > 20) return null
+
+  const matches = Array.from(text.matchAll(/\$(\d+)\[(?:i|f1|f2)]/g))
+  if (matches.length === 0) return null
+
+  type Cand = { idx: number; pos: number; clause: string; before: string }
+  const cands: Cand[] = []
+
+  const extractSentence = (t: string, pos: number): { sentence: string; start: number } => {
+    const delims = ['。', '；', ';', '\n']
+    let start = 0
+    for (const d of delims) {
+      const i = t.lastIndexOf(d, pos - 1)
+      if (i >= 0) start = Math.max(start, i + 1)
+    }
+    let end = t.length
+    for (const d of delims) {
+      const i = t.indexOf(d, pos)
+      if (i >= 0) end = Math.min(end, i)
+    }
+    return { sentence: t.slice(start, end), start }
+  }
+
+  for (const m of matches) {
+    const idx = Math.trunc(Number(m[1]))
+    if (!Number.isFinite(idx) || idx <= 0) continue
+    const pos = typeof m.index === 'number' ? m.index : -1
+    if (pos < 0) continue
+
+    const { sentence, start } = extractSentence(text, pos)
+    if (!sentence) continue
+    const localPos = pos - start
+    const eachLayerPos = sentence.indexOf('每层')
+    const capPos = sentence.search(/(?:最多叠加|至多叠加|最多拥有|至多拥有)\s*\d{1,2}\s*层/)
+    const isPerLayer = eachLayerPos >= 0 ? localPos >= eachLayerPos : capPos >= 0 ? localPos < capPos : false
+    if (!isPerLayer) continue
+
+    const { clause, before } = extractClause(text, pos)
+    if (!clause) continue
+    cands.push({ idx, pos, clause, before })
+  }
+
+  if (cands.length === 0) return null
+
+  const uniqByIdx = new Map<number, Cand>()
+  for (const c of cands) if (!uniqByIdx.has(c.idx)) uniqByIdx.set(c.idx, c)
+
+  const dataExpr: Record<string, string> = {}
+  const usedIdx: number[] = []
+
+  for (const c of uniqByIdx.values()) {
+    const spec = buildSpecForPlaceholder({ text, clause: c.clause, before: c.before, idx: c.idx, pos: c.pos })
+    if (!spec) continue
+
+    const map: Record<string, number> =
+      spec.kind === 'keyIdxMap'
+        ? spec.map
+        : spec.kind === 'keyIdx'
+          ? { [spec.key]: spec.idx }
+          : { [spec.key]: spec.idx }
+
+    for (const [k, idx] of Object.entries(map)) {
+      const key = String(k || '').trim()
+      if (!key) continue
+      if (key in dataExpr) continue
+      dataExpr[key] = `tables[${idx}] * ${maxStacks}`
+    }
+    usedIdx.push(c.idx)
+  }
+
+  const keys = Object.keys(dataExpr)
+  if (keys.length === 0) return null
+
+  const title = (() => {
+    const has = (k: string) => keys.includes(k)
+    if (keys.length === 1 && has('dmg')) return `${maxStacks}层Buff提高伤害[dmg]%`
+    if (keys.length === 1 && has('speedPct')) return `${maxStacks}层Buff提高速度[speedPct]%`
+    if (keys.length === 1 && has('atkPct')) return `${maxStacks}层Buff提高攻击力[atkPct]%`
+    if (has('atkPct') && has('dotIgnore')) return `${maxStacks}层Buff提高攻击力[atkPct]%，造成的持续伤害无视目标[dotIgnore]%的防御力`
+    return `${maxStacks}层Buff`
+  })()
+
+  const dataPairs = Object.entries(dataExpr)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(', ')
+  const expr = `(tables) => ({ title: ${JSON.stringify(title)}, data: { ${dataPairs} } })`
+  return { expr, usedIdx }
+}
+
 function renderTypeCalcJs(entries: Array<{ name: string; expr: string }>): string {
   const lines: string[] = []
   lines.push('/**')
@@ -313,16 +416,22 @@ export async function generateSrWeaponCalcJs(opts: {
 
       // Special deterministic patterns (must come before generic placeholder mapping).
       // These are used to match baseline-style dynamic buffs.
-      const special = tryBuildEnergyCapBuff(text)
+      const specialEnergy = tryBuildEnergyCapBuff(text)
+      const specialStack = tryBuildStackCapBuff(text)
 
       const matches = Array.from(text.matchAll(/\$(\d+)\[(?:i|f1|f2)]/g))
-      if (!special && matches.length === 0) continue
+      if (!specialEnergy && !specialStack && matches.length === 0) continue
 
       const parts: string[] = []
+      const specialParts: string[] = []
       const usedIdx = new Set<number>()
-      if (special) {
-        parts.push(special.expr)
-        usedIdx.add(special.usedIdx)
+      if (specialEnergy) {
+        specialParts.push(specialEnergy.expr)
+        usedIdx.add(specialEnergy.usedIdx)
+      }
+      if (specialStack) {
+        specialParts.push(specialStack.expr)
+        for (const idx of specialStack.usedIdx) usedIdx.add(idx)
       }
       for (const m of matches) {
         const idxStr = m[1]
@@ -345,6 +454,8 @@ export async function generateSrWeaponCalcJs(opts: {
         }
         parts.push(`keyIdx(${JSON.stringify(spec.title)}, ${JSON.stringify(spec.map)})`)
       }
+
+      parts.push(...specialParts)
 
       if (parts.length === 0) continue
       totalMapped++

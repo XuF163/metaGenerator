@@ -318,6 +318,39 @@ function inferExtraBuffsFromAffix(opts: {
     }
   }
 
+  // Staff of the Scarlet Sands (and similar): ATK increase based on Elemental Mastery.
+  //
+  // Example:
+  // - "基于装备者元素精通的$[0]，获得攻击力加成。...「...」效果：基于装备者元素精通的$[1]，获得攻击力加成，该效果至多叠加3层。"
+  {
+    const found: string[] = []
+    const push = (pRaw: string | undefined) => {
+      const p = String(pRaw || '').trim()
+      if (!p) return
+      if (found.includes(p)) return
+      found.push(p)
+    }
+    let m: RegExpExecArray | null
+    const re1 = /元素精通[^$]{0,50}?\$\[(\d+)\][^。；;]{0,80}?攻击力(?:加成|提升)/g
+    while ((m = re1.exec(text))) push(m[1])
+    const re2 = /\$\[(\d+)\][^。；;]{0,50}?元素精通[^。；;]{0,80}?攻击力(?:加成|提升)/g
+    while ((m = re2.exec(text))) push(m[1])
+
+    const baseNums = found.length >= 1 ? parseAffixNumberList(datas[found[0]!]) : null
+    const stackNums = found.length >= 2 ? parseAffixNumberList(datas[found[1]!]) : null
+    if (baseNums) {
+      const stackMult = localMaxStacks(text)
+      const expr = stackNums
+        ? `calc(attr.mastery) * (${JSON.stringify(baseNums)}[refine] + ${JSON.stringify(stackNums)}[refine] * ${stackMult}) / 100`
+        : `calc(attr.mastery) * (${JSON.stringify(baseNums)}[refine]) / 100`
+      out.push({
+        title: '基于元素精通获得[atkPlus]攻击力',
+        sort: 6,
+        data: { atkPlus: expr }
+      })
+    }
+  }
+
   // HP-scaling elemental damage bonus with an explicit cap.
   //
   // Example (seen on some catalysts): "释放元素爆发后...元素伤害加成提高$[x]，每1000点生命值上限提高$[y]，至多提高$[z]"

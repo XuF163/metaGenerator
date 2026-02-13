@@ -81,7 +81,14 @@ node circaltest/panel-regression-cover.mjs --game sr
 提示：可在 `config/config.json` 设置 `calc.channel` 切换 calc 生成渠道：
 - `llm`（默认）：LLM 自生成
 - `upstream`：追随上游（genshin-optimizer / hsr-optimizer）抽取上下文 + LLM 生成（需要先初始化子模块）
-- `upstream-direct`：追随上游但不使用 LLM，脚本直出（更适合 CI/CD；需要先初始化子模块）
+- `upstream-direct`：追随上游但不使用 LLM，**优先同步基线 meta 的计算脚本**（角色 `calc.js` + 武器/遗物相关 `.js`），保证面板回归口径一致（更适合 CI/CD）
+
+注意：SR 若出现面板伤害漂移，但 `calc.js` 已同步，通常是 `meta-sr/character/**/data.json`（talent 表/desc）与基线不一致导致；可用下面命令强制按基线 overlay 重生成：
+
+```powershell
+node dist/cli.js gen --games sr --types character --baseline-overlay --force
+node dist/cli.js calc --games sr
+```
 
 ```powershell
 # 从某次 panel-regression 的 diff.json 中挑选偏差最大角色批量重生成（仅 GS）

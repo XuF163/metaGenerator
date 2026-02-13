@@ -39,6 +39,31 @@ function inferPickFromTitle(opts: {
   if (/低空/.test(t)) return 0
   if (/高空/.test(t)) return Math.min(1, len - 1)
 
+  // Explicit hit/segment indices (1-based): "首段/一段/二段/3段...".
+  const segCn = t.match(/(首|一|二|三|四|五|六|七|八|九|十)段/)
+  if (segCn) {
+    const map: Record<string, number> = {
+      首: 0,
+      一: 0,
+      二: 1,
+      三: 2,
+      四: 3,
+      五: 4,
+      六: 5,
+      七: 6,
+      八: 7,
+      九: 8,
+      十: 9
+    }
+    const idx = map[segCn[1]!]
+    if (typeof idx === 'number') return Math.max(0, Math.min(len - 1, idx))
+  }
+  const segNum = t.match(/(\d{1,2})段/)
+  if (segNum) {
+    const n = Math.trunc(Number(segNum[1]))
+    if (Number.isFinite(n) && n >= 1 && n <= 20) return Math.max(0, Math.min(len - 1, n - 1))
+  }
+
   // Explicit numeric layers (0-based). Common in tables like [0层,1层,2层...].
   const layerM = t.match(/(\d{1,2})层/)
   if (layerM) {
