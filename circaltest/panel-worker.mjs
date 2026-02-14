@@ -249,6 +249,7 @@ function buildDetailSig(detail) {
     if (!detail || typeof detail !== "object") return ""
     const d = detail
     const fn = typeof d.dmg === "function" ? String(d.dmg) : ""
+    const titleRaw = typeof d.title === "string" ? String(d.title).trim() : ""
 
     const kind = (() => {
       if (/\breaction\s*\(/.test(fn) || /\.reaction\s*\(/.test(fn)) return "reaction"
@@ -288,6 +289,15 @@ function buildDetailSig(detail) {
       }
       return max > 1 ? String(max) : ""
     })()
+    const titleHitMul = (() => {
+      if (!titleRaw) return ""
+      const m = titleRaw.match(/-(\d+)\s*段/)
+      if (m) {
+        const n = Number(m[1])
+        return Number.isFinite(n) && n > 1 ? String(Math.trunc(n)) : ""
+      }
+      return ""
+    })()
 
     const tables = []
     const re = /\btalent\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(['"])(.*?)\2\s*\]/g
@@ -299,10 +309,11 @@ function buildDetailSig(detail) {
       if (tables.length >= 6) break
     }
     const uniq = Array.from(new Set(tables)).sort()
-    const tablePart = uniq.join("+")
+    const hitMulHint = hitMul || titleHitMul || ""
+    const tablePart = `${uniq.join("+")}${hitMulHint ? `*${hitMulHint}` : ""}`
 
-    // Keep sig stable across different auto-generated wrappers:
-    // - Do NOT include dmgCalls/hitMul (they vary with code shape but often represent same semantic row).
+    // Keep sig reasonably stable across different auto-generated wrappers, while still disambiguating
+    // common "total damage (N hits)" vs "single hit" rows. We attach a hit-multiplier hint to tablePart.
     return [kind, key || "", eleFromFn || "", tablePart || "", paramsPart || ""].join("|")
   } catch {
     return ""

@@ -228,6 +228,21 @@ export function applySrPostprocess(opts: {
     const spriteName = parseSpriteName(descOf('q')) || '忆灵'
     const me2DescAll = descOf('me2')
     const isMemStackKit = /忆质/.test(me2DescAll) && /每持有\s*1\s*点/.test(me2DescAll)
+    const looksLikeBounce = (descRaw: unknown): boolean => {
+      const d = norm(descRaw)
+      if (!d) return false
+      if (!/(造成|伤害)/.test(d)) return false
+      return /(随机|弹射)/.test(d)
+    }
+    const hasMtSkillBounce = details.some((d) => {
+      if (!d || typeof d !== 'object') return false
+      if (!isDmg(d)) return false
+      const tk = tkOf(d)
+      if (!tk.startsWith('mt')) return false
+      const tbl = norm(tableOf(d))
+      if (!/^技能伤害$/.test(tbl) && !/^目标伤害$/.test(tbl)) return false
+      return looksLikeBounce(descOf(tk))
+    })
 
     for (const d of details) {
       if (!d || typeof d !== 'object') continue
@@ -249,8 +264,15 @@ export function applySrPostprocess(opts: {
         }
       }
 
-      // Memory-talent rows (mt*): "随机伤害" is typically a single bounce instance.
-      if (tk.startsWith('mt') && /^随机伤害$/.test(tbl)) (d as any).title = '忆灵天赋伤害(单次弹射)'
+      // Memory-talent rows (mt*): derive a stable baseline-like bounce title.
+      if (tk.startsWith('mt')) {
+        if ((/^技能伤害$/.test(tbl) || /^目标伤害$/.test(tbl)) && looksLikeBounce(descOf(tk))) {
+          ;(d as any).title = '忆灵天赋伤害(单次弹射)'
+        } else if (!hasMtSkillBounce && /^随机伤害$/.test(tbl)) {
+          // Fallback: some kits only expose bounce under "随机伤害".
+          ;(d as any).title = '忆灵天赋伤害(单次弹射)'
+        }
+      }
 
       // Memory-skill rows (me): normalize "随机/最后" showcase titles.
       if (tk === 'me') {
@@ -1429,6 +1451,54 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
     // Best-effort: do not block generation.
   }
 
+  // 4b) Random-hit ultimates (q): keep a per-hit row and (when possible) add a baseline-like "(完整)" total row.
+  // Example: "额外造成10次伤害，每次伤害..." -> single-hit table + total = base + random * 10.
+  try {
+    const qDesc = norm((input.talentDesc as any)?.q)
+    const mh = qDesc.match(/额外造成\s*(\d{1,2})\s*次(?:伤害|攻击)/) || qDesc.match(/造成\s*(\d{1,2})\s*次(?:伤害|攻击)/)
+    const hits0 = mh ? Math.trunc(Number(mh[1])) : 0
+    const hits = Number.isFinite(hits0) && hits0 >= 2 && hits0 <= 30 ? hits0 : 0
+    if (hits) {
+      const qTables = Array.isArray((tables as any)?.q) ? ((tables as any).q as string[]) : []
+      if (qTables.includes('随机伤害') && qTables.some((t) => /技能伤害/.test(String(t || '')))) {
+        // Rename the per-hit random component to avoid renderer auto-multiplying it into a total row.
+        for (const d of details as any[]) {
+          if (!d || typeof d !== 'object') continue
+          if (normalizeKind(d.kind) !== 'dmg') continue
+          if (String(d.talent || '').trim() !== 'q') continue
+          const tbl = norm(String(d.table || ''))
+          if (tbl !== '随机伤害') continue
+          if (typeof d.title === 'string' && /单次/.test(norm(d.title))) break
+          d.title = '终结技单次随机伤害'
+          break
+        }
+
+        const hasFull = details.some((d: any) => normTitleKey(d?.title) === normTitleKey('终结技伤害(完整)'))
+        if (!hasFull && details.length < 20) {
+          const baseTable = qTables.includes('技能伤害') ? '技能伤害' : String(qTables.find((t) => /技能伤害/.test(String(t || ''))) || '').trim()
+          const randTable = '随机伤害'
+          if (baseTable) {
+            details.push({
+              title: '终结技伤害(完整)',
+              kind: 'dmg',
+              talent: 'q',
+              table: baseTable,
+              key: 'q',
+              params: { q: true },
+              dmgExpr: `dmg((toRatio(Array.isArray(talent.q[${jsString(baseTable)}]) ? talent.q[${jsString(
+                baseTable
+              )}][0] : talent.q[${jsString(baseTable)}]) + toRatio(Array.isArray(talent.q[${jsString(
+                randTable
+              )}]) ? talent.q[${jsString(randTable)}][0] : talent.q[${jsString(randTable)}]) * ${hits}), "q")`
+            } as any)
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   // 4c) Random extra-hit ultimates: patch per-hit rows into baseline-like "总伤害" rows.
   // Example: "并额外造成6次伤害，每次伤害..." should be showcased as base + extra * 6.
   try {
@@ -1475,6 +1545,116 @@ ${callB && bounceHitsExpr ? `  const b = (${callB})
           d.dmgExpr = `dmg(talent.q2[${jsString(baseTable)}] + talent.q2[${jsString(extraTable)}] * ${hits}, ${jsString(
             key
           )}${eleArg})`
+        }
+      }
+    }
+  } catch {
+    // Best-effort: do not block generation.
+  }
+
+  // 4d) Enhanced basic attacks that consist of multiple hits + an optional finisher:
+  // if tables expose a per-hit multiplier ("每段伤害") and another finisher damage table,
+  // rewrite the main a2 showcase row into the total damage.
+  try {
+    const descA2 = norm((input.talentDesc as any)?.a2)
+    if (descA2) {
+      const cnNumToInt = (s: string): number | null => {
+        const t = String(s || '').trim()
+        if (!t) return null
+        if (/^\d+$/.test(t)) {
+          const n = Math.trunc(Number(t))
+          return Number.isFinite(n) ? n : null
+        }
+        const map: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 }
+        if (t in map) return map[t]!
+        const m = t.match(/^十([一二两三四五六七八九])$/)
+        if (m) return 10 + (map[m[1]!] ?? 0)
+        const m2 = t.match(/^([一二两三四五六七八九])十([一二两三四五六七八九])$/)
+        if (m2) return (map[m2[1]!] ?? 0) * 10 + (map[m2[2]!] ?? 0)
+        return null
+      }
+
+      const inferHitCount = (desc: string): number | null => {
+        const s = norm(desc).replace(/\s+/g, '')
+        if (!s) return null
+        const m =
+          s.match(/造成([0-9]{1,2})段/) ||
+          s.match(/造成([一二两三四五六七八九十]{1,3})段/) ||
+          s.match(/([0-9]{1,2})段攻击/) ||
+          s.match(/([一二两三四五六七八九十]{1,3})段攻击/) ||
+          s.match(/共计([0-9]{1,2})段/) ||
+          s.match(/共计([一二两三四五六七八九十]{1,3})段/)
+        if (!m) return null
+        const n = cnNumToInt(m[1] || '')
+        return n != null && Number.isFinite(n) && n >= 2 && n <= 20 ? n : null
+      }
+
+      const hits = inferHitCount(descA2)
+      if (hits) {
+        const a2Tables = Array.isArray((tables as any)?.a2) ? ((tables as any).a2 as string[]) : []
+        const perHitTable =
+          a2Tables.find((t) => {
+            const tn = norm(t)
+            return tn && /每段/.test(tn) && /伤害/.test(tn) && !srIsBuffOnlyTableName(tn)
+          }) || ''
+        if (perHitTable) {
+          const finisherCandidates = a2Tables
+            .map((t) => String(t || '').trim())
+            .filter(Boolean)
+            .filter((t) => norm(t) !== norm(perHitTable))
+            .filter((t) => {
+              const tn = norm(t)
+              if (!tn) return false
+              if (!/伤害/.test(tn)) return false
+              if (/每段/.test(tn)) return false
+              if (srIsBuffOnlyTableName(tn)) return false
+              if (/(持续|dot|击破|超击破)/i.test(tn)) return false
+              return true
+            })
+
+          const scoreFinisher = (t: string): number => {
+            const tn = norm(t)
+            let s = 0
+            if (/(最后|终结|终结一击|收尾)/.test(tn)) s += 40
+            if (/(碎|拳|踢|重击|爆发)/.test(tn)) s += 10
+            if (tn.length <= 10) s += 5
+            return s
+          }
+          finisherCandidates.sort((a, b) => scoreFinisher(b) - scoreFinisher(a) || a.length - b.length)
+          const finisherTable = finisherCandidates[0] || ''
+
+          const a2DmgRows = details.filter((d) => {
+            if (!d || typeof d !== 'object') return false
+            if (!isDmg(d)) return false
+            return String((d as any).talent || '').trim() === 'a2'
+          })
+
+          const row =
+            (a2DmgRows.find((d) => /强化/.test(norm((d as any).title)) && /普攻/.test(norm((d as any).title))) as any) ||
+            (a2DmgRows.length === 1 ? (a2DmgRows[0] as any) : null)
+          if (row) {
+            const key = typeof row.key === 'string' && row.key.trim() ? row.key.trim() : 'a'
+            const ele = typeof row.ele === 'string' && row.ele.trim() ? row.ele.trim() : ''
+
+            const callHit = makeDmgCallExpr({
+              ...(row as CalcSuggestDetail),
+              talent: 'a2',
+              table: perHitTable,
+              key,
+              ...(ele ? { ele } : {})
+            } as any)
+            const callFin =
+              finisherTable &&
+              makeDmgCallExpr({ ...(row as CalcSuggestDetail), talent: 'a2', table: finisherTable, key, ...(ele ? { ele } : {}) } as any)
+
+            if (callHit) {
+              row.table = perHitTable
+              row.key = key
+              row.dmgExpr = callFin
+                ? `({ dmg: (${callHit}).dmg * ${hits} + (${callFin}).dmg, avg: (${callHit}).avg * ${hits} + (${callFin}).avg })`
+                : `({ dmg: (${callHit}).dmg * ${hits}, avg: (${callHit}).avg * ${hits} })`
+            }
+          }
         }
       }
     }

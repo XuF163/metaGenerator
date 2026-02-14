@@ -330,6 +330,7 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
 	    const tableUnits: Record<string, Record<string, string>> = {}
 	    const tableSamples: Record<string, Record<string, unknown>> = {}
 	    const tableTextSamples: Record<string, Record<string, string>> = {}
+	    const tableValues: Record<string, Record<string, number[]>> = {}
 	    const tableTextByName: Record<string, Record<string, string>> = {}
 	    const talentRaw = isRecord(metaRaw.talent) ? (metaRaw.talent as Record<string, unknown>) : null
 	    if (talentRaw) {
@@ -379,9 +380,15 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
 	        if (!isRecord(blk)) continue
 	        const out: Record<string, unknown> = {}
 	        const outText: Record<string, string> = {}
+	        const outValues: Record<string, number[]> = {}
 	        for (const [name, values] of Object.entries(blk)) {
 	          if (typeof name !== 'string' || !name.trim()) continue
 	          if (!Array.isArray(values) || values.length === 0) continue
+	          if (
+	            values.every((v) => typeof v === 'number' && Number.isFinite(v))
+	          ) {
+	            outValues[name] = values.map((v) => Number(v))
+	          }
 	          const sample = values[0]
 	          if (Array.isArray(sample) || (sample && typeof sample === 'object')) {
 	            out[name] = sample
@@ -415,6 +422,7 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
 	        }
 	        if (Object.keys(out).length) tableSamples[k] = out
 	        if (Object.keys(outText).length) tableTextSamples[k] = outText
+	        if (Object.keys(outValues).length) tableValues[k] = outValues
 	      }
 	    }
 
@@ -435,6 +443,7 @@ export async function calcCommand(ctx: CommandContext, options: GenOptions): Pro
         tables: tables as any,
         tableUnits: tableUnits as any,
         tableSamples: tableSamples as any,
+        tableValues: tableValues as any,
         tableTextSamples: tableTextSamples as any,
         talentDesc: talentDesc as any,
         buffHints: buildBuffHints(game, metaRaw)

@@ -33,6 +33,15 @@ export interface CalcSuggestInput {
    */
   tableSamples?: Partial<Record<TalentKey, Record<string, unknown>>>
   /**
+   * Optional per-level numeric values for scalar talent tables (level 1..15).
+   *
+   * Used by upstream-direct generators to map upstream `dm.*` formulas back to meta table names
+   * (e.g. attaching node-local `skill_dmgInc` to the correct `currentTalent="e:<table>"` only).
+   *
+   * Not used in prompts; safe to omit for LLM channels.
+   */
+  tableValues?: Partial<Record<TalentKey, Record<string, number[]>>>
+  /**
    * Optional human-readable sample texts for structured talent tables (array/object).
    * Mainly used to infer array component meaning (e.g. "%攻击 + %精通") and to help the LLM.
    *
@@ -60,6 +69,11 @@ export interface CalcSuggestInput {
     /** Small excerpt / summary (keep it short; prompt is size-limited). */
     excerpt?: string
   }
+  /**
+   * Internal flag: set by the "upstream-direct" channel to indicate buffs come from deterministic upstream extraction.
+   * Used by validatePlan() to allow legitimate stat-scaling buffs (e.g. HP->ATK%) that would otherwise be pruned as hallucinations.
+   */
+  upstreamDirect?: boolean
 }
 
 export type CalcDetailKind = 'dmg' | 'heal' | 'shield' | 'reaction'

@@ -75,8 +75,9 @@ function withinRatio(r, pct = 0.025) {
 }
 
 function pickWorstRatioForScore(d) {
+  // Accuracy contract: allow entry sets to differ, but any matched rows must be correct.
+  // Therefore, rank avatars by matched-only divergence (ignore maxAvg drift caused by missing/extra rows).
   const cands = [
-    { src: "maxAvg", ratio: d?.maxAvg?.ratio },
     { src: "maxAvgMatched", ratio: d?.maxAvgMatched?.ratio },
     { src: "worst", ratio: d?.worst?.ratio }
   ]
@@ -299,7 +300,7 @@ function renderSummaryMd({ game, cover, perUid, worstAvatars }) {
   }
   lines.push("")
 
-  lines.push("## Worst Avatars (by abs(log(ratio)))")
+  lines.push("## Worst Avatars (matched rows only; by abs(log(ratio)))")
   lines.push("")
   lines.push("| rank | uid | id | name | ratio | score | hint |")
   lines.push("|---:|---:|---:|---|---:|---:|---|")

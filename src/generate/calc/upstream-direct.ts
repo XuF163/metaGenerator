@@ -16,6 +16,41 @@ function normalizeSpace(text: string): string {
     .replace(/\s+/g, ' ')
 }
 
+function applyGsRowScopedBuffParams(plan: CalcSuggestResult, upstreamBuffs: CalcSuggestBuff[]): void {
+  if (!Array.isArray(plan.details) || plan.details.length === 0) return
+  if (!Array.isArray(upstreamBuffs) || upstreamBuffs.length === 0) return
+
+  type ApplyTo = { game?: string; talentKey?: string; table?: string; paramKey?: string }
+  const patches: Array<Required<Pick<ApplyTo, 'talentKey' | 'table' | 'paramKey'>>> = []
+  for (const b of upstreamBuffs) {
+    if (!isRecord(b)) continue
+    const apply = (b as any).__applyTo as ApplyTo | undefined
+    if (!apply || typeof apply !== 'object') continue
+    if (apply.game && String(apply.game).trim() !== 'gs') continue
+    const talentKey = typeof apply.talentKey === 'string' ? apply.talentKey.trim() : ''
+    const table = typeof apply.table === 'string' ? apply.table.trim() : ''
+    const paramKey = typeof apply.paramKey === 'string' ? apply.paramKey.trim() : ''
+    if (!talentKey || !table || !paramKey) continue
+    patches.push({ talentKey, table, paramKey })
+  }
+  if (!patches.length) return
+
+  for (const d of plan.details) {
+    const talent = typeof d?.talent === 'string' ? String(d.talent).trim() : ''
+    const table = typeof (d as any)?.table === 'string' ? String((d as any).table).trim() : ''
+    if (!talent || !table) continue
+
+    for (const p of patches) {
+      if (talent !== p.talentKey) continue
+      if (table !== p.table) continue
+      const cur = (d as any).params
+      const next = (cur && typeof cur === 'object' && !Array.isArray(cur)) ? ({ ...cur } as any) : {}
+      next[p.paramKey] = true
+      ;(d as any).params = next
+    }
+  }
+}
+
 function parseNumberLiteral(text: string): number | null {
   const t = String(text || '').trim()
   if (!/^[+-]?\d+(?:\.\d+)?$/.test(t)) return null
@@ -72,9 +107,62 @@ function mergePlanBuffs(opts: {
   upstream: CalcSuggestBuff[]
   preferUpstream: boolean
 }): Array<CalcSuggestBuff | string> | undefined {
-  const base = Array.isArray(opts.base) ? opts.base : []
+  let base = Array.isArray(opts.base) ? opts.base : []
   const upstream = Array.isArray(opts.upstream) ? opts.upstream : []
   if (base.length === 0 && upstream.length === 0) return undefined
+
+  // When following upstream directly, treat upstream as the authoritative source for any overlapping data keys.
+  // This avoids double-counting and ensures we don't keep heuristic placeholders when upstream provides a deterministic formula.
+  if (opts.preferUpstream && upstream.length) {
+    const upstreamKeys = new Set<string>()
+    for (const b of upstream) {
+      if (!isRecord(b)) continue
+      const data = (b as any).data
+      if (!isRecord(data)) continue
+      for (const k of Object.keys(data)) {
+        const kk = String(k || '').trim()
+        if (!kk || kk.startsWith('_')) continue
+        upstreamKeys.add(kk)
+      }
+    }
+
+    if (upstreamKeys.size) {
+      const filtered: Array<CalcSuggestBuff | string> = []
+      for (const b of base) {
+        if (typeof b === 'string') {
+          filtered.push(b)
+          continue
+        }
+        if (!isRecord(b)) continue
+        const data = (b as any).data
+        if (!isRecord(data)) {
+          filtered.push(b as CalcSuggestBuff)
+          continue
+        }
+        const next: Record<string, unknown> = { ...(data as any) }
+        let changed = false
+        for (const k of Object.keys(next)) {
+          const kk = String(k || '').trim()
+          if (!kk || kk.startsWith('_')) continue
+          if (!upstreamKeys.has(kk)) continue
+          delete next[k]
+          changed = true
+        }
+        if (!changed) {
+          filtered.push(b as CalcSuggestBuff)
+          continue
+        }
+        const effectKeys = Object.keys(next).filter((k) => {
+          const kk = String(k || '').trim()
+          return kk && !kk.startsWith('_')
+        })
+        if (effectKeys.length === 0) continue
+        filtered.push({ ...(b as any), data: next } as CalcSuggestBuff)
+      }
+      base = filtered
+    }
+  }
+
   const baseDataKeys = (() => {
     const keys = new Set<string>()
     for (const b of base) {
@@ -131,9 +219,15 @@ function mergePlanBuffs(opts: {
   }
 
   for (const b of upstream) {
-    // Upstream total-stat nodes (e.g. Hu Tao's E: HP->ATK) can duplicate heuristic buffs that already
-    // model the same conversion with proper params gating. Treat upstream `(...total)` as a fallback:
-    // if base already defines the same data keys, drop those keys from the upstream entry to avoid double counting.
+    if (opts.preferUpstream) {
+      pushBuff(b, 'upstream')
+      continue
+    }
+
+    // Prefer heuristic when upstream is disabled: upstream total-stat nodes (e.g. Hu Tao's E: HP->ATK)
+    // can duplicate heuristic buffs that already model the same conversion with proper params gating.
+    // Treat upstream `(...total)` as a fallback: if base already defines the same data keys, drop those keys
+    // from the upstream entry to avoid double counting.
     const filtered = (() => {
       if (!isRecord(b)) return null
       const title = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
@@ -168,6 +262,8 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
   }
 }): Promise<{ js: string; usedLlm: boolean; error?: string }> {
   const { input, createdBy } = opts
+  input.upstreamDirect = true
+  const preferUpstream = opts.upstream?.preferUpstream !== false
 
   let plan: CalcSuggestResult = heuristicPlan(input)
   let upstreamBuffs: CalcSuggestBuff[] = []
@@ -187,12 +283,12 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
             projectRootAbs: opts.projectRootAbs,
             id: input.id,
             elem: input.elem,
+            input,
             upstream: {
               genshinOptimizerRoot: opts.upstream?.genshinOptimizerRoot,
               includeTeamBuffs: opts.upstream?.includeTeamBuffs
             }
           })
-    const preferUpstream = opts.upstream?.preferUpstream !== false
     const merged = mergePlanBuffs({
       base: Array.isArray(plan.buffs) ? plan.buffs : undefined,
       upstream: upstreamBuffs,
@@ -222,40 +318,103 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
         return /^upstream:.*\(\s*total\s*\)\s*$/i.test(t)
       }
 
-      const otherKeys = new Set<string>()
-      for (const b of buffs) {
-        if (isUpstreamTotal(b)) continue
-        if (!isRecord(b)) continue
-        const data = (b as any).data
-        if (!isRecord(data)) continue
-        for (const k of Object.keys(data)) {
-          const kk = String(k || '').trim()
-          if (kk) otherKeys.add(kk)
-        }
-      }
-
-      if (otherKeys.size) {
-        const next: Array<CalcSuggestBuff | string> = []
+      if (preferUpstream) {
+        const upstreamKeys = new Set<string>()
         for (const b of buffs) {
-          if (!isUpstreamTotal(b)) {
-            next.push(b)
-            continue
+          if (!isRecord(b)) continue
+          const t = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+          if (!t.startsWith('upstream:')) continue
+          const data = (b as any).data
+          if (!isRecord(data)) continue
+          for (const k of Object.keys(data)) {
+            const kk = String(k || '').trim()
+            if (kk && !kk.startsWith('_')) upstreamKeys.add(kk)
           }
+        }
+
+        if (upstreamKeys.size) {
+          const next: Array<CalcSuggestBuff | string> = []
+          for (const b of buffs) {
+            if (typeof b === 'string') {
+              next.push(b)
+              continue
+            }
+            if (!isRecord(b)) continue
+            const t = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+            if (t.startsWith('upstream:')) {
+              next.push(b as CalcSuggestBuff)
+              continue
+            }
+            const data = (b as any).data
+            if (!isRecord(data)) {
+              next.push(b as CalcSuggestBuff)
+              continue
+            }
+            const filtered: Record<string, unknown> = { ...(data as any) }
+            let changed = false
+            for (const k of Object.keys(filtered)) {
+              const kk = String(k || '').trim()
+              if (!kk || kk.startsWith('_')) continue
+              if (!upstreamKeys.has(kk)) continue
+              delete filtered[k]
+              changed = true
+            }
+            if (!changed) {
+              next.push(b as CalcSuggestBuff)
+              continue
+            }
+            const effectKeys = Object.keys(filtered).filter((k) => {
+              const kk = String(k || '').trim()
+              return kk && !kk.startsWith('_')
+            })
+            if (effectKeys.length) next.push({ ...(b as any), data: filtered } as CalcSuggestBuff)
+          }
+          ;(plan as any).buffs = next
+        }
+      } else {
+        const otherKeys = new Set<string>()
+        for (const b of buffs) {
+          if (isUpstreamTotal(b)) continue
           if (!isRecord(b)) continue
           const data = (b as any).data
           if (!isRecord(data)) continue
-          const filtered: Record<string, unknown> = {}
-          for (const [k, v] of Object.entries(data)) {
+          for (const k of Object.keys(data)) {
             const kk = String(k || '').trim()
-            if (!kk) continue
-            if (otherKeys.has(kk)) continue
-            filtered[kk] = v
+            if (kk) otherKeys.add(kk)
           }
-          if (Object.keys(filtered).length) next.push({ ...(b as any), data: filtered } as CalcSuggestBuff)
         }
-        ;(plan as any).buffs = next
+
+        if (otherKeys.size) {
+          const next: Array<CalcSuggestBuff | string> = []
+          for (const b of buffs) {
+            if (!isUpstreamTotal(b)) {
+              next.push(b)
+              continue
+            }
+            if (!isRecord(b)) continue
+            const data = (b as any).data
+            if (!isRecord(data)) continue
+            const filtered: Record<string, unknown> = {}
+            for (const [k, v] of Object.entries(data)) {
+              const kk = String(k || '').trim()
+              if (!kk) continue
+              if (otherKeys.has(kk)) continue
+              filtered[kk] = v
+            }
+            if (Object.keys(filtered).length) next.push({ ...(b as any), data: filtered } as CalcSuggestBuff)
+          }
+          ;(plan as any).buffs = next
+        }
       }
     }
+  } catch {
+    // best-effort
+  }
+
+  // Row-scoped upstream buffs (e.g. node-local premods in genshin-optimizer) require detail-level params gating.
+  // Attach inferred params to matching details so miao-plugin applies the buff only for those rows.
+  try {
+    if (input.game === 'gs') applyGsRowScopedBuffParams(plan, upstreamBuffs)
   } catch {
     // best-effort
   }

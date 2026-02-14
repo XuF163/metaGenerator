@@ -315,14 +315,31 @@ function mapSrParamKey(kRaw: string): string {
 }
 
 function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<string, string> {
+  // Defaults are UI-centric in upstream optimizers and frequently assume "buffs on / max stacks" for convenience.
+  // For meta showcase rows (and baseline-like behavior), prefer conservative defaults:
+  // - stance/enhanced-state switches default to off
+  // - some team/support `*Buff` switches default to false (avoid always-on teammate state in a single-avatar calc)
+  //
+  // Keep a pragmatic override: party-wide HP knobs are not representable in miao-plugin's single-avatar context.
   const out: Record<string, string> = { ...defaults }
 
-  const set = (k: string, v: string): void => {
-    const key = String(k || '').trim()
-    const val = String(v || '').trim()
-    if (!key || !val) return
-    out[key] = val
-  }
+  // Some upstream kits default large "stack counters" to max (e.g. 10/12 stacks) for optimizer convenience.
+  // In meta calc.js, these are usually rotation-dependent and should start at 0 unless a detail row opts in.
+  const forceZeroStackPrefixes = (() => {
+    const prefixes = new Set<string>()
+    for (const k0 of Object.keys(out)) {
+      const k = String(k0 || '').trim()
+      if (!k) continue
+      const lower = k.toLowerCase()
+      if (!/(stacks?|stack)$/.test(lower)) continue
+      if (/memo/.test(lower)) continue
+      const v = String(out[k] || '').trim()
+      const n = isNumberLiteral(v)
+      if (n == null) continue
+      if (n > 3) prefixes.add(lower.replace(/stacks?$/, ''))
+    }
+    return prefixes
+  })()
 
   for (const k0 of Object.keys(out)) {
     const k = String(k0 || '').trim()
@@ -331,47 +348,90 @@ function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<
     const v = String(out[k] || '').trim()
     if (!v) continue
 
-    // Upstream defaults are curated for optimizer UI, but baseline meta treats some knobs as *stateful toggles*
-    // (unset => off) to avoid inflating damage outside the intended state rows.
-    //
-    // - "enhanced/state/mode/stance" flags: default to false (state is enabled per-row via params).
-    // - generic stack counters: default to 0, except talent-like stacks (often showcased at max in baseline).
-    if (v === 'true') {
-      // Keep this conservative: many upstream knobs end with "...State" but are effectively "kit baseline"
-      // assumptions in CNB-style showcase calcs (e.g. `vendettaState`). Only force-disable the obviously
-      // transient/enhanced toggles by default.
-      const isStateLike = /(enhanced|mode|stance|active|field)/.test(lower)
-      if (isStateLike) {
-        set(k, 'false')
-        continue
-      }
-    }
-
-    const looksLikeStack = /stacks?/.test(lower) || /\bstack\b/.test(lower)
-    const isEidolonLike = /^[eq]\d/.test(lower)
-    const isEnemyLike = /(enemy|target|weakness)/.test(lower)
-    const isTalentLike = /talent/.test(lower)
-    if (looksLikeStack && !isEidolonLike && !isEnemyLike && !isTalentLike) {
-      // Keep cons-dependent max defaults (common in showcase-style rows, e.g. memoSpdStacksMax = e>=4?7:6).
-      // Otherwise, treat stack counters as stateful knobs (unset => 0) to avoid inflating baseline comparisons.
+    // Force large stack counters (non-memo) to 0.
+    if (/(stacks?|stack)$/.test(lower) && !/memo/.test(lower)) {
       const n = isNumberLiteral(v)
-      const isConsDependent = /\bcons\b/.test(v)
-      if (n != null || !isConsDependent) {
-        set(k, '0')
+      if (n != null && n > 3) {
+        out[k] = '0'
         continue
       }
     }
 
-    // Tribbie-like "alliesMaxHp" knobs: baseline typically uses a single-character showcase approximation.
-    // Defaulting to own HP reduces drift vs baseline while keeping the param overrideable per row.
+    // Turn off stance/enhanced/mode toggles when upstream defaults them to true.
+    // These are usually "what state are you in?" UI switches for optimization, but meta calc.js should use
+    // explicit per-row `params` so baseline-like rows don't start in a special stance by default.
+    if (v === 'true') {
+      const isEidolonToggle = /^e[1-6]/.test(lower)
+      const isPassiveConversion = /conversion/.test(lower)
+      const isCoreState =
+        lower === 'vendettastate' || // Mydei-like kits are commonly showcased in their signature state.
+        lower === 'talentenhancedstate' // mapped to `strength`; handled via explicit detail params
+
+      const looksLikeStateToggle =
+        lower.endsWith('state') ||
+        lower.includes('stance') ||
+        lower.includes('enhanced') ||
+        lower.includes('enhance') ||
+        lower.includes('mode') ||
+        lower.includes('specialeffect') ||
+        lower.includes('seamstitch')
+
+      if (looksLikeStateToggle && !isEidolonToggle && !isPassiveConversion && !isCoreState && !/buffs?$/i.test(k)) {
+        out[k] = 'false'
+        continue
+      }
+    }
+
+    // Turn off a narrow set of teammate/support toggles when upstream defaults them to true.
+    // Do NOT blanket-disable all `*Buff` keys: many kits model essential self-state as `crBuff/spdBuff/...`,
+    // and upstream defaults are usually correct for those.
+    if (v === 'true' && /buff$/i.test(k)) {
+      // If a related large stack counter defaults to 0, the corresponding toggle should also be off by default.
+      for (const p of forceZeroStackPrefixes) {
+        if (!p) continue
+        if (p.length < 4) continue
+        if (lower.includes(p)) {
+          out[k] = 'false'
+          continue
+        }
+      }
+
+      const forceOff =
+        // Explicit team/teammate switches.
+        /(team|teammate|ally)/.test(lower) ||
+        // Common "support state" toggles (often live under teammateContent in upstream kits).
+        [
+          'teamDmgBuff',
+          'skillBuff',
+          'ultBuff',
+          'techniqueBuff',
+          'battleStartDefBuff',
+          'battleStartAtkBuff',
+          'battleStartSpdBuff'
+        ].some((kk) => kk.toLowerCase() === lower)
+
+      if (forceOff) {
+        out[k] = 'false'
+        continue
+      }
+    }
+
+    // Enhancement-level sliders (0/1/2...) should default to the base kit (0).
+    if (/(enhance|enhanced)/.test(lower) && v !== '0' && !/^e[1-6]/.test(lower)) {
+      const n = isNumberLiteral(v)
+      if (n != null) {
+        out[k] = '0'
+        continue
+      }
+    }
+
+    // Tribbie-like `alliesMaxHp` knobs: approximate with own HP.
     // NOTE: Do NOT match generic "MaxHp" substrings (e.g. `e4MaxHpIncreaseStacks`), otherwise we'd default a
     // numeric stack counter to `calc(attr.hp)` and massively inflate damage via `hpPct` buffs.
     if (/(allies|ally|team)/.test(lower) && /(maxhp|max_hp)/.test(lower)) {
-      set(k, 'calc(attr.hp)')
-      continue
+      out[k] = 'calc(attr.hp)'
     }
   }
-
   return out
 }
 
@@ -434,6 +494,28 @@ function applyDefaultsToParamsExpr(expr: string, defaults: Record<string, string
   return out
 }
 
+function extractAbilityTypeAliasesFromInitializeConfigurations(text: string): Record<string, string[]> {
+  const block = extractArrowFnBodyBlock(text, 'initializeConfigurations')
+  if (!block) return {}
+
+  const out: Record<string, string[]> = {}
+  const re = /\bx\.([A-Z][A-Z0-9_]*_DMG_TYPE)\.set\s*\(/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(block))) {
+    const typeVar = String(m[1] || '').trim()
+    if (!typeVar) continue
+    const open = block.indexOf('(', m.index)
+    if (open < 0) continue
+    const args = extractCallArgs(block, open, 4)
+    const raw0 = args[0] || ''
+    if (!raw0) continue
+    const typeConsts = extractAbilityTypeConsts(raw0)
+    if (typeConsts.length <= 1) continue
+    out[typeVar] = typeConsts
+  }
+  return out
+}
+
 function extractCallArgs(text: string, openParenIdx: number, maxArgs = 6): string[] {
   const out: string[] = []
   let cur = ''
@@ -480,6 +562,20 @@ function mapStatVarToBuffKey(varName: string): StatVarMap | null {
   const v = varName.trim().toUpperCase()
   if (!v) return null
 
+  const abilityPrefix = (abilityRaw: string): string | null => {
+    const ability = String(abilityRaw || '').trim().toUpperCase()
+    if (!ability) return null
+    if (ability === 'BASIC') return 'a'
+    if (ability === 'SKILL') return 'e'
+    if (ability === 'ULT') return 'q'
+    if (ability === 'FUA') return 't'
+    if (ability === 'DOT') return 'dot'
+    if (ability === 'BREAK') return 'break'
+    if (ability === 'MEMO_SKILL') return 'me'
+    if (ability === 'MEMO_TALENT') return 'mt'
+    return null
+  }
+
   // Upstream uses `*_SCALING` vars to model both:
   // - base talent multipliers (already represented by our local talent tables)
   // - extra scaling components from eidolons/traces/conditionals (NOT represented in tables)
@@ -509,6 +605,28 @@ function mapStatVarToBuffKey(varName: string): StatVarMap | null {
   }
   if (/_TOUGHNESS/.test(v)) return null
 
+  // Ability-specific dmg boosts (added into the "dmg% bonus" bucket).
+  const mDmgBoost = /^(BASIC|SKILL|ULT|FUA|DOT|BREAK|MEMO_SKILL|MEMO_TALENT)_DMG_BOOST$/.exec(v)
+  if (mDmgBoost) {
+    const prefix = abilityPrefix(mDmgBoost[1]!)
+    if (!prefix) return null
+    return { key: `${prefix}Dmg`, scale: 100 }
+  }
+  // Ability-specific final dmg multiplier boosts.
+  const mFinalDmgBoost = /^(BASIC|SKILL|ULT|FUA|DOT|BREAK|MEMO_SKILL|MEMO_TALENT)_FINAL_DMG_BOOST$/.exec(v)
+  if (mFinalDmgBoost) {
+    const prefix = abilityPrefix(mFinalDmgBoost[1]!)
+    if (!prefix) return null
+    return { key: `${prefix}Multi`, scale: 100 }
+  }
+  // Ability-specific true dmg multipliers (applied as extra final multiplier).
+  const mTrue = /^(BASIC|SKILL|ULT|FUA|DOT|BREAK|MEMO_SKILL|MEMO_TALENT)_TRUE_DMG_MODIFIER$/.exec(v)
+  if (mTrue) {
+    const prefix = abilityPrefix(mTrue[1]!)
+    if (!prefix) return null
+    return { key: `${prefix}Multi`, scale: 100 }
+  }
+
   if (v === 'ATK_P') return { key: 'atkPct', scale: 100 }
   if (v === 'ATK') return { key: 'atkPlus', scale: 1 }
   if (v === 'HP_P') return { key: 'hpPct', scale: 100 }
@@ -529,6 +647,7 @@ function mapStatVarToBuffKey(varName: string): StatVarMap | null {
   if (v === 'EHR') return { key: 'effPct', scale: 100 }
   if (v === 'ERS' || v === 'EFF_RES') return { key: 'effDef', scale: 100 }
   if (v === 'BREAK_EFF' || v === 'BE') return { key: 'stance', scale: 100 }
+  if (v === 'FINAL_DMG_BOOST') return { key: 'multi', scale: 100 }
   // Some kits use a dedicated "true dmg" multiplier bucket (additive to the final multiplier).
   // Baseline commonly models this as `multi` (percent points), not as `dmg%`.
   if (v === 'TRUE_DMG_MODIFIER') return { key: 'multi', scale: 100 }
@@ -542,6 +661,8 @@ function mapAbilityDmgTypeToBuffKey(typeConst: string): string | null {
   if (t === 'SKILL_DMG_TYPE') return 'eDmg'
   if (t === 'ULT_DMG_TYPE') return 'qDmg'
   if (t === 'FUA_DMG_TYPE') return 'tDmg'
+  if (t === 'MEMO_SKILL_DMG_TYPE') return 'meDmg'
+  if (t === 'MEMO_TALENT_DMG_TYPE') return 'mtDmg'
   if (t === 'DOT_DMG_TYPE') return 'dotDmg'
   if (t === 'BREAK_DMG_TYPE') return 'breakDmg'
   return null
@@ -564,27 +685,69 @@ function extractAbilityTypeConsts(typeExpr: string): string[] {
   return Array.from(new Set(out))
 }
 
+const SR_ALL_ABILITY_TYPE_CONSTS: string[] = [
+  'BASIC_DMG_TYPE',
+  'SKILL_DMG_TYPE',
+  'ULT_DMG_TYPE',
+  'FUA_DMG_TYPE',
+  'DOT_DMG_TYPE',
+  'BREAK_DMG_TYPE',
+  'MEMO_SKILL_DMG_TYPE',
+  'MEMO_TALENT_DMG_TYPE'
+]
+
+function resolveAbilityTypeConstsFromExpr(typeExprRaw: string): string[] {
+  const typeExpr = String(typeExprRaw || '').trim()
+  if (!typeExpr) return []
+  // Special-case upstream helper: `allTypesExcept(DOT_DMG_TYPE)` => all known types excluding DOT.
+  if (/^allTypesExcept\s*\(/.test(typeExpr)) {
+    const excluded = extractAbilityTypeConsts(typeExpr)
+    if (!excluded.length) return SR_ALL_ABILITY_TYPE_CONSTS.slice()
+    const ex = new Set(excluded)
+    return SR_ALL_ABILITY_TYPE_CONSTS.filter((t) => !ex.has(t))
+  }
+  return extractAbilityTypeConsts(typeExpr)
+}
+
 function extractBuffsFromBlock(
   blockText: string,
   constMap: Record<string, string>,
   defaultsExpr: Record<string, string>,
-  opts?: { includeTeamBuffs?: boolean }
+  opts?: { includeTeamBuffs?: boolean; abilityTypeAliases?: Record<string, string[]> }
 ): CalcSuggestBuff[] {
   const buffs: CalcSuggestBuff[] = []
-  const push = (title: string, dataKey: string, value: number | string, extra?: Pick<CalcSuggestBuff, 'tree'>): void => {
-    if (!isAllowedMiaoBuffDataKey('sr', dataKey)) return
-    const b: CalcSuggestBuff = { title, data: { [dataKey]: value } }
+  const pushData = (
+    title: string,
+    dataRaw: Record<string, number | string>,
+    extra?: Pick<CalcSuggestBuff, 'tree' | 'check'>
+  ): void => {
+    const data: Record<string, number | string> = {}
+    for (const [k0, v] of Object.entries(dataRaw || {})) {
+      const k = String(k0 || '').trim()
+      if (!k || !isAllowedMiaoBuffDataKey('sr', k)) continue
+      data[k] = v
+    }
+    if (Object.keys(data).length === 0) return
+    const b: CalcSuggestBuff = { title, data }
     if (extra?.tree) b.tree = extra.tree
+    if (extra?.check) b.check = extra.check
     buffs.push(b)
   }
 
-  const statRe = /\bx\.([A-Z][A-Z0-9_]+)\.(buff|buffSingle|buffTeam)\s*\(/g
+  const push = (title: string, dataKey: string, value: number | string, extra?: Pick<CalcSuggestBuff, 'tree' | 'check'>): void => {
+    pushData(title, { [dataKey]: value }, extra)
+  }
+
+  const statRe =
+    /\bx\.(m\.)?([A-Z][A-Z0-9_]+)\.(buff|buffSingle|buffTeam|buffDual|buffBaseDual|buffMemo|buffMemoSingle|buffMemoTeam|buffMemoDual)\s*\(/g
   let m: RegExpExecArray | null
   while ((m = statRe.exec(blockText))) {
-    const varName = String(m[1] || '').trim()
-    const method = String(m[2] || '').trim()
+    const isMemoNs = !!m[1]
+    const varName = String(m[2] || '').trim()
+    const method = String(m[3] || '').trim()
     if (!varName) continue
-    if (method === 'buffTeam' && !opts?.includeTeamBuffs) {
+    const isTeamMethod = method === 'buffTeam' || method === 'buffMemoTeam'
+    if (isTeamMethod && !opts?.includeTeamBuffs) {
       // Many upstream "team" effects are actually enemy debuffs (RES_PEN/vulnerability) that affect the caster too.
       // Keep these even when we otherwise skip teammate-only buffs.
       const v = varName.toUpperCase()
@@ -628,7 +791,11 @@ function extractBuffsFromBlock(
       const lineEnd0 = blockText.indexOf('\n', m.index)
       const lineEnd = lineEnd0 >= 0 ? lineEnd0 : blockText.length
       const line = blockText.slice(lineStart, lineEnd)
-      const mm = line.match(new RegExp(`(.+?)&&\\s*x\\.${escapeRegExp(varName)}\\.(?:buff|buffSingle|buffTeam)\\s*\\(`))
+      const mm = line.match(
+        new RegExp(
+          `(.+?)&&\\s*x\\.(?:m\\.)?${escapeRegExp(varName)}\\.(?:buff|buffSingle|buffTeam|buffDual|buffBaseDual|buffMemo|buffMemoSingle|buffMemoTeam|buffMemoDual)\\s*\\(`
+        )
+      )
       if (mm) gateExpr = normalizeExpr(String(mm[1] || '').trim())
     } catch {
       // ignore
@@ -654,6 +821,19 @@ function extractBuffsFromBlock(
       scaled = `calc(attr.${mapped.baseStat}) * (${s})`
     }
 
+    // Memo namespace: scope global dmg/multi buffs to memo-only keys when possible.
+    if (isMemoNs) {
+      if (mapped.key === 'dmg') {
+        pushData(`upstream:m.${varName}[meDmg|mtDmg]`, { meDmg: scaled, mtDmg: scaled }, tree ? { tree } : undefined)
+        continue
+      }
+      if (mapped.key === 'multi') {
+        pushData(`upstream:m.${varName}[meMulti|mtMulti]`, { meMulti: scaled, mtMulti: scaled }, tree ? { tree } : undefined)
+        continue
+      }
+      // For other keys (e.g. atkPct), fall through to global mapping.
+    }
+
     let dataKey = mapped.key
     // Upstream collapses DEF shred and DEF ignore into `DEF_PEN`. Baseline meta distinguishes:
     // - `enemyDef`: debuff "降低防御力"
@@ -671,8 +851,16 @@ function extractBuffsFromBlock(
   }
 
   const scanAbilityBuff = (
-    fnName: 'buffAbilityDmg' | 'buffAbilityCd' | 'buffAbilityVulnerability',
-    mapKey: (typeConst: string) => string | null
+    fnName:
+      | 'buffAbilityDmg'
+      | 'buffAbilityCd'
+      | 'buffAbilityCr'
+      | 'buffAbilityDefPen'
+      | 'buffAbilityTrueDmg'
+      | 'buffAbilityResPen'
+      | 'buffAbilityVulnerability',
+    mapKey: (typeConst: string) => string | null,
+    extra?: { check?: (typeConstsExpanded: string[]) => string }
   ): void => {
     const re = new RegExp(`\\b${fnName}\\s*\\(\\s*x\\s*,`, 'g')
     let mm: RegExpExecArray | null
@@ -685,12 +873,26 @@ function extractBuffsFromBlock(
       if (!rawVal) continue
       if (/\baction\b/.test(rawVal) || /\bcontext\b/.test(rawVal)) continue
 
-      const typeConsts = extractAbilityTypeConsts(rawTypeExpr)
+      const typeConstsRaw = resolveAbilityTypeConstsFromExpr(rawTypeExpr)
+      if (!typeConstsRaw.length) continue
+      const typeConsts = (() => {
+        const expanded: string[] = []
+        for (const t of typeConstsRaw) {
+          const alias = opts?.abilityTypeAliases?.[t]
+          if (Array.isArray(alias) && alias.length) expanded.push(...alias)
+          else expanded.push(t)
+        }
+        return Array.from(new Set(expanded))
+      })()
       if (!typeConsts.length) continue
 
-      const keys = typeConsts
-        .map((t) => mapKey(t))
-        .filter((k): k is string => typeof k === 'string' && !!k && isAllowedMiaoBuffDataKey('sr', k))
+      const keys = Array.from(
+        new Set(
+          typeConsts
+            .map((t) => mapKey(t))
+            .filter((k): k is string => typeof k === 'string' && !!k && isAllowedMiaoBuffDataKey('sr', k))
+        )
+      )
       if (!keys.length) continue
 
       const expr0 = normalizeExpr(rawVal)
@@ -722,8 +924,9 @@ function extractBuffsFromBlock(
       const scaled = scaleExpr(inlined, 100)
 
       const typeList = typeConsts.join('|')
+      const check = extra?.check ? extra.check(typeConsts) : ''
       for (const k of keys) {
-        push(`upstream:${fnName}(${typeList})[${k}]`, k, scaled)
+        push(`upstream:${fnName}(${typeList})[${k}]`, k, scaled, check ? { check } : undefined)
       }
     }
   }
@@ -733,6 +936,30 @@ function extractBuffsFromBlock(
     const p = abilityPrefixFromTypeConst(t)
     return p ? `${p}Cdmg` : null
   })
+  scanAbilityBuff('buffAbilityCr', (t) => {
+    const p = abilityPrefixFromTypeConst(t)
+    return p ? `${p}Cpct` : null
+  })
+  scanAbilityBuff('buffAbilityDefPen', (t) => {
+    const p = abilityPrefixFromTypeConst(t)
+    return p ? `${p}Ignore` : null
+  })
+  scanAbilityBuff('buffAbilityTrueDmg', (t) => {
+    const p = abilityPrefixFromTypeConst(t)
+    return p ? `${p}Multi` : null
+  })
+  scanAbilityBuff(
+    'buffAbilityResPen',
+    () => 'kx',
+    {
+      check: (typeConsts) => {
+        // miao-plugin has only a global `kx`; gate by common showcase state flags to avoid over-buffing.
+        if (typeConsts.includes('ULT_DMG_TYPE')) return 'params.q === true'
+        if (typeConsts.includes('SKILL_DMG_TYPE')) return 'params.e === true'
+        return ''
+      }
+    }
+  )
   scanAbilityBuff('buffAbilityVulnerability', (t) => {
     const p = abilityPrefixFromTypeConst(t)
     return p ? `${p}Enemydmg` : null
@@ -741,21 +968,53 @@ function extractBuffsFromBlock(
   return buffs
 }
 
-type DynConvMap = { key: string; scale: number; baseStat: 'atk' | 'hp' | 'def' | 'speed' }
+type DynConvMap = { key: string; scale: number; convertibleExpr: string }
 
-function mapSrStatToBuffKey(statNameRaw: string): DynConvMap | null {
-  const s = String(statNameRaw || '').trim().toUpperCase()
-  if (!s) return null
-  // dynamicStatConversion(HP->HP): upstream semantics is an *additive* buff equal to `convertibleValue * factor`.
-  // This matches miao-plugin's `<stat>Plus` buckets (flat additions), not `<stat>Pct` (percent of base only).
-  if (s === 'ATK') return { key: 'atkPlus', scale: 1, baseStat: 'atk' }
-  if (s === 'HP') return { key: 'hpPlus', scale: 1, baseStat: 'hp' }
-  if (s === 'DEF') return { key: 'defPlus', scale: 1, baseStat: 'def' }
-  if (s === 'SPD') return { key: 'speedPlus', scale: 1, baseStat: 'speed' }
-  return null
+function mapSrDynamicStatConversion(fromStatRaw: string, toStatRaw: string): DynConvMap | null {
+  const from = String(fromStatRaw || '').trim().toUpperCase()
+  const to = String(toStatRaw || '').trim().toUpperCase()
+  if (!from || !to) return null
+
+  // Upstream `hsr-optimizer` commonly models % stats as ratios (0.5 for 50%),
+  // while miao-plugin attrs store them as percent points (50).
+  const fromExpr = (() => {
+    if (from === 'ATK') return 'calc(attr.atk)'
+    if (from === 'HP') return 'calc(attr.hp)'
+    if (from === 'DEF') return 'calc(attr.def)'
+    if (from === 'SPD') return 'calc(attr.speed)'
+    if (from === 'CR') return '(calc(attr.cpct) / 100)'
+    if (from === 'CD') return '(calc(attr.cdmg) / 100)'
+    if (from === 'EHR') return '(calc(attr.effPct) / 100)'
+    if (from === 'RES') return '(calc(attr.effDef) / 100)'
+    if (from === 'ERR') return '(calc(attr.recharge) / 100)'
+    if (from === 'BE') return '(calc(attr.stance) / 100)'
+    if (from === 'OHB') return '(calc(attr.heal) / 100)'
+    return null
+  })()
+  if (!fromExpr) return null
+
+  const toMap = (() => {
+    // Flat stats.
+    if (to === 'ATK') return { key: 'atkPlus', scale: 1 }
+    if (to === 'HP') return { key: 'hpPlus', scale: 1 }
+    if (to === 'DEF') return { key: 'defPlus', scale: 1 }
+    if (to === 'SPD') return { key: 'speedPlus', scale: 1 }
+    // Ratio stats -> percent points.
+    if (to === 'CR') return { key: 'cpct', scale: 100 }
+    if (to === 'CD') return { key: 'cdmg', scale: 100 }
+    if (to === 'EHR') return { key: 'effPct', scale: 100 }
+    if (to === 'RES') return { key: 'effDef', scale: 100 }
+    if (to === 'ERR') return { key: 'recharge', scale: 100 }
+    if (to === 'BE') return { key: 'stance', scale: 100 }
+    if (to === 'OHB') return { key: 'heal', scale: 100 }
+    return null
+  })()
+  if (!toMap) return null
+
+  return { ...toMap, convertibleExpr: fromExpr }
 }
 
-function extractArrowFactorExpr(arrowRaw: string): string {
+function extractArrowBodyExpr(arrowRaw: string): string {
   const s = String(arrowRaw || '').trim()
   if (!s) return ''
   const idx = s.indexOf('=>')
@@ -767,14 +1026,7 @@ function extractArrowFactorExpr(arrowRaw: string): string {
     const m = body.match(/return\s+([^;\r\n]+)\s*;?/)
     body = String(m?.[1] || '').trim()
   }
-  if (!body) return ''
-
-  // Extract factor from `convertibleValue * factor` or `factor * convertibleValue`.
-  const m1 = /^\s*convertibleValue\s*\*\s*(.+?)\s*$/.exec(body)
-  if (m1) return String(m1[1] || '').trim()
-  const m2 = /^\s*(.+?)\s*\*\s*convertibleValue\s*$/.exec(body)
-  if (m2) return String(m2[1] || '').trim()
-  return ''
+  return body.trim()
 }
 
 function guessGateExprForDynamicConversion(text: string, callIdx: number): string {
@@ -800,9 +1052,7 @@ function extractDynamicStatConversions(text: string, constMap: Record<string, st
     const fromStat = String(m[1] || '').trim()
     const toStat = String(m[2] || '').trim()
     if (!fromStat || !toStat) continue
-    if (fromStat.toUpperCase() !== toStat.toUpperCase()) continue
-
-    const mapped = mapSrStatToBuffKey(fromStat)
+    const mapped = mapSrDynamicStatConversion(fromStat, toStat)
     if (!mapped) continue
 
     const open = text.indexOf('(', m.index)
@@ -810,36 +1060,35 @@ function extractDynamicStatConversions(text: string, constMap: Record<string, st
     const args = extractCallArgs(text, open, 12)
     if (!args.length) continue
     const arrowArg = args[args.length - 1] || ''
-    let factorExpr = extractArrowFactorExpr(arrowArg)
-    if (!factorExpr) continue
+    let bodyExpr = extractArrowBodyExpr(arrowArg)
+    if (!bodyExpr || !/\bconvertibleValue\b/.test(bodyExpr)) continue
 
     // Optional gating from the closest `condition:` in the same dynamic conditional object.
     let gateExpr = guessGateExprForDynamicConversion(text, m.index)
 
-    factorExpr = normalizeExpr(factorExpr)
-    factorExpr = inlineConsts(factorExpr, constMap)
-    factorExpr = applyDefaultsToParamsExpr(factorExpr, defaultsExpr)
+    bodyExpr = normalizeExpr(bodyExpr)
+    bodyExpr = inlineConsts(bodyExpr, constMap)
+    bodyExpr = applyDefaultsToParamsExpr(bodyExpr, defaultsExpr)
 
-    if (!factorExpr || hasUnknownFreeIdentifiers(factorExpr)) continue
+    // Substitute upstream `convertibleValue` with miao-plugin attr reads (ratio for % stats).
+    bodyExpr = bodyExpr.replace(/\bconvertibleValue\b/g, `(${mapped.convertibleExpr})`)
+    if (!bodyExpr || hasUnknownFreeIdentifiers(bodyExpr)) continue
 
     if (gateExpr) {
       gateExpr = applyDefaultsToParamsExpr(inlineConsts(gateExpr, constMap), defaultsExpr)
       if (gateExpr && !hasUnknownFreeIdentifiers(gateExpr)) {
-        factorExpr = `(${gateExpr}) ? (${factorExpr}) : 0`
+        bodyExpr = `(${gateExpr}) ? (${bodyExpr}) : 0`
       }
     }
 
-    let scaled: number | string = scaleExpr(factorExpr, mapped.scale)
+    let scaled: number | string = scaleExpr(bodyExpr, mapped.scale)
     const s = typeof scaled === 'number' ? String(scaled) : String(scaled || '').trim()
     if (!s) continue
     if (hasUnknownFreeIdentifiers(s)) continue
-
-    const expr = `calc(attr.${mapped.baseStat}) * (${s})`
-    if (hasUnknownFreeIdentifiers(expr)) continue
     if (!isAllowedMiaoBuffDataKey('sr', mapped.key)) continue
     out.push({
       title: `upstream:dynamicStatConversion(${fromStat}->${toStat})[${mapped.key}]`,
-      data: { [mapped.key]: expr }
+      data: { [mapped.key]: s }
     })
   }
 
@@ -1016,6 +1265,7 @@ export function buildSrUpstreamDirectBuffs(opts: {
 
   const constMap = buildConstExprMap(text)
   const defaultsExpr = extractDefaultsExprMap(text, constMap)
+  const abilityTypeAliases = extractAbilityTypeAliasesFromInitializeConfigurations(text)
 
   const blocks: string[] = []
   const pre = extractArrowFnBodyBlock(text, 'precomputeEffects')
@@ -1038,11 +1288,19 @@ export function buildSrUpstreamDirectBuffs(opts: {
   const buffs: CalcSuggestBuff[] = []
   for (const b of blocks) {
     buffs.push(
-      ...extractBuffsFromBlock(b, constMap, defaultsExpr, { includeTeamBuffs: !!opts.upstream?.includeTeamBuffs })
+      ...extractBuffsFromBlock(b, constMap, defaultsExpr, {
+        includeTeamBuffs: !!opts.upstream?.includeTeamBuffs,
+        abilityTypeAliases
+      })
     )
   }
   if (mutual) {
-    buffs.push(...extractBuffsFromBlock(mutual, constMap, defaultsExpr, { includeTeamBuffs: true }))
+    buffs.push(
+      ...extractBuffsFromBlock(mutual, constMap, defaultsExpr, {
+        includeTeamBuffs: true,
+        abilityTypeAliases
+      })
+    )
   }
   buffs.push(...extractDynamicStatConversions(text, constMap, defaultsExpr))
   const dyn = extractDynamicConditionalAtkPlusFromSpd(text, constMap, defaultsExpr, opts.input)

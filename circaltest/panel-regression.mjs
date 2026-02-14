@@ -331,7 +331,9 @@ function diffRuns(baseline, generated) {
         if (!row) continue
         const isSigStrict = !!bSig && row.sig === bSig
         const isSigLoose = !isSigStrict && !!bSigLoose && row.sigLoose === bSigLoose
-        if (!isSigStrict && !isSigLoose && bCat && row.cat && row.cat !== bCat) continue
+        // Prevent obvious cross-skill mismatches (e.g. baseline Q-state rows pairing with generated E rows)
+        // even when signatures collide (same key/ele/tablePart).
+        if (bCat && row.cat && row.cat !== bCat) continue
 
         const isStrict = !!bStrict && row.strict === bStrict
         const match = isSigStrict ? "sig" : isSigLoose ? "sig-loose" : isStrict ? "strict" : "loose"

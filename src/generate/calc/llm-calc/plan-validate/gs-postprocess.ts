@@ -58,11 +58,22 @@ export function applyGsPostprocess(opts: {
   // When the plan hits the 20-row cap, prefer dropping segmented NA rows (baseline rarely keeps all of them)
   // so we can keep more baseline-like E/Q/heal/shield showcases.
   const gsFindReplaceableNaIdx = (): number => {
+    const hasStateParams = (d: any): boolean => {
+      const p = d?.params
+      if (!p || typeof p !== 'object' || Array.isArray(p)) return false
+      // Protect stateful showcase rows (e.g. 开Q/开E/半血...) from being overwritten by later aliases.
+      return (
+        Object.prototype.hasOwnProperty.call(p, 'e') ||
+        Object.prototype.hasOwnProperty.call(p, 'q') ||
+        Object.prototype.hasOwnProperty.call(p, 'halfHp')
+      )
+    }
     for (let i = details.length - 1; i >= 0; i--) {
       const d = details[i] as any
       if (!d || typeof d !== 'object') continue
       if (normalizeKind(d.kind) !== 'dmg') continue
       if (d.talent !== 'a') continue
+      if (hasStateParams(d)) continue
       const title = String(d.title || '')
       const table = String(d.table || '')
       const key = String(d.key || '')
@@ -78,6 +89,7 @@ export function applyGsPostprocess(opts: {
       if (!d || typeof d !== 'object') continue
       if (normalizeKind(d.kind) !== 'dmg') continue
       if (d.talent !== 'a') continue
+      if (hasStateParams(d)) continue
       const title = String(d.title || '')
       const table = String(d.table || '')
       const key = String(d.key || '')
@@ -91,6 +103,7 @@ export function applyGsPostprocess(opts: {
       if (!d || typeof d !== 'object') continue
       if (normalizeKind(d.kind) !== 'dmg') continue
       if (d.talent !== 'a') continue
+      if (hasStateParams(d)) continue
       const title = String(d.title || '')
       const table = String(d.table || '')
       const key = String(d.key || '')
@@ -187,6 +200,19 @@ export function applyGsPostprocess(opts: {
   if (chargedTable) {
     const title = chargedTable.endsWith('2') ? chargedTable.slice(0, -1) : chargedTable
     gsPushDetail({ title, kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' })
+
+    // Charged attacks commonly have a distinct "finisher" hit table (e.g. "重击终结伤害").
+    // Include it as an extra core A2 showcase when available.
+    const chargedFinisherTable =
+      aTables.find((t) => t === '重击终结伤害') ||
+      aTables.find((t) => t === '重击终结伤害2') ||
+      aTables.find((t) => /重击/.test(t) && /(终结|尾刀|最后)/.test(t) && /伤害/.test(t)) ||
+      aTables.find((t) => /(终结|尾刀|最后)/.test(t) && /伤害/.test(t)) ||
+      ''
+    if (chargedFinisherTable && chargedFinisherTable !== chargedTable) {
+      const finTitle = chargedFinisherTable.endsWith('2') ? chargedFinisherTable.slice(0, -1) : chargedFinisherTable
+      gsPushDetail({ title: finTitle, kind: 'dmg', talent: 'a', table: chargedFinisherTable, key: 'a2' })
+    }
   }
 
   // 2) Add a small number of extra E/Q damage tables when available.
@@ -285,7 +311,6 @@ export function applyGsPostprocess(opts: {
     const prefix = talent === 'e' ? 'E' : 'Q'
     const out: CalcSuggestDetail = { title: `${prefix}${table}`, kind: 'dmg', talent, table, key: talent }
     if (talent === 'q') (out as any).params = { q: true }
-    if (talent === 'e') (out as any).params = { e: true }
 
     if (details.length < 20) {
       gsPushDetail(out)
@@ -331,12 +356,6 @@ export function applyGsPostprocess(opts: {
       if (!Object.prototype.hasOwnProperty.call(p, 'q')) p.q = true
       ;(out as any).params = p
     }
-    if (talent === 'e') {
-      const p0 = (out as any).params
-      const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
-      if (!Object.prototype.hasOwnProperty.call(p, 'e')) p.e = true
-      ;(out as any).params = p
-    }
 
     gsPushAliasByTitle(out)
   }
@@ -344,17 +363,19 @@ export function applyGsPostprocess(opts: {
   gsEnsureCoreTitleAlias('e')
   gsEnsureCoreTitleAlias('q')
 
-  // 2b) GS skill-state convention: many baseline calc.js use `params.e===true` to represent "E state active".
-  // Ensure E-sourced damage rows opt into this state so upstream/heuristic buffs gated by `params.e` can apply.
+  // 2b) GS state conventions (baseline-friendly):
+  // - Keep `params.q===true` for Q rows (burst-state showcase), but do NOT auto-enable `params.e` for all E rows,
+  //   since upstream/baseline may use `params.e` for kit-specific toggles (e.g. manual detonation, special modes).
   try {
     for (const d of details as any[]) {
       if (!d || typeof d !== 'object') continue
       if (normalizeKind(d.kind) !== 'dmg') continue
-      if (d.talent !== 'e') continue
       const p0 = d.params
       const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
-      if (!Object.prototype.hasOwnProperty.call(p, 'e')) p.e = true
-      d.params = p
+      if (d.talent === 'q') {
+        if (!Object.prototype.hasOwnProperty.call(p, 'q')) p.q = true
+        d.params = p
+      }
     }
   } catch {
     // best-effort
@@ -472,6 +493,239 @@ export function applyGsPostprocess(opts: {
       .filter((d) => d.talent === 'q')
       .sort((a, b) => scoreBase(b) - scoreBase(a))
     for (const d of qBases.slice(0, gsEleVariant.maxQ)) gsTryAddEleVariant(d, gsEleVariant)
+  }
+
+  // 3b) Baseline-style state showcase aliases for NA/charged rows.
+  // When kit descriptions indicate E/Q states affect normal/charged attacks, add a small number of
+  // explicit param-enabled rows (e.g. "开Q重击", "重击蒸发(半血开E)") so upstream-derived buffs can apply.
+  try {
+    const descEState = normalizePromptText((input.talentDesc as any)?.e)
+    const descQState = normalizePromptText((input.talentDesc as any)?.q)
+    const descT = normalizePromptText((input.talentDesc as any)?.t)
+
+    const hasParamKey = (k: string): boolean =>
+      details.some((d: any) => {
+        const p = d?.params
+        return p && typeof p === 'object' && !Array.isArray(p) && Object.prototype.hasOwnProperty.call(p, k)
+      })
+
+    const hasHalfHp = hasParamKey('halfHp') || /低于\s*50%|生命值.{0,8}50%/.test(`${descEState} ${descQState} ${descT}`)
+
+    const affectsA = (descRaw: string): boolean => {
+      const desc = normalizePromptText(descRaw)
+      if (!desc) return false
+      const hasAttackWords = /(普通攻击|重击|下落攻击|攻击伤害)/.test(desc)
+      if (!hasAttackWords) return false
+      const hasConvertWords = /(转为|转化为|转换为|附魔|替换为|变为|进入.{0,16}状态)/.test(desc)
+      if (hasConvertWords) return true
+      // Also treat explicit "攻击力提高/提升" state texts as affecting attack showcases.
+      if (/(攻击力).{0,12}(提高|提升|增加)/.test(desc) && /(持续|状态|期间)/.test(desc)) return true
+      return false
+    }
+
+    const eAffectsA = affectsA(descEState)
+    const qAffectsA = affectsA(descQState)
+
+    const cloneWithParams = (
+      base: CalcSuggestDetail,
+      title: string,
+      extra: Record<string, number | boolean | string>
+    ): CalcSuggestDetail => {
+      const p0 = (base as any).params
+      const p = p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as any) } : {}
+      for (const [k, v] of Object.entries(extra)) (p as any)[k] = v
+      return { ...(base as any), title, params: p }
+    }
+
+    // Stronger alias insertion for state rows:
+    // - Prefer keeping the 20-row cap
+    // - If we can't replace a NA segment row, replace an obvious duplicate row (same kind+talent+table+ele)
+    //   so critical state showcases (开Q/开E/半血...) don't get dropped for kits without NA segments.
+    const pushAliasStrong = (d: CalcSuggestDetail): void => {
+      if (!d || typeof d !== 'object') return
+      if (!d.talent || !d.table) return
+      const kind = normalizeKind(d.kind)
+      if (!['dmg', 'heal', 'shield', 'reaction'].includes(kind)) return
+      const title = normalizePromptText(d.title)
+      if (!title) return
+      const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+
+      const hasSameTitle = details.some((x: any) => {
+        if (!x || typeof x !== 'object') return false
+        if (normalizeKind(x.kind) !== kind) return false
+        if (x.talent !== d.talent) return false
+        const t = normalizePromptText(String(x.title || ''))
+        if (!t || t !== title) return false
+        const xe = typeof x.ele === 'string' ? String(x.ele).trim() : ''
+        return xe === ele
+      })
+      if (hasSameTitle) return
+
+      if (details.length < 20) {
+        details.push(d)
+        return
+      }
+
+      const idxNa = gsFindReplaceableNaIdx()
+      if (idxNa >= 0) {
+        details.splice(idxNa, 1, d)
+        return
+      }
+
+      const sigOf = (x: any): string => {
+        const k = normalizeKind(x?.kind)
+        const tk = String(x?.talent || '').trim()
+        const tb = normalizePromptText(x?.table)
+        const e0 = typeof x?.ele === 'string' ? String(x.ele).trim() : ''
+        return `${k}|${tk}|${tb}|${e0}`
+      }
+
+      const groups = new Map<string, number[]>()
+      for (let i = 0; i < details.length; i++) {
+        const cur: any = details[i]
+        if (!cur || typeof cur !== 'object') continue
+        const sig = sigOf(cur)
+        if (!sig) continue
+        const list = groups.get(sig) || []
+        list.push(i)
+        groups.set(sig, list)
+      }
+
+      let bestIdx = -1
+      let bestScore = Number.POSITIVE_INFINITY
+      for (const idxs of groups.values()) {
+        if (idxs.length <= 1) continue
+        for (const i of idxs) {
+          const cur: any = details[i]
+          if (!cur || typeof cur !== 'object') continue
+          const t = normalizePromptText(cur.title).replace(/\s+/g, '')
+          const hasParams = cur.params && typeof cur.params === 'object' && !Array.isArray(cur.params) && Object.keys(cur.params).length > 0
+          const k = normalizeKind(cur.kind)
+          const score = t.length + (hasParams ? 100 : 0) + (k === 'shield' ? 1000 : 0) + (k === 'reaction' ? 200 : 0)
+          if (score < bestScore) {
+            bestScore = score
+            bestIdx = i
+          }
+        }
+      }
+      if (bestIdx >= 0) {
+        details.splice(bestIdx, 1, d)
+      }
+    }
+
+    const pickCharged = (opts?: { ele?: string; tableRe?: RegExp }): CalcSuggestDetail | null => {
+      const ele = typeof opts?.ele === 'string' ? opts.ele.trim() : ''
+      const re = opts?.tableRe
+      const cands = details.filter((d) => {
+        if (!d || typeof d !== 'object') return false
+        if (normalizeKind(d.kind) !== 'dmg') return false
+        if (d.talent !== 'a') return false
+        const key = typeof (d as any).key === 'string' ? String((d as any).key).trim() : ''
+        const s = `${normalizePromptText(d.title)} ${normalizePromptText(d.table)}`
+        const isCharged = key === 'a2' || /(重击|瞄准|蓄力)/.test(s)
+        if (!isCharged) return false
+        const e0 = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+        if (ele && e0 !== ele) return false
+        if (!ele && e0) return false
+        if (re) {
+          if (!re.test(s)) return false
+        }
+        return true
+      })
+      return cands[0] || null
+    }
+
+    // Q-state charged attack aliases (Noelle-like kits): "开Q重击" + "开Q尾刀".
+    if (qAffectsA) {
+      const loop = pickCharged({ tableRe: /循环|每段/ })
+      const fin = pickCharged({ tableRe: /终结|尾刀|最后/ })
+      if (loop) pushAliasStrong(cloneWithParams(loop, '开Q重击', { q: true }))
+      if (fin) pushAliasStrong(cloneWithParams(fin, '开Q尾刀', { q: true }))
+    }
+
+    // Q-state stat/dmg buffs can affect other talents (e.g. Itto burst ATK bonus affecting E skill).
+    // Add a minimal, explicit showcase row for E damage under Q state so `params.q`-gated upstream buffs are not dead.
+    const qAffectsOther = (descRaw: string): boolean => {
+      const desc = normalizePromptText(descRaw)
+      if (!desc) return false
+      // Common patterns: "...进入XX状态...提高攻击力/造成的伤害提高..."
+      if (/(攻击力).{0,12}(提高|提升|增加)/.test(desc) && /(状态|期间|持续|特性)/.test(desc)) return true
+      if (/(伤害).{0,12}(提高|提升|增加)/.test(desc) && /(状态|期间|持续|特性)/.test(desc)) return true
+      return false
+    }
+    if (qAffectsOther(descQState)) {
+      const eBase = details.find((d) => {
+        if (!d || typeof d !== 'object') return false
+        if (normalizeKind(d.kind) !== 'dmg') return false
+        if (d.talent !== 'e') return false
+        const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+        if (ele) return false
+        const table = normalizePromptText(d.table)
+        if (!table || !/伤害/.test(table)) return false
+        if (/(治疗|护盾|吸收量|持续时间|冷却)/.test(table)) return false
+        return true
+      })
+      if (eBase) {
+        const title = `开Q后${normalizePromptText(eBase.title)}`
+        pushAliasStrong(cloneWithParams(eBase, title, { q: true }))
+      }
+    }
+
+    // E-state charged attack + amp variants (Hu Tao-like kits): add "(半血开E)" rows when supported.
+    if (eAffectsA) {
+      const stateLabel = hasHalfHp ? '半血开E' : '开E'
+      const stateParams: Record<string, number | boolean | string> = { e: true, ...(hasHalfHp ? { halfHp: true } : {}) }
+      const chargedBase: CalcSuggestDetail | null = (() => {
+        const hit = pickCharged()
+        if (hit) return hit
+        // Fallback: synthesize from the selected charged table (core A2 row might not exist yet at this stage).
+        if (!chargedTable) return null
+        const title = chargedTable.endsWith('2') ? chargedTable.slice(0, -1) : chargedTable
+        return { title, kind: 'dmg', talent: 'a', table: chargedTable, key: 'a2' }
+      })()
+      if (chargedBase) {
+        pushAliasStrong(cloneWithParams(chargedBase, `${chargedBase.title}(${stateLabel})`, stateParams))
+      }
+
+      // Charged amp showcase: vaporize/melt variants should also carry the same state params.
+      // If the base amp row was not derived due to the 20-row cap, synthesize it directly from the charged base row.
+      const ensureChargedAmp = (id: 'vaporize' | 'melt'): void => {
+        const existing = pickCharged({ ele: id })
+        if (existing) {
+          pushAliasStrong(cloneWithParams(existing, `${existing.title}(${stateLabel})`, stateParams))
+          return
+        }
+        if (!chargedBase) return
+        if (!gsEleVariant || gsEleVariant.id !== id) return
+        const ampTitle = gsMakeEleTitle(chargedBase.title, gsEleVariant.suffix)
+        const ampRow: CalcSuggestDetail = { ...(chargedBase as any), title: ampTitle, kind: 'dmg', ele: id }
+        pushAliasStrong(cloneWithParams(ampRow, `${ampTitle}(${stateLabel})`, stateParams))
+        gsBuffIdsOut.add(id)
+      }
+      ensureChargedAmp('vaporize')
+      ensureChargedAmp('melt')
+
+      // Skill periodic damage showcases: "E后<表名>" is a common baseline naming convention.
+      const eBase = details.find((d) => {
+        if (!d || typeof d !== 'object') return false
+        if (normalizeKind(d.kind) !== 'dmg') return false
+        if (d.talent !== 'e') return false
+        const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+        if (ele) return false
+        const table = normalizePromptText(d.table)
+        if (!table || !/伤害/.test(table)) return false
+        if (/(治疗|护盾|吸收量|持续时间|冷却)/.test(table)) return false
+        return true
+      })
+      if (eBase) {
+        const tableBase = normalizePromptText(eBase.table)?.replace(/2$/, '') || ''
+        const title = tableBase ? `E后${tableBase}` : `E后${normalizePromptText(eBase.title)}`
+        // Do NOT implicitly enable halfHp here (title does not encode it). Keep it as "E后..." only.
+        gsPushAliasByTitle(cloneWithParams(eBase, title, { e: true }))
+      }
+    }
+  } catch {
+    // best-effort
   }
 
   // 4) Baseline-style multi-hit total rows (e.g. Q激化总伤-10段 / Q总伤害·超激化).

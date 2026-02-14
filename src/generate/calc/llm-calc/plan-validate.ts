@@ -1088,7 +1088,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
   // GS: Prevent low-HP conditional talent tables (e.g. "低血量时...") from being used as normal rows.
   // If the model selects a conditional table but forgets to set params.halfHp, damage can drift by 2x+.
-  if (input.game === 'gs') {
+  if (input.game === 'gs' && !input.upstreamDirect) {
     const isLowHpLike = (s: string): boolean =>
       /(低血|低生命|低于50%|半血|生命值低于|生命值少于)/.test(String(s || ''))
     const stripLowHpMark = (s: string): string =>
@@ -1334,7 +1334,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       const bad = new Set(multiUnitTables.map((x) => `${x.originTalent}:${x.table}`))
       for (let i = details.length - 1; i >= 0; i--) {
         const d = details[i]
-        if (!d || d.kind !== 'dmg') continue
+        if (!d || normalizeKind((d as any).kind) !== 'dmg') continue
         if (!d.talent || !d.table) continue
         if (bad.has(`${d.talent}:${d.table}`)) details.splice(i, 1)
       }
@@ -4115,6 +4115,15 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
     const re = /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b/g
     for (const b of buffsOut) {
+      const title = typeof (b as any)?.title === 'string' ? String((b as any).title).trim() : ''
+      // Upstream-direct node-local premods are intentionally modeled via opt-in params; keep their checks.
+      if (
+        title.startsWith('upstream:genshin-optimizer(node-premod-variant:') ||
+        title.startsWith('upstream:genshin-optimizer(node-premod-row:')
+      ) {
+        continue
+      }
+
       const check = (b as any)?.check
       if (typeof check !== 'string') continue
       const expr = check.trim()
@@ -4899,6 +4908,10 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       // Keep core state gating (e/q/qBuff/break). These are used to align baseline-style showcase assumptions.
       if (/\bparams\.(?:e|q|qBuff|break)\b/.test(expr)) continue
 
+      // Keep row-scoped upstream-direct gating (node-local premods). Dropping this turns row-only buffs
+      // into unconditional global buffs and causes large drift.
+      if (/\bupstream:genshin-optimizer\(node-premod-(?:row|variant):/i.test(String((b as any)?.title || ''))) continue
+
       const title = normalizePromptText((b as any)?.title)
       if (title && isHpConditionTitle(title)) continue
 
@@ -5087,7 +5100,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
 
   // If official hints explicitly grant "<n>%<元素>元素伤害加成", ensure a baseline-style `dmg` buff exists.
   // (LLMs frequently omit these, which can make panel regression drift low by ~40-60% for some accounts.)
-  if (input.game === 'gs') {
+  if (input.game === 'gs' && !input.upstreamDirect) {
     const hints = (input.buffHints || []).filter((s) => typeof s === 'string') as string[]
     // Some sources shorten "火元素伤害加成" -> "火伤加成" (omit "元素" and sometimes "害").
     const elemRe = /(火|水|雷|冰|风|岩|草)(?:元素)?伤(?:害)?加成/g
@@ -5225,6 +5238,16 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       const data = b.data
       if (!data || typeof data !== 'object') continue
       if (!Object.prototype.hasOwnProperty.call(data, 'kx')) continue
+
+      // Upstream-direct node-local premods rely on params-based row gating; never drop their checks.
+      const title = typeof (b as any)?.title === 'string' ? String((b as any).title).trim() : ''
+      if (
+        title.startsWith('upstream:genshin-optimizer(node-premod-variant:') ||
+        title.startsWith('upstream:genshin-optimizer(node-premod-row:')
+      ) {
+        continue
+      }
+
       const check = (b as any).check
       if (typeof check !== 'string') continue
       const expr = check.trim()
@@ -5247,6 +5270,16 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       const keys = Object.keys(data as any).filter((k) => k && !k.startsWith('_'))
       if (!keys.length) continue
       if (!keys.every((k) => safeStatKeys.has(k))) continue
+
+      // Upstream-direct node-local premods rely on params-based row gating; never drop their checks.
+      const title = typeof (b as any)?.title === 'string' ? String((b as any).title).trim() : ''
+      if (
+        title.startsWith('upstream:genshin-optimizer(node-premod-variant:') ||
+        title.startsWith('upstream:genshin-optimizer(node-premod-row:')
+      ) {
+        continue
+      }
+
       const check = (b as any).check
       if (typeof check !== 'string') continue
       const expr = check.trim()
@@ -5332,6 +5365,16 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         if (!data || typeof data !== 'object') continue
         const bases = inferAffectedBases(data as any)
         if (bases.size === 0) continue
+
+        const title = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+        // Upstream-direct node-local premods are modeled as opt-in rows (variant/row-scoped); do NOT auto-propagate
+        // their params to all affected details (otherwise the scoped buff becomes unconditional and inflates base rows).
+        if (
+          title.startsWith('upstream:genshin-optimizer(node-premod-variant:') ||
+          title.startsWith('upstream:genshin-optimizer(node-premod-row:')
+        ) {
+          continue
+        }
 
         const check = typeof (b as any).check === 'string' ? String((b as any).check).trim() : ''
         if (!check || !/params\./.test(check)) continue
@@ -5643,6 +5686,14 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
 
     for (const b of buffsOut) {
+      const title = typeof (b as any)?.title === 'string' ? String((b as any).title).trim() : ''
+      if (
+        title.startsWith('upstream:genshin-optimizer(node-premod-variant:') ||
+        title.startsWith('upstream:genshin-optimizer(node-premod-row:')
+      ) {
+        continue
+      }
+
       const check0 = typeof (b as any).check === 'string' ? String((b as any).check).trim() : ''
       if (!check0 || !/params\./.test(check0)) continue
 
@@ -5763,6 +5814,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     const pruneDerivedNonPlusBuffData = (): void => {
       const usesAttrValue = (expr: string): boolean => /\bcalc\s*\(\s*attr\./.test(expr) || /\battr\.[A-Za-z_]/.test(expr)
       const hasTrustedUpstream = !!(input as any).upstream
+      const isUpstreamDirect = (input as any).upstreamDirect === true
       const isSafeAttrDerivedKey = (kRaw: string): boolean => {
         const k = String(kRaw || '').trim()
         if (!k || k.startsWith('_')) return false
@@ -5780,7 +5832,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
         if (!t) return false
         return /(基于|根据|按|相当于|每点|每\s*1\s*点|超过|超出)/.test(t)
       }
-      const allowsAttr = (k: string, evidenceOk: boolean): boolean => /plus$/i.test(k) || (evidenceOk && isSafeAttrDerivedKey(k))
+      const allowsAttr = (k: string, evidenceOk: boolean): boolean =>
+        /plus$/i.test(k) || isUpstreamDirect || (evidenceOk && isSafeAttrDerivedKey(k))
       const usesTriggeredValueTalentTable = (expr: string): boolean => {
         // Heuristic: buff keys like `heal`/`shield` represent *bonus multipliers* in miao-plugin.
         // Triggered effects (healing amounts / absorption values) are stored in tables named "...回复/固定值/吸收量"
@@ -6441,7 +6494,7 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
   }
 
-  if (input.game === 'gs') {
+  if (input.game === 'gs' && !input.upstreamDirect) {
     // Some characters have passives like:
     // - "技能X造成的伤害提升，提升值相当于元素精通的90%"
     // Baseline usually models this as a *detail-local* flat add (by modifying that specific detail row),
@@ -7169,7 +7222,9 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     const hasQpct = buffsOut.some((b) => !!b.data && Object.prototype.hasOwnProperty.call(b.data, 'qPct'))
     if (!hasQpct) {
       buffsOut.unshift({
-        title: '元素爆发：愿力加成（按 params.type/params.num）',
+        // Keep the wording explicitly damage-related so the conservative GS buff filter
+        // does not drop `qPct` as a non-damage buff.
+        title: '元素爆发：愿力伤害加成（按 params.type/params.num）',
         data: { qPct: '("type" in params ? talent.q["愿力加成"][params.type] * params.num : 0)' }
       })
     }
@@ -7398,9 +7453,10 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
   }
 
-  // GS: If an important E-state buff (gated by `params.e`) affects global stats / A/Q damage,
-  // ensure showcase rows also enable `params.e` (baseline often assumes "E后/开E" rotation for such kits).
-  if (input.game === 'gs') {
+  const patchGsShowcaseParamsEFromBuffs = (): void => {
+    // GS: If an important E-state buff (gated by `params.e`) affects global stats / A/Q damage,
+    // ensure showcase rows also enable `params.e` (baseline often assumes "E后/开E" rotation for such kits).
+    if (input.game !== 'gs') return
     const affectsQ = (data: Record<string, number | string>): boolean => {
       for (const k of Object.keys(data || {})) {
         // Global stats / dmg bonus / enemy modifiers
@@ -7432,16 +7488,29 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       return false
     }
 
-    const needsEOnQ = buffsOut.some((b) => {
+    const refsParamE = (b: CalcSuggestBuff): boolean => {
       const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
-      if (!/\bparams\.e\b/.test(check)) return false
+      if (check && /\bparams\.e\b/.test(check)) return true
+
+      const data = (b as any)?.data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return false
+      for (const v of Object.values(data as Record<string, unknown>)) {
+        if (typeof v !== 'string') continue
+        if (/\bparams\.e\b/.test(v)) return true
+      }
+      return false
+    }
+
+    const needsEOnQ = buffsOut.some((b) => {
+      if (!b || typeof b !== 'object') return false
+      if (!refsParamE(b)) return false
       const data = b.data
       if (!data || typeof data !== 'object') return false
       return affectsQ(data)
     })
     const needsEOnA = buffsOut.some((b) => {
-      const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
-      if (!/\bparams\.e\b/.test(check)) return false
+      if (!b || typeof b !== 'object') return false
+      if (!refsParamE(b)) return false
       const data = b.data
       if (!data || typeof data !== 'object') return false
       return affectsA(data as any)
@@ -7474,6 +7543,8 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
   }
 
+  patchGsShowcaseParamsEFromBuffs()
+
   // SR: Extract "*Plus" (flat additional damage value) buffs from constellation hint text.
   // Many SR profiles use max talent levels that can exceed table lengths in meta (yielding undefined => 0),
   // and baseline calc.js often relies on `aPlus/tPlus/...` to keep showcase rows non-zero.
@@ -7492,8 +7563,66 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   if (input.game === 'gs') {
     applyGsBurstAltAttackKeyMapping(input, details)
     applyGsPostprocess({ input, tables, details, okReactions, gsBuffIdsOut })
+    // GS: postprocess may insert new Q/A rows; patch again to ensure they inherit `params.e` when needed.
+    patchGsShowcaseParamsEFromBuffs()
+    patchGsNodePremodVariantDetailsFromBuffs(details, buffsOut)
     rewriteGsBasePlusPerLayerDetails({ input, tables, details })
+
+    // GS: When a talent table's unit indicates a damage multiplier bucket (e.g. "普通攻击伤害"),
+    // model it as a `*Multi` buff (delta from base 100%) so showcased rows align with baseline semantics.
+    //
+    // Derived purely from official table units + runtime talent values (no baseline code reuse).
+    if (multiUnitTables.length) {
+      const existingMultiKeys = new Set<string>()
+      for (const b of buffsOut) {
+        const data = (b as any)?.data
+        if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+        for (const k of Object.keys(data)) {
+          const kk = String(k || '').trim()
+          if (kk && /Multi$/.test(kk)) existingMultiKeys.add(kk)
+        }
+      }
+
+      // Group by (multiKey,stateFlag) and only auto-model unambiguous cases (single source table).
+      const groups = new Map<string, typeof multiUnitTables>()
+      for (const m of multiUnitTables) {
+        if (!m || !m.multiKey) continue
+        if (!m.stateFlag) continue
+        // If the plan already provided this multiKey, avoid double-counting.
+        if (existingMultiKeys.has(m.multiKey)) continue
+        const gk = `${m.multiKey}:${m.stateFlag}`
+        const list = groups.get(gk) || []
+        list.push(m)
+        groups.set(gk, list)
+      }
+
+      const data: Record<string, string> = {}
+      for (const list of groups.values()) {
+        if (!Array.isArray(list) || list.length !== 1) continue
+        const m = list[0]!
+        const tk = m.originTalent
+        const tn = m.table
+        if (!tk || !tn) continue
+        if (!tables[tk]?.includes(tn)) continue
+
+        const base = `talent.${tk}[${JSON.stringify(tn)}]`
+        const scalar = `(Array.isArray(${base}) ? ${base}[0] : ${base})`
+        // `*Multi` keys are stored as delta from base 100%.
+        const delta = `(${scalar} - 100)`
+        const gated = `(params.${m.stateFlag} ? ${delta} : 0)`
+        data[m.multiKey] = gated
+      }
+
+      if (Object.keys(data).length) {
+        buffsOut.unshift({
+          title: '倍率表乘区（来自天赋表单位）',
+          data
+        })
+      }
+    }
+
     patchGsBuffGateFieldsFromTitles(buffsOut)
+    rewriteGsBuffStatScalingConstRatiosToTalentTables(input, buffsOut)
   }
 
   // SR: normalize multi-target titles and fill a few baseline-like showcase rows (generic, no per-character hardcode).
@@ -7575,6 +7704,49 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     }
   }
 
+  // GS: Ensure reaction-variant dmg rows have reaction-aware titles (prevents mismatching plain vs reaction rows).
+  if (input.game === 'gs') {
+    const map: Record<string, string> = {
+      vaporize: '蒸发',
+      melt: '融化',
+      spread: '蔓激化',
+      aggravate: '超激化'
+    }
+    for (const d of details) {
+      if (!d || typeof d !== 'object') continue
+      if (normalizeKind((d as any).kind) !== 'dmg') continue
+      const eleRaw = typeof (d as any).ele === 'string' ? String((d as any).ele).trim() : ''
+      const ele = eleRaw ? eleRaw.toLowerCase() : ''
+      const cn = map[ele]
+      if (!cn) continue
+      if (typeof (d as any).title !== 'string') continue
+      let title = String((d as any).title).trim()
+      if (!title) continue
+
+      // Normalize ambiguous "激化" wording into the specific reaction name when possible.
+      if (ele === 'spread' && !title.includes('蔓激化') && title.includes('激化') && !title.includes('超激化')) {
+        title = title.replace(/激化/g, '蔓激化')
+      }
+      if (ele === 'aggravate' && !title.includes('超激化') && title.includes('激化') && !title.includes('蔓激化')) {
+        title = title.replace(/激化/g, '超激化')
+      }
+
+      if (title.includes(cn)) {
+        ;(d as any).title = title
+        continue
+      }
+
+      // Prefer baseline-like suffix forms.
+      if (/伤害$/.test(title)) {
+        if (ele === 'spread' || ele === 'aggravate') title = title.replace(/伤害$/, `·${cn}`)
+        else title = title.replace(/伤害$/, cn)
+      } else {
+        title = `${title}${cn}`
+      }
+      ;(d as any).title = title
+    }
+  }
+
   // GS: Final param fixups (run late so rows inserted by any GS postprocess are covered).
   if (input.game === 'gs') {
     const isLowHpLike = (s: string): boolean => /(低血|低生命|低于50%|半血|生命值低于|生命值少于)/.test(normalizePromptText(s))
@@ -7589,26 +7761,6 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
       if (!Object.prototype.hasOwnProperty.call(p, 'halfHp')) p.halfHp = true
       ;(d as any).params = p
     }
-
-    // 2) If any buff is gated by `params.e`, enable `params.e=true` for A/Q dmg rows by default (showcase rotation).
-    const hasECheckedBuff = buffsOut.some((b) => {
-      const check = typeof (b as any)?.check === 'string' ? String((b as any).check) : ''
-      return /\bparams\.e\b/.test(check)
-    })
-    if (hasECheckedBuff) {
-      for (const d of details) {
-        if (!d || typeof d !== 'object') continue
-        if (normalizeKind((d as any).kind) !== 'dmg') continue
-        const tk = typeof (d as any).talent === 'string' ? String((d as any).talent).trim() : ''
-        if (tk !== 'a' && tk !== 'q') continue
-        const p0 = (d as any).params
-        const p: Record<string, any> =
-          p0 && typeof p0 === 'object' && !Array.isArray(p0) ? { ...(p0 as Record<string, any>) } : {}
-        if (Object.prototype.hasOwnProperty.call(p, 'e')) continue
-        p.e = true
-        ;(d as any).params = p
-      }
-    }
   }
 
   const buffsFinal: Array<CalcSuggestBuff | string> = []
@@ -7618,6 +7770,89 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
   buffsFinal.push(...buffsOut)
 
   return { mainAttr, defDmgKey, details, buffs: buffsFinal }
+}
+
+function patchGsNodePremodVariantDetailsFromBuffs(details: CalcSuggestDetail[], buffs: CalcSuggestBuff[]): void {
+  try {
+    if (!Array.isArray(details) || details.length === 0) return
+    if (!Array.isArray(buffs) || buffs.length === 0) return
+
+    const existingParams = new Set<string>()
+    for (const d of details) {
+      const p = (d as any)?.params
+      if (!p || typeof p !== 'object' || Array.isArray(p)) continue
+      for (const k of Object.keys(p)) {
+        const kk = String(k || '').trim()
+        if (kk) existingParams.add(kk)
+      }
+    }
+
+    const preferEle = new Set(['vaporize', 'melt', 'aggravate', 'spread'])
+    let inserted = 0
+
+    for (const b of buffs) {
+      if (!b || typeof b !== 'object') continue
+      const title = typeof (b as any).title === 'string' ? String((b as any).title).trim() : ''
+      if (!title.startsWith('upstream:genshin-optimizer(node-premod-variant:')) continue
+
+      const check = typeof (b as any).check === 'string' ? String((b as any).check) : ''
+      const mParam = /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b/.exec(check)
+      const paramKey = String(mParam?.[1] || '').trim()
+      if (!paramKey) continue
+      if (existingParams.has(paramKey)) continue
+
+      const data = (b as any).data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+      const keys = Object.keys(data).map((k) => String(k || '').trim())
+      const bucket = keys.some((k) => /^e[A-Z]/.test(k)) ? 'e' : keys.some((k) => /^q[A-Z]/.test(k)) ? 'q' : ''
+      if (!bucket) continue
+
+      const candidates = details.filter((d) => {
+        if (!d || typeof d !== 'object') return false
+        if (String((d as any).talent || '').trim() !== bucket) return false
+        const kind = normalizeKind((d as any).kind)
+        if (kind === 'heal' || kind === 'shield' || kind === 'reaction') return false
+        return true
+      })
+      if (!candidates.length) continue
+
+      const pick = (() => {
+        for (const d of candidates) {
+          const ele = typeof (d as any).ele === 'string' ? String((d as any).ele).trim().toLowerCase() : ''
+          if (ele && preferEle.has(ele)) return d
+          const t = String((d as any).title || '')
+          if (/蒸发|融化|超激化|蔓激化/.test(t)) return d
+        }
+        return candidates[0]!
+      })()
+
+      const baseIdx = details.indexOf(pick)
+      if (baseIdx < 0) continue
+
+      const p0 = (pick as any).params
+      const p: Record<string, number | boolean | string> =
+        p0 && typeof p0 === 'object' && !Array.isArray(p0) ? ({ ...(p0 as any) } as any) : ({} as any)
+      if (Object.prototype.hasOwnProperty.call(p, paramKey)) continue
+      p[paramKey] = true
+
+      const label = paramKey.replace(/^node_/, '')
+      const next: CalcSuggestDetail = {
+        ...(pick as any),
+        title: `${String((pick as any).title || bucket.toUpperCase())}(${label || 'variant'})`,
+        params: p as any
+      }
+      if (typeof (b as any).cons === 'number' && Number.isFinite((b as any).cons)) (next as any).cons = (b as any).cons
+      if (typeof (b as any).tree === 'number' && Number.isFinite((b as any).tree)) (next as any).tree = (b as any).tree
+
+      details.splice(baseIdx + 1, 0, next)
+      existingParams.add(paramKey)
+      inserted++
+      while (details.length > 20) details.pop()
+      if (inserted >= 6) break
+    }
+  } catch {
+    // best-effort
+  }
 }
 
 function patchSrVariantStateParamsFromBuffs(details: CalcSuggestDetail[], buffs: CalcSuggestBuff[]): void {
@@ -7670,6 +7905,117 @@ function patchSrVariantStateParamsFromBuffs(details: CalcSuggestDetail[], buffs:
         changed = true
       }
       if (changed) (d as any).params = p as any
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+function rewriteGsBuffStatScalingConstRatiosToTalentTables(input: CalcSuggestInput, buffs: CalcSuggestBuff[]): void {
+  try {
+    if (input.game !== 'gs') return
+    if (!buffs.length) return
+
+    const unitsAll = (input.tableUnits || {}) as any
+    const valuesAll = (input.tableValues || {}) as any
+    if (!valuesAll || typeof valuesAll !== 'object') return
+
+    type Cand = { tk: string; table: string; stat: 'atk' | 'def' | 'hp'; values: number[] }
+    const cands: Cand[] = []
+
+    const norm = (s: unknown): string => normalizePromptText(String(s || ''))
+    const unitToStat = (uRaw: unknown): 'atk' | 'def' | 'hp' | null => {
+      const u = norm(uRaw)
+      if (!u) return null
+      if (/(生命值上限|最大生命值|生命值|\bhp\b)/i.test(u)) return 'hp'
+      if (/(防御力|防御|\bdef\b)/i.test(u)) return 'def'
+      if (/(攻击力|攻击|\batk\b)/i.test(u)) return 'atk'
+      return null
+    }
+
+    const isBuffLikeTable = (tRaw: string): boolean => {
+      const t = norm(tRaw)
+      if (!t) return false
+      // Only rewrite when the table name is clearly a buff table (avoid mapping to raw damage tables).
+      return /(提高|提升|增加|降低|减少|加成)/.test(t)
+    }
+
+    for (const [tk0, tableMapRaw] of Object.entries(valuesAll)) {
+      const tk = String(tk0 || '').trim()
+      if (!tk) continue
+      if (!/^[aeqt]$/.test(tk)) continue
+      if (!tableMapRaw || typeof tableMapRaw !== 'object' || Array.isArray(tableMapRaw)) continue
+      const unitMap = unitsAll?.[tk] || {}
+
+      for (const [table0, arrRaw] of Object.entries(tableMapRaw as Record<string, unknown>)) {
+        const table = String(table0 || '').trim()
+        const arr = Array.isArray(arrRaw) ? (arrRaw as unknown[]) : []
+        if (!table || arr.length < 5) continue
+        if (!isBuffLikeTable(table)) continue
+        const nums = arr.map((v) => Number(v)).filter((n) => Number.isFinite(n)) as number[]
+        if (nums.length < 5) continue
+        const stat = unitToStat(unitMap?.[table])
+        if (!stat) continue
+        cands.push({ tk, table, stat, values: nums })
+      }
+    }
+
+    if (!cands.length) return
+
+    const tol = 0.35 // percent points
+    const findTableForPct = (stat: 'atk' | 'def' | 'hp', pct: number): Cand | null => {
+      let best: Cand | null = null
+      let hits = 0
+      for (const c of cands) {
+        if (c.stat !== stat) continue
+        if (!c.values.some((v) => Math.abs(v - pct) <= tol)) continue
+        hits++
+        best = c
+        if (hits > 1) return null
+      }
+      return best
+    }
+
+    const rewriteExpr = (exprRaw: unknown): unknown => {
+      if (typeof exprRaw !== 'string') return exprRaw
+      let expr = String(exprRaw)
+      if (!expr.trim()) return exprRaw
+
+      // Detect simple linear stat scaling like `1.368 * calc(attr.def)` where 1.368 is max-level ratio.
+      const re =
+        /(?:\(\s*)?(\d+(?:\.\d+)?)(?:\s*\))?\s*\*\s*(?:\(\s*)?calc\s*\(\s*attr\.(hp|def|atk)\s*\)\s*(?:\)\s*)?/g
+      expr = expr.replace(re, (full, cRaw, statRaw) => {
+        const c = Number(cRaw)
+        const stat = String(statRaw || '').trim() as any
+        if (!Number.isFinite(c) || c <= 0) return full
+        // Avoid rewriting integer multipliers (too ambiguous).
+        if (!String(cRaw).includes('.')) return full
+        if (stat !== 'hp' && stat !== 'def' && stat !== 'atk') return full
+        const pct = c * 100
+        if (!Number.isFinite(pct) || pct <= 0 || pct > 500) return full
+
+        const hit = findTableForPct(stat, pct)
+        if (!hit) return full
+        const ref = `toRatio(talent.${hit.tk}[${JSON.stringify(hit.table)}])`
+        return full.replace(cRaw, ref)
+      })
+
+      return expr
+    }
+
+    for (const b of buffs) {
+      if (!b || typeof b !== 'object') continue
+      const data = (b as any).data
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+      let changed = false
+      for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+        const vv = rewriteExpr(v)
+        if (vv !== v) {
+          ;(data as any)[k] = vv as any
+          changed = true
+        }
+      }
+      if (changed) (b as any).data = data
     }
   } catch {
     // best-effort

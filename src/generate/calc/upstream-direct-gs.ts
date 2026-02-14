@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import type { CalcSuggestBuff } from './llm-calc/types.js'
+import type { CalcSuggestBuff, CalcSuggestInput } from './llm-calc/types.js'
 import { isAllowedMiaoBuffDataKey } from './llm-calc/utils.js'
 import { buildCalcUpstreamContext } from './upstream-follow/context.js'
 
@@ -9,6 +9,38 @@ function resolveMaybeRelative(projectRootAbs: string, p: string | undefined): st
   const t = typeof p === 'string' ? p.trim() : ''
   if (!t) return undefined
   return path.isAbsolute(t) ? t : path.resolve(projectRootAbs, t)
+}
+
+function resolveTravelerCharSheetFileAbs(opts: {
+  genshinOptimizerRootAbs: string
+  elem: string
+  input?: CalcSuggestInput
+}): string | null {
+  const name = typeof opts.input?.name === 'string' ? opts.input.name.trim() : ''
+  // Baseline meta models traveler per-element under a unified name/id (e.g. `旅行者/anemo` with id=7).
+  // genshin-optimizer splits traveler by element + gender: TravelerAnemoM/F, ...
+  // We pick the male variant deterministically; gameplay numbers are identical across genders.
+  if (!name || (name !== '旅行者' && name !== 'Traveler' && !/旅行者/.test(name))) return null
+
+  const elem = String(opts.elem || '').trim().toLowerCase()
+  const map: Record<string, string> = {
+    anemo: 'Anemo',
+    geo: 'Geo',
+    electro: 'Electro',
+    dendro: 'Dendro',
+    hydro: 'Hydro',
+    pyro: 'Pyro'
+  }
+  const suffix = map[elem]
+  if (!suffix) return null
+
+  // Traveler sheets are split:
+  // - `Traveler{Elem}{M|F}/index.tsx` is a tiny wrapper importing the real implementation under `Traveler{Elem}F/<elem>.tsx`.
+  // For upstream-direct extraction we need the implementation file because it contains `dataObjForCharacterSheet(...)` blocks.
+  const dir = path.join(opts.genshinOptimizerRootAbs, 'libs', 'gi', 'sheets', 'src', 'Characters', `Traveler${suffix}F`)
+  const fileAbs = path.join(dir, `${elem}.tsx`)
+  if (fs.existsSync(fileAbs)) return fileAbs
+  return null
 }
 
 const allStatsCache = new Map<string, any>()
@@ -144,6 +176,65 @@ function parseDmConstNumbers(dmBlock: string): Map<string, number> {
   return out
 }
 
+function maxNumberDeep(v: unknown): number | null {
+  let max: number | null = null
+  const walk = (x: unknown): void => {
+    if (typeof x === 'number' && Number.isFinite(x)) {
+      max = max == null ? x : Math.max(max, x)
+      return
+    }
+    if (Array.isArray(x)) {
+      for (const it of x) walk(it)
+      return
+    }
+    if (x && typeof x === 'object') {
+      for (const it of Object.values(x as Record<string, unknown>)) walk(it)
+    }
+  }
+  walk(v)
+  return max
+}
+
+function augmentDmConstNumbersWithComputedArrays(dmBlock: string, skillParam: any, dmConstNums: Map<string, number>): void {
+  if (!dmBlock) return
+  if (!skillParam || typeof skillParam !== 'object') return
+
+  const stack: string[] = []
+  const lines = dmBlock.split(/\r?\n/)
+  for (const line0 of lines) {
+    const line = line0.trim()
+    if (!line) continue
+
+    const openObj = /^([A-Za-z0-9_]+)\s*:\s*{\s*$/.exec(line)
+    if (openObj) {
+      stack.push(openObj[1]!)
+      continue
+    }
+
+    // Common upstream pattern for "tally element count" arrays:
+    //   hp_Arr: [0, ...skillParam_gen.passive1.map(([a]) => a)],
+    // We approximate this as the max numeric entry in the referenced skillParam section.
+    const mMapSpread =
+      /^([A-Za-z0-9_]+)\s*:\s*\[\s*([+-]?\d+(?:\.\d+)?)\s*,\s*\.\.\.\s*skillParam_gen\.([A-Za-z0-9_]+)\.map\s*\(/.exec(
+        line
+      )
+    if (mMapSpread) {
+      const prop = mMapSpread[1]!
+      const head = Number(mMapSpread[2])
+      const section = mMapSpread[3]!
+      const max = maxNumberDeep((skillParam as any)?.[section])
+      const picked = [Number.isFinite(head) ? head : null, max].filter((x) => typeof x === 'number') as number[]
+      if (picked.length) {
+        const fullPath = [...stack, prop].join('.')
+        if (!dmConstNums.has(fullPath)) dmConstNums.set(fullPath, Math.max(...picked))
+      }
+    }
+
+    const closeCount = (line.match(/}/g) || []).length
+    for (let i = 0; i < closeCount; i++) stack.pop()
+  }
+}
+
 function parseConstExprs(text: string): Map<string, ConstExpr> {
   const out = new Map<string, ConstExpr>()
   for (const line0 of text.split(/\r?\n/)) {
@@ -165,6 +256,12 @@ function mapPremodKeyToMiaoBuffKey(elem: string, key: string): string | null {
   const e = elem.trim().toLowerCase()
   if (k === `${e}_dmg_`) return 'dmg'
   if (k === 'dmg_' || k === 'all_dmg_') return 'dmg'
+  // Enemy resistance shred (e.g. `pyro_enemyRes_`, `cryo_enemyRes_`):
+  // baseline meta models these as `[kx]%减抗` (positive percent points).
+  if (k.endsWith('_enemyRes_')) {
+    if (k === `${e}_enemyRes_`) return 'kx'
+    return null
+  }
   if (k === 'dmgInc' || k === 'all_dmgInc') return 'dmgPlus'
   if (k === 'physical_dmg_') return 'phy'
   if (k === 'eleMas') return 'mastery'
@@ -511,6 +608,10 @@ function normalizeExprGs(exprRaw: string): string {
   expr = expr.replace(/\binput\.total\.critRate_\b/g, '(calc(attr.cpct) / 100)')
   expr = expr.replace(/\binput\.total\.critDMG_\b/g, '(calc(attr.cdmg) / 100)')
   expr = expr.replace(/\binput\.total\.heal_\b/g, '(calc(attr.heal) / 100)')
+  expr = expr.replace(/\binput\.premod\.enerRech_\b/g, '(calc(attr.recharge) / 100)')
+  expr = expr.replace(/\binput\.premod\.critRate_\b/g, '(calc(attr.cpct) / 100)')
+  expr = expr.replace(/\binput\.premod\.critDMG_\b/g, '(calc(attr.cdmg) / 100)')
+  expr = expr.replace(/\binput\.premod\.heal_\b/g, '(calc(attr.heal) / 100)')
   // Best-effort: miao-plugin does not distinguish premod vs total; map both to total panel stats.
   expr = expr.replace(/\binput\.premod\.atk\b/g, 'calc(attr.atk)')
   expr = expr.replace(/\binput\.premod\.hp\b/g, 'calc(attr.hp)')
@@ -539,6 +640,21 @@ function extractExprUntilStatementEnd(text: string, startIdx: number): { expr: s
     }
     if (ch === '"' || ch === "'" || ch === '`') {
       inStr = ch
+      continue
+    }
+    // Skip JS comments so stray parens/braces inside comments don't break depth tracking
+    // (common in GO sheets: `// ... :(`).
+    const next = text[i + 1]
+    if (ch === '/' && next === '/') {
+      i += 2
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++
+      i -= 1
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < text.length - 1 && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i += 1
       continue
     }
     if (ch === '(' || ch === '[' || ch === '{') depth++
@@ -820,6 +936,435 @@ function extractTopLevelObjectPropBlock(objText: string, propNameRaw: string): s
   return ''
 }
 
+function extractCallArgsWithRange(text: string, openParenIdx: number): { args: string[]; endIdx: number } | null {
+  if (openParenIdx < 0 || openParenIdx >= text.length) return null
+  if (text[openParenIdx] !== '(') return null
+
+  const args: string[] = []
+  let start = openParenIdx + 1
+  let depthParen = 0
+  let depthBrace = 0
+  let depthBracket = 0
+  let inStr: '"' | "'" | '`' | null = null
+
+  for (let i = openParenIdx + 1; i < text.length; i++) {
+    const ch = text[i]!
+    if (inStr) {
+      if (ch === '\\') {
+        i++
+        continue
+      }
+      if (ch === inStr) inStr = null
+      continue
+    }
+
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch
+      continue
+    }
+
+    if (ch === '(') {
+      depthParen++
+      continue
+    }
+    if (ch === ')') {
+      if (depthParen === 0) {
+        const last = text.slice(start, i).trim()
+        if (last) args.push(last)
+        return { args, endIdx: i }
+      }
+      depthParen--
+      continue
+    }
+    if (ch === '{') {
+      depthBrace++
+      continue
+    }
+    if (ch === '}') {
+      if (depthBrace > 0) depthBrace--
+      continue
+    }
+    if (ch === '[') {
+      depthBracket++
+      continue
+    }
+    if (ch === ']') {
+      if (depthBracket > 0) depthBracket--
+      continue
+    }
+
+    if (ch === ',' && depthParen === 0 && depthBrace === 0 && depthBracket === 0) {
+      args.push(text.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+
+  return null
+}
+
+function unquoteLiteral(text: string): string {
+  const t = String(text || '').trim()
+  if (t.length >= 2) {
+    const q = t[0]
+    if ((q === "'" || q === '"' || q === '`') && t.endsWith(q)) return t.slice(1, -1)
+  }
+  return t
+}
+
+function matchMetaTableNameByPctValues(upstreamPct: number[], tableValues: Record<string, number[]>): string | null {
+  const up = Array.isArray(upstreamPct) ? upstreamPct : []
+  if (up.length === 0) return null
+
+  const tryScale = (scale: number): string | null => {
+    let bestName = ''
+    let bestScore = Number.POSITIVE_INFINITY
+    let ties = 0
+
+    for (const [name, metaPct] of Object.entries(tableValues || {})) {
+      if (!name) continue
+      if (!Array.isArray(metaPct) || metaPct.length === 0) continue
+      if (metaPct.length !== up.length) continue
+
+      const n = Math.min(5, up.length)
+      let sum = 0
+      let ok = true
+      for (let i = 0; i < n; i++) {
+        const a = metaPct[i]!
+        const b0 = up[i]!
+        const b = b0 * scale
+        if (typeof a !== 'number' || !Number.isFinite(a) || !Number.isFinite(b)) {
+          ok = false
+          break
+        }
+        const diff = Math.abs(a - b)
+        // Meta talentData values are typically rounded to 2 decimals; upstream skillParam has 4-6 decimals.
+        if (diff > 0.2) {
+          ok = false
+          break
+        }
+        sum += diff
+      }
+      if (!ok) continue
+
+      if (sum < bestScore - 1e-9) {
+        bestName = name
+        bestScore = sum
+        ties = 1
+        continue
+      }
+      if (Math.abs(sum - bestScore) < 1e-9) ties++
+    }
+
+    if (!bestName) return null
+    if (ties > 1) return null
+    return bestName
+  }
+
+  // In genshin-optimizer, skillParam multipliers are usually stored as ratios (e.g. 0.7296 for 72.96%),
+  // while our meta talent tables use percent points (e.g. 72.96). Try both to map deterministically.
+  return tryScale(1) || tryScale(100)
+}
+
+function extractNodeLocalPremodBuffsFromDmgNodes(opts: {
+  text: string
+  elem: string
+  charKey?: string
+  constInits: Map<string, string>
+  dmMap: Map<string, string>
+  dmConstNums: Map<string, number>
+  skillParam: any
+  condVarInfo: Map<string, CondVarInfo>
+  tableValues?: Partial<Record<string, Record<string, number[]>>>
+  globalKeys: Set<string>
+}): CalcSuggestBuff[] {
+  // Node-local `premod` blocks in GO are row-scoped, while miao-plugin only provides a coarse, row-agnostic
+  // buff system. Conservative default:
+  // - If a multiplier ref appears in both "plain" and "premod" variants, skip the premod one to avoid
+  //   globally over-buffing the base row (e.g. Amber C2 manual detonation).
+  // - Otherwise, merge into a best-effort global skill/burst bucket.
+  const dataOut: Record<string, number | string> = {}
+  const variantByParamKey = new Map<string, CalcSuggestBuff>()
+  const rowByParamKey = new Map<string, CalcSuggestBuff>()
+
+  type CallInfo = {
+    fn: 'dmgNode' | 'splitScaleDmgNode'
+    talentKey: 'e' | 'q'
+    multRef: string
+    hasPremod: boolean
+    additionalText: string
+    premodBlocks: string[]
+  }
+
+  const resolveInline = (raw: string): string => {
+    let s = String(raw || '').trim().replace(/,$/, '')
+    if (!s) return ''
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(s)) {
+      const init = opts.constInits.get(s)
+      if (init) s = String(init || '').trim().replace(/,$/, '')
+    }
+    return s
+  }
+
+  const resolveUpstreamPctValues = (multRefRaw: string): number[] | null => {
+    const multRef = String(multRefRaw || '').trim()
+    if (!multRef) return null
+    const dmRef = /^dm\.([A-Za-z0-9_.]+)$/.exec(multRef)
+    if (!dmRef) return null
+    const dmPath = dmRef[1]!
+    const access = opts.dmMap.get(dmPath)
+    if (!access) return null
+    const raw = getSkillParamValue(opts.skillParam, access)
+    if (Array.isArray(raw)) {
+      const arr = raw
+        .map((x) => Number(x))
+        .filter((n) => typeof n === 'number' && Number.isFinite(n))
+      return arr.length ? arr : null
+    }
+    if (typeof raw === 'number' && Number.isFinite(raw)) return [raw]
+    const n = Number(raw)
+    if (Number.isFinite(n)) return [n]
+    return null
+  }
+
+  const resolveMetaTableName = (c: CallInfo): string | null => {
+    const tvRaw = opts.tableValues?.[c.talentKey]
+    const tv = tvRaw && typeof tvRaw === 'object' ? (tvRaw as Record<string, number[]>) : null
+    if (!tv || Object.keys(tv).length === 0) return null
+    const upstreamPct = resolveUpstreamPctValues(c.multRef)
+    if (!upstreamPct || upstreamPct.length === 0) return null
+    return matchMetaTableNameByPctValues(upstreamPct, tv)
+  }
+
+  const ensureRowBuff = (c: CallInfo): CalcSuggestBuff | null => {
+    const table = resolveMetaTableName(c)
+    if (!table) return null
+    const paramKey = sanitizeParamKey(`node_${c.talentKey}_${c.fn}_${c.multRef}`)
+    if (!paramKey) return null
+    const existing = rowByParamKey.get(paramKey)
+    if (existing) return existing
+    const b: CalcSuggestBuff = {
+      title: `upstream:genshin-optimizer(node-premod-row:${c.talentKey}:${table})`,
+      check: `params.${paramKey} === true`,
+      data: {}
+    }
+    ;(b as any).__applyTo = { game: 'gs', talentKey: c.talentKey, table, paramKey }
+    rowByParamKey.set(paramKey, b)
+    return b
+  }
+
+  const calls: CallInfo[] = []
+
+  const extractPremodBlocksFromAdditionalText = (additionalTextRaw: string): string[] => {
+    const out: string[] = []
+    const additionalText = resolveInline(additionalTextRaw || '')
+
+    const direct = extractTopLevelObjectPropBlock(additionalText, 'premod')
+    if (direct) out.push(direct)
+
+    // Handle common GO pattern: `{ ...something, ...extraBuffObj }` where `extraBuffObj` is a const object
+    // like `{ premod: { critDMG_: ... } }`.
+    for (const m of additionalText.matchAll(/\.\.\.\s*([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+      const name = String(m[1] || '').trim()
+      if (!name) continue
+      const init = resolveInline(name)
+      if (!init) continue
+
+      // Object-spread alias: `{ ...foo }` -> `foo`
+      const spread = /^\{\s*\.\.\.\s*([^}]+?)\s*}\s*$/.exec(init)
+      const resolved = spread ? resolveInline(spread[1]!) : init
+      if (!resolved) continue
+
+      const b = extractTopLevelObjectPropBlock(resolved, 'premod')
+      if (b) out.push(b)
+    }
+
+    return out
+  }
+
+  const scan = (fn: CallInfo['fn']): void => {
+    let from = 0
+    while (true) {
+      const idx = opts.text.indexOf(`${fn}(`, from)
+      if (idx < 0) break
+      const openParenIdx = opts.text.indexOf('(', idx)
+      if (openParenIdx < 0) break
+
+      const call = extractCallArgsWithRange(opts.text, openParenIdx)
+      if (!call) {
+        from = openParenIdx + 1
+        continue
+      }
+      from = call.endIdx + 1
+
+      const args = call.args
+      // dmgNode(base, lvlMultiplier, move, additional?, ...)
+      // splitScaleDmgNode(bases, lvlMultipliers, move, additional?, ...)
+      if (args.length < 3) continue
+      const move = unquoteLiteral(args[2] || '')
+      const overrideTalentType = unquoteLiteral(args[5] || '')
+      const talentType =
+        overrideTalentType === 'skill' || overrideTalentType === 'burst'
+          ? overrideTalentType
+          : move === 'skill' || move === 'burst'
+            ? move
+            : ''
+      const talentKey = talentType === 'skill' ? 'e' : talentType === 'burst' ? 'q' : ''
+      if (!talentKey) continue
+
+      const multRef = resolveInline(args[1] || '') || String(args[1] || '').trim()
+      const additionalText = resolveInline(args[3] || '')
+      const premodBlocks = additionalText ? extractPremodBlocksFromAdditionalText(additionalText) : []
+      const hasPremod = premodBlocks.length > 0
+
+      calls.push({ fn, talentKey, multRef, hasPremod, additionalText, premodBlocks })
+    }
+  }
+
+  scan('dmgNode')
+  scan('splitScaleDmgNode')
+
+  const groups = new Map<string, { hasPlain: boolean; hasPremod: boolean }>()
+  for (const c of calls) {
+    const gk = `${c.fn}:${c.talentKey}:${c.multRef}`
+    const cur = groups.get(gk) || { hasPlain: false, hasPremod: false }
+    if (c.hasPremod) cur.hasPremod = true
+    else cur.hasPlain = true
+    groups.set(gk, cur)
+  }
+
+  for (const c of calls) {
+    if (!c.hasPremod) continue
+    const gk = `${c.fn}:${c.talentKey}:${c.multRef}`
+    const g = groups.get(gk)
+    const isVariant = Boolean(g?.hasPlain)
+
+    const premodEntries = c.premodBlocks.flatMap((b) => parseObjectLiteralEntries(b))
+    if (!premodEntries.length) continue
+
+    const rowBuff = !isVariant ? ensureRowBuff(c) : null
+
+    const inferVariant = (): { paramKey: string; cons?: number } => {
+      let cons: number | undefined
+      let hint = ''
+      for (const e of premodEntries) {
+        const raw = String(e?.value || '')
+        const m = /\bdm\.([A-Za-z0-9_.]+)\b/.exec(raw)
+        if (!m) continue
+        const path = String(m[1] || '').trim()
+        if (!path) continue
+        const mc = /\bconstellation(\d+)\b/i.exec(path)
+        if (mc) {
+          const n = Number(mc[1])
+          if (Number.isFinite(n) && n > 0) cons = Math.trunc(n)
+        }
+        const segs = path.split('.').map((s) => s.trim()).filter(Boolean)
+        hint = segs.length ? segs[segs.length - 1]! : hint
+        if (hint) break
+      }
+      const base = `${c.talentKey}_${cons ? `c${cons}_` : ''}${hint || 'premod'}`
+      const paramKey = sanitizeParamKey(`node_${base}`)
+      return { paramKey, cons }
+    }
+
+    const variant = isVariant ? inferVariant() : null
+    const variantBuff = (() => {
+      if (!variant?.paramKey) return null
+      const existing = variantByParamKey.get(variant.paramKey)
+      if (existing) return existing
+      const b: CalcSuggestBuff = {
+        title: `upstream:genshin-optimizer(node-premod-variant:${variant.paramKey})`,
+        check: `params.${variant.paramKey} === true`,
+        data: {}
+      }
+      if (typeof variant.cons === 'number' && Number.isFinite(variant.cons) && variant.cons > 0) (b as any).cons = variant.cons
+      variantByParamKey.set(variant.paramKey, b)
+      return b
+    })()
+
+    for (const e of premodEntries) {
+      const rawKey = String(e.key || '').trim()
+      if (!rawKey) continue
+      // Keep talent-scoped keys aligned, but allow generic stat keys (critRate_/critDMG_/atk_/...) for any.
+      if (c.talentKey === 'e' && /^burst_/i.test(rawKey)) continue
+      if (c.talentKey === 'q' && /^skill_/i.test(rawKey)) continue
+
+      const buffKey = mapPremodKeyToMiaoBuffKey(opts.elem, rawKey)
+      if (!buffKey) continue
+      if (!isAllowedMiaoBuffDataKey('gs', buffKey)) continue
+      // Fallback-only: do not override global premod.
+      if (opts.globalKeys.has(buffKey)) continue
+
+      const expr = translateGsExpr(e.value, {
+        constInits: opts.constInits,
+        dmMap: opts.dmMap,
+        dmConstNums: opts.dmConstNums,
+        skillParam: opts.skillParam,
+        condVarInfo: opts.condVarInfo,
+        charKey: opts.charKey,
+        elem: opts.elem
+      })
+      if (!expr) continue
+
+      const scaled = scaleExpr(expr, buffScale(buffKey))
+      if (typeof scaled === 'number') {
+        if (!Number.isFinite(scaled) || scaled === 0) continue
+      } else {
+        const t = String(scaled || '').trim()
+        if (!t || t === '0' || t === '(0)') continue
+        if (/\.\.\./.test(t)) continue
+        if (hasUnknownFreeIdentifiers(t)) continue
+      }
+
+      // Some upstream `*dmgInc` nodes are modeled as additive flat damage tied to EM (e.g. +EM*12),
+      // which is typically applied only to specific dmgNode rows and cannot be safely represented as
+      // a global `ePlus/qPlus` buff in miao-plugin (no table-level gating). Skip to avoid over-buffing
+      // unrelated rows (baseline often encodes these directly in the matching detail formula).
+      if ((buffKey === 'ePlus' || buffKey === 'qPlus') && typeof scaled === 'string') {
+        if (/\bcalc\s*\(\s*attr\.mastery\s*\)/.test(scaled) || /\battr\.mastery\b/.test(scaled)) {
+          // Keep only when we can scope the buff to a specific table row; otherwise we'd over-buff all E/Q rows.
+          if (!rowBuff && !(isVariant && variantBuff)) continue
+        }
+      }
+
+      const sink = (() => {
+        if (isVariant && variantBuff) return (variantBuff as any).data as Record<string, number | string>
+        if (rowBuff) return (rowBuff as any).data as Record<string, number | string>
+        // Without row/variant scoping, only keep talent-scoped keys to avoid globally over-buffing
+        // generic stats like `cdmg` from node-local blocks.
+        if (!/^(e|q)/.test(buffKey)) return null
+        return dataOut
+      })()
+      if (!sink) continue
+      const existing = sink[buffKey]
+      if (existing !== undefined) {
+        const canon = (v: number | string): string => String(v).replace(/\s+/g, '')
+        if (typeof existing === 'number' && typeof scaled === 'number') {
+          if (Math.abs(existing - scaled) < 1e-9) continue
+        } else if (typeof existing === 'string' && typeof scaled === 'string') {
+          if (canon(existing) === canon(scaled)) continue
+        }
+      }
+      sink[buffKey] = mergeBuffValue(existing, scaled as any)
+    }
+  }
+
+  const out: CalcSuggestBuff[] = []
+  if (Object.keys(dataOut).length) out.push({ title: 'upstream:genshin-optimizer(node-premod)', data: dataOut })
+  for (const b of rowByParamKey.values()) {
+    const data = (b as any)?.data
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    if (Object.keys(data).length === 0) continue
+    out.push(b)
+  }
+  for (const b of variantByParamKey.values()) {
+    const data = (b as any)?.data
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    if (Object.keys(data).length === 0) continue
+    out.push(b)
+  }
+  return out
+}
+
 function pushObjectEntries(out: Map<string, string[]>, block: string): void {
   if (!block) return
   const entries = parseObjectLiteralEntries(block)
@@ -921,6 +1466,7 @@ function mapTotalKeyToMiaoBuffKey(key: string): string | null {
   if (k === 'atk') return 'atkPlus'
   if (k === 'hp') return 'hpPlus'
   if (k === 'def') return 'defPlus'
+  if (k === 'eleMas') return 'mastery'
   return null
 }
 
@@ -940,7 +1486,7 @@ function buffScale(buffKey: string): number {
   if (/Dmg$/.test(buffKey)) return 100
   if (/Cpct$/.test(buffKey)) return 100
   if (/Cdmg$/.test(buffKey)) return 100
-  if (/^(cpct|cdmg|dmg|phy|heal|recharge|shield|enemyDef|enemyIgnore|ignore)$/.test(buffKey)) return 100
+  if (/^(cpct|cdmg|dmg|phy|heal|recharge|shield|enemyDef|enemyIgnore|ignore|kx)$/.test(buffKey)) return 100
   return 1
 }
 
@@ -952,6 +1498,8 @@ function translateGsExpr(
     dmConstNums: Map<string, number>
     skillParam: any
     condVarInfo?: Map<string, CondVarInfo>
+    charKey?: string
+    elem: string
   },
   stack = new Set<string>(),
   depth = 0
@@ -959,6 +1507,21 @@ function translateGsExpr(
   if (depth > 20) return ''
   let expr = normalizeExprGs(stripJsComments(exprRaw)).replace(/,$/, '').trim()
   if (!expr) return ''
+
+  // Upstream "target" element gates (team buffs that only apply to certain elements).
+  // miao-plugin provides `attr.element` (raw elem key, e.g. 'pyro') and `element` (display name, e.g. '火').
+  if (
+    expr === 'input.charKey' ||
+    expr === 'input?.charKey' ||
+    expr === 'input.activeCharKey' ||
+    expr === 'input?.activeCharKey' ||
+    expr === 'target.charKey' ||
+    expr === 'target?.charKey'
+  ) {
+    return JSON.stringify(String(opts.charKey || '').trim())
+  }
+
+  if (expr === 'target.charEle' || expr === 'target?.charEle') return JSON.stringify(String(opts.elem || '').trim().toLowerCase())
 
   // `tally.*` represents teammate-count / team-aggregate values in genshin-optimizer.
   // miao-plugin runtime has no such concept; approximate with "showcase-like" assumptions:
@@ -1215,6 +1778,11 @@ function translateGsExpr(
       const pass = t(args[2] || '')
       if (!pass) return '0'
 
+      // Team/tally comparisons (e.g. "only Pyro+Electro team") are common in upstream `teamBuff` nodes.
+      // miao-plugin calc.js has no team model; for baseline-style showcase outputs, assume such requirements
+      // are satisfied so the corresponding kit buffs are visible.
+      if (/^tally\./.test(v1Raw) || /^tally\./.test(v2Raw)) return pass
+
       const cond = (raw: string): { varName: string; info: CondVarInfo } | null => {
         const varName = String(raw || '').trim()
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) return null
@@ -1230,6 +1798,22 @@ function translateGsExpr(
         const picked = c1 && s2 ? { c: c1, state: s2 } : { c: c2!, state: s1! }
         const key = inferCondStateParamKey(picked.c.info, picked.state, picked.c.varName)
         const access = renderParamAccess(key)
+        // Baseline meta tends to assume many upstream "toggle" conditions are enabled unless explicitly modeled.
+        // Keep the classic default-off semantics for common global state flags (`e/q/halfHp/...`), but treat most
+        // other `"on"` toggles as default-on (params.<key> === false disables).
+        const keepDefaultOff = new Set([
+          'e',
+          'q',
+          'half',
+          'halfHp',
+          'lowHp',
+          'long',
+          'off_field',
+          'offField',
+          'inField'
+        ])
+        const wantsDefaultOn = picked.state === 'on' && !keepDefaultOff.has(key)
+        if (wantsDefaultOn) return `((${access}) === false ? 0 : (${pass}))`
         return `((${access}) ? (${pass}) : 0)`
       }
 
@@ -1347,11 +1931,57 @@ function translateGsExpr(
         return t(body)
       }
 
+      const resolveFromEntriesBody = (fromEntriesExpr: string): string => {
+        const open = fromEntriesExpr.indexOf('(')
+        const feArgs = extractCallArgs(fromEntriesExpr, open, 2)
+        if (!feArgs.length) return ''
+        const inner = String(feArgs[0] || '').trim()
+        if (!inner) return ''
+
+        const idxMap = inner.indexOf('.map')
+        if (idxMap < 0) return ''
+        const arrExpr = inner.slice(0, idxMap).trim()
+        const maxExpr = resolveRangeMax(arrExpr)
+        if (!maxExpr) return ''
+
+        const openMapParen = inner.indexOf('(', idxMap)
+        if (openMapParen < 0) return ''
+        const mapArgs = extractCallArgs(inner, openMapParen, 3)
+        const arrowExpr = String(mapArgs[0] || '').trim()
+        if (!arrowExpr) return ''
+
+        const idxArrow = arrowExpr.indexOf('=>')
+        if (idxArrow < 0) return ''
+        const paramPart = arrowExpr.slice(0, idxArrow).trim().replace(/^\(|\)$/g, '').trim()
+        const param = /^[A-Za-z_][A-Za-z0-9_]*$/.test(paramPart) ? paramPart : ''
+        let body = arrowExpr.slice(idxArrow + 2).trim()
+        if (body.startsWith('{')) {
+          const mRet = /\breturn\s+([^;]+);?/.exec(body)
+          if (!mRet) return ''
+          body = mRet[1]!.trim()
+        }
+        if (!body) return ''
+
+        // Expected: `[key, value]` tuple; pick the value part.
+        let valueExpr = body
+        const idxBracket = body.indexOf('[')
+        if (idxBracket >= 0 && body.trim().startsWith('[')) {
+          const tuple = extractCallArgs(body, idxBracket, 3)
+          if (tuple.length >= 2) valueExpr = tuple[1]!
+        }
+        if (param) valueExpr = valueExpr.replace(new RegExp(`\\b${escapeRegExp(param)}\\b`, 'g'), `(${maxExpr})`)
+        return t(valueExpr)
+      }
+
       const tableInit =
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(tableRaw) && opts.constInits.get(tableRaw)
           ? String(opts.constInits.get(tableRaw))
           : tableRaw
       const tableInitTrim = String(tableInit || '').trim()
+      if (/^Object\.fromEntries\s*\(/.test(tableInitTrim)) {
+        const bodyExpr = resolveFromEntriesBody(tableInitTrim)
+        return bodyExpr || t(defaultRaw) || '0'
+      }
       if (/^objKeyMap\s*\(/.test(tableInitTrim)) {
         const bodyExpr = resolveObjKeyMapBody(tableInit)
         return bodyExpr || t(defaultRaw) || '0'
@@ -1482,6 +2112,7 @@ export function buildGsUpstreamDirectBuffs(opts: {
   projectRootAbs: string
   id?: number
   elem: string
+  input?: CalcSuggestInput
   upstream?: {
     genshinOptimizerRoot?: string
     includeTeamBuffs?: boolean
@@ -1501,9 +2132,11 @@ export function buildGsUpstreamDirectBuffs(opts: {
     id,
     genshinOptimizerRootAbs: rootAbs
   })
-  if (!ctx?.file) return []
 
-  const fileAbs = path.join(rootAbs, ...ctx.file.split('/'))
+  const fileAbs =
+    (ctx?.file && path.join(rootAbs, ...ctx.file.split('/'))) ||
+    resolveTravelerCharSheetFileAbs({ genshinOptimizerRootAbs: rootAbs, elem: opts.elem, input: opts.input })
+  if (!fileAbs) return []
   if (!fs.existsSync(fileAbs)) return []
 
   let text = ''
@@ -1513,12 +2146,16 @@ export function buildGsUpstreamDirectBuffs(opts: {
     return []
   }
 
+  // Most upstream sheets declare: `const key = 'Foo'` (CharacterKey / CharacterSheetKey).
+  // Some modular sheets (notably traveler element files) instead reference skillParam explicitly:
+  // `allStats.char.skillParam.TravelerAnemoF` without defining `const key`.
   const mKey = /\bconst\s+key\b[^=]*=\s*['"]([^'"]+)['"]/.exec(text)
-  const charKey = mKey?.[1]?.trim() || ''
-  if (!charKey) return []
+  const mSkillParamKey = /\ballStats\.char\.skillParam\.([A-Za-z0-9_]+)\b/.exec(text)
+  const skillParamKey = (mKey?.[1] || mSkillParamKey?.[1] || '').trim()
+  if (!skillParamKey) return []
 
   const allStats = loadAllStats(rootAbs)
-  const skillParam = allStats?.char?.skillParam?.[charKey]
+  const skillParam = allStats?.char?.skillParam?.[skillParamKey]
   if (!skillParam || typeof skillParam !== 'object') return []
 
   const idxDm = text.indexOf('const dm')
@@ -1526,6 +2163,7 @@ export function buildGsUpstreamDirectBuffs(opts: {
   const dmBlock = idxDmBrace >= 0 ? extractBraceBlock(text, idxDmBrace) : ''
   const dmMap = dmBlock ? parseDmMapping(dmBlock) : new Map<string, string>()
   const dmConstNums = dmBlock ? parseDmConstNumbers(dmBlock) : new Map<string, number>()
+  if (dmBlock) augmentDmConstNumbersWithComputedArrays(dmBlock, skillParam, dmConstNums)
 
   const includeTeamBuffs = Boolean(opts.upstream?.includeTeamBuffs)
   const premodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs: false })
@@ -1533,14 +2171,12 @@ export function buildGsUpstreamDirectBuffs(opts: {
   const totalCandidates = extractObjectEntryCandidates(text, 'total:', { includeTeamBuffs: false })
   const teamPremodCandidates = extractTeamBuffEntryCandidates(text, 'premod')
   const teamTotalCandidates = extractTeamBuffEntryCandidates(text, 'total')
-  const nodeLocalPremodCandidates = extractObjectEntryCandidates(text, 'premod:', { includeTeamBuffs: false, includeNodeLocal: true })
   if (
     premodCandidates.size === 0 &&
     baseCandidates.size === 0 &&
     totalCandidates.size === 0 &&
     teamPremodCandidates.size === 0 &&
-    teamTotalCandidates.size === 0 &&
-    nodeLocalPremodCandidates.size === 0
+    teamTotalCandidates.size === 0
   ) {
     return []
   }
@@ -1564,7 +2200,8 @@ export function buildGsUpstreamDirectBuffs(opts: {
   const applyCandidates = (
     candidates: Map<string, string[]>,
     mapKey: (rawKey: string) => string | null,
-    dataOut: Record<string, number | string>
+    dataOut: Record<string, number | string>,
+    wrap?: (v: { rawKey: string; buffKey: string; expr: number | string; sourceExpr: string }) => number | string
   ): void => {
     for (const [rawKey, values] of candidates.entries()) {
       const buffKey = mapKey(rawKey)
@@ -1575,13 +2212,23 @@ export function buildGsUpstreamDirectBuffs(opts: {
       // Prefer later occurrences (dataObjForCharacterSheet premod/base blocks tend to come later than node-local ones).
       for (let i = values.length - 1; i >= 0; i--) {
         const value = values[i]!
-        const expr = translateGsExpr(value, { constInits, dmMap, dmConstNums, skillParam, condVarInfo })
+        const sourceExpr = String(value || '').trim()
+        const expr = translateGsExpr(value, {
+          constInits,
+          dmMap,
+          dmConstNums,
+          skillParam,
+          condVarInfo,
+          charKey: skillParamKey,
+          elem: opts.elem
+        })
         if (!expr) continue
 
         const scaled = scaleExpr(expr, buffScale(buffKey))
         if (typeof scaled === 'number') {
           if (!Number.isFinite(scaled) || scaled === 0) continue
-          dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], scaled)
+          const next = wrap ? wrap({ rawKey, buffKey, expr: scaled, sourceExpr }) : scaled
+          dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], next)
           break
         }
 
@@ -1590,7 +2237,8 @@ export function buildGsUpstreamDirectBuffs(opts: {
         // Spread/rest fragments are not representable in miao-plugin runtime; keep upstream-direct deterministic.
         if (/\.\.\./.test(t)) continue
         if (hasUnknownFreeIdentifiers(t)) continue
-        dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], t)
+        const next = wrap ? wrap({ rawKey, buffKey, expr: t, sourceExpr }) : t
+        dataOut[buffKey] = mergeBuffValue(dataOut[buffKey], next)
         break
       }
     }
@@ -1602,9 +2250,18 @@ export function buildGsUpstreamDirectBuffs(opts: {
     applyCandidates(teamPremodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
     applyCandidates(teamTotalCandidates, mapTotalKeyToMiaoBuffKey, dataTotal)
   } else {
-    // Keep a conservative subset: teamBuff entries that map to ability-scoped buckets (a/a2/a3/e/q).
-    const isAbilityScoped = (buffKey: string): boolean => /^(a|a2|a3|e|q|nightsoul)/.test(buffKey)
-    const applyTeamAbilityOnly = (
+    // Keep a conservative subset even when team buffs are disabled:
+    // - include ability-scoped buckets (a/e/q...) as before
+    // - include a few baseline-critical global keys (atkPct/kx/dmg/crit...), which are often modeled as `teamBuff`
+    //   in upstream but still affect the caster and are used by baseline panel showcases.
+    const isConservativeTeamBuffKey = (buffKey: string): boolean => {
+      if (/^(a|a2|a3|e|q|nightsoul)/.test(buffKey)) return true
+      if (/^(atk|hp|def)(Pct|Plus)$/.test(buffKey)) return true
+      if (/^(recharge|mastery|cpct|cdmg|dmg|dmgPlus|phy|heal|shield|kx|enemyDef|enemyIgnore|ignore)$/.test(buffKey))
+        return true
+      return false
+    }
+    const applyTeamConservative = (
       candidates: Map<string, string[]>,
       mapKey: (rawKey: string) => string | null,
       dataOut: Record<string, number | string>
@@ -1613,51 +2270,91 @@ export function buildGsUpstreamDirectBuffs(opts: {
       for (const [rawKey, values] of candidates.entries()) {
         const buffKey = mapKey(rawKey)
         if (!buffKey) continue
-        if (!isAbilityScoped(buffKey)) continue
+        if (!isConservativeTeamBuffKey(buffKey)) continue
         filtered.set(rawKey, values)
       }
-      applyCandidates(filtered, mapKey, dataOut)
-    }
-    applyTeamAbilityOnly(teamPremodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
-  }
 
-  // Best-effort: lift a conservative subset of node-local premods into global buffs to match baseline expectations.
-  // Keep this narrow to avoid over-buffing (node-local premods can be hit-scoped).
-  try {
-    for (const [rawKey0, values] of nodeLocalPremodCandidates.entries()) {
-      const rawKey = String(rawKey0 || '').trim()
-      if (!rawKey) continue
-      if (!/^(skill|burst)_/i.test(rawKey)) continue
-      if (!Array.isArray(values) || values.length === 0) continue
+      // Baseline convention: many kit-provided "teamBuff dmg%" nodes are showcased as burst-state effects.
+      // Keep them behind `params.q` only when upstream cond metadata strongly suggests "afterUse.burst" semantics.
+      const wrap = (v: { rawKey: string; buffKey: string; expr: number | string; sourceExpr: string }): number | string => {
+        const { buffKey, expr, sourceExpr } = v
+        if (buffKey !== 'dmg' && buffKey !== 'dmgPlus') return expr
 
-      const buffKey = mapPremodKeyToMiaoBuffKey(opts.elem, rawKey)
-      if (!buffKey) continue
-      if (!isAllowedMiaoBuffDataKey('gs', buffKey)) continue
-      // Fallback-only: do not override global premod.
-      if (Object.prototype.hasOwnProperty.call(dataPremod, buffKey)) continue
+        const shouldGateByQ = (() => {
+          const expand = (expr0: string): string => {
+            let out = String(expr0 || '').trim()
+            const seen = new Set<string>()
+            const stop = new Set<string>([
+              'Math',
+              'input',
+              'target',
+              'dm',
+              'const',
+              'true',
+              'false',
+              'null',
+              'undefined',
+              'Infinity',
+              'NaN'
+            ])
+            for (let i = 0; i < 6; i++) {
+              let changed = false
+              out = out.replace(/\b[A-Za-z_][A-Za-z0-9_]*\b/g, (id0) => {
+                const id = String(id0 || '').trim()
+                if (!id || stop.has(id) || seen.has(id)) return id0
+                const init = constInits.get(id)
+                if (!init) return id0
+                seen.add(id)
+                changed = true
+                return `(${init})`
+              })
+              if (!changed) break
+            }
+            return out
+          }
 
-      const uniq = new Map<string, number | string>()
-      for (const vRaw of values) {
-        const expr = translateGsExpr(vRaw, { constInits, dmMap, dmConstNums, skillParam, condVarInfo })
-        if (!expr) continue
+          const cur = expand(sourceExpr)
 
-        const scaled = scaleExpr(expr, buffScale(buffKey))
-        if (typeof scaled === 'number') {
-          if (!Number.isFinite(scaled) || scaled === 0) continue
-          uniq.set(`n:${scaled}`, scaled)
-          continue
-        }
+          for (const [varName, info] of condVarInfo.entries()) {
+            if (!varName) continue
+            if (!new RegExp(`\\b${escapeRegExp(varName)}\\b`).test(cur)) continue
+            const nk = String(info.nameKey || '').toLowerCase()
+            if (nk.includes('burst')) return true
+          }
+          return false
+        })()
 
-        const t = String(scaled || '').trim()
-        if (!t || t === '0' || t === '(0)') continue
-        if (/\.\.\./.test(t)) continue
-        if (hasUnknownFreeIdentifiers(t)) continue
-        uniq.set(`s:${t}`, t)
+        if (!shouldGateByQ) return expr
+        const inner = typeof expr === 'number' ? String(expr) : String(expr || '').trim()
+        if (!inner || inner === '0' || inner === '(0)') return expr
+        return `(params.q ? (${inner}) : 0)`
       }
 
-      if (uniq.size !== 1) continue
-      dataPremod[buffKey] = Array.from(uniq.values())[0]!
+      applyCandidates(filtered, mapKey, dataOut, wrap)
     }
+    applyTeamConservative(teamPremodCandidates, (k) => mapPremodKeyToMiaoBuffKey(opts.elem, k), dataPremod)
+    applyTeamConservative(teamTotalCandidates, mapTotalKeyToMiaoBuffKey, dataTotal)
+  }
+
+  // Node-local premods: apply to specific dmgNode rows only.
+  // Build check-gated buffs keyed by `currentTalent` to avoid over-buffing unrelated rows.
+  const nodeLocalBuffs: CalcSuggestBuff[] = []
+  try {
+    const globalKeys = new Set(Object.keys(dataPremod))
+    nodeLocalBuffs.push(
+      ...extractNodeLocalPremodBuffsFromDmgNodes({
+        text,
+        elem: opts.elem,
+        charKey: skillParamKey,
+        constInits,
+        dmMap,
+        dmConstNums,
+        skillParam,
+        condVarInfo,
+        tableValues: (opts.input as any)?.tableValues,
+        globalKeys
+      })
+    )
   } catch {
     // best-effort
   }
@@ -1666,6 +2363,7 @@ export function buildGsUpstreamDirectBuffs(opts: {
 
   const buffs: CalcSuggestBuff[] = []
   if (Object.keys(dataPremod).length) buffs.push({ title: 'upstream:genshin-optimizer(premod)', data: dataPremod })
+  if (nodeLocalBuffs.length) buffs.push(...nodeLocalBuffs)
   if (Object.keys(dataTotal).length) buffs.push({ title: 'upstream:genshin-optimizer(total)', data: dataTotal })
   return buffs
 }

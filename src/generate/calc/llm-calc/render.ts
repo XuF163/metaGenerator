@@ -419,7 +419,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
 	      ? 'const toRatio = (v) => { const n = Number(v); return Number.isFinite(n) ? n / 100 : 0 }\n'
 	      : 'const toRatio = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }\n'
 
-	  const inferDefParams = (): Record<string, unknown> | undefined => {
+  const inferDefParams = (): Record<string, unknown> | undefined => {
     if (input.game === 'sr') {
       const out: Record<string, unknown> = {}
 
@@ -642,6 +642,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     // - Enable boolean state flags referenced by buffs when they appear in any detail params
     // - For simple numeric stack params, default to the max numeric value present in any detail params
     const paramKeysInBuff = new Set<string>()
+    const boolDefaultFalseKeys = new Set<string>()
     const minRequired: Record<string, number> = {}
     const collectParamRefs = (expr: string): void => {
       const re = /\bparams\.([A-Za-z_][A-Za-z0-9_]*)/g
@@ -650,6 +651,24 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         const k = m[1]
         if (!k) continue
         paramKeysInBuff.add(k)
+      }
+    }
+    const collectBoolDefaultFalse = (exprRaw: unknown): void => {
+      const expr = typeof exprRaw === 'string' ? String(exprRaw) : ''
+      if (!expr) return
+      const patterns: RegExp[] = [
+        /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b\s*\)*\s*\?/g,
+        /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b\s*\)*\s*&&/g,
+        /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b\s*\)*\s*\|\|/g,
+        /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b\s*\)*\s*===\s*true\b/g,
+        /\bparams\.([A-Za-z_][A-Za-z0-9_]*)\b\s*\)*\s*==\s*true\b/g
+      ]
+      for (const re of patterns) {
+        for (const m of expr.matchAll(re)) {
+          const k = String(m[1] || '').trim()
+          if (!k) continue
+          boolDefaultFalseKeys.add(k)
+        }
       }
     }
     const collectParamThresholds = (expr: string): void => {
@@ -671,15 +690,20 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       if (typeof (b as any).check === 'string') {
         collectParamRefs((b as any).check)
         collectParamThresholds((b as any).check)
+        collectBoolDefaultFalse((b as any).check)
       }
       const data = (b as any).data
       if (data && typeof data === 'object' && !Array.isArray(data)) {
         for (const v of Object.values(data as Record<string, unknown>)) {
-          if (typeof v === 'string') collectParamRefs(v)
+          if (typeof v === 'string') {
+            collectParamRefs(v)
+            collectBoolDefaultFalse(v)
+          }
         }
       }
     }
 
+    const keysInDetails = new Set<string>()
     const numMax: Record<string, number> = {}
     for (const d of plan.details || []) {
       const p = (d as any).params
@@ -687,6 +711,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       for (const [k0, v] of Object.entries(p as Record<string, unknown>)) {
         const k = String(k0 || '').trim()
         if (!k) continue
+        keysInDetails.add(k)
         if (typeof v === 'number' && Number.isFinite(v)) {
           numMax[k] = Math.max(numMax[k] ?? -Infinity, v)
         }
@@ -736,6 +761,44 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
       }
     }
 
+    // Default some state-like boolean params to true when upstream-derived buffs gate on `params.xxx ? ... : 0`
+    // but no detail provides `params.xxx`, otherwise those buffs are permanently dead in showcases.
+    if (boolDefaultFalseKeys.size) {
+      const banned = new Set([
+        'half',
+        'halfHp',
+        'lowHp',
+        'targetHp50',
+        'targetHp80',
+        'hpBelow50',
+        'hpAbove50',
+        'hpAbove50Count',
+        'Moonsign',
+        'Nightsoul',
+        'Hexenzirkel',
+        'elementTypes',
+        'team_element_count',
+        'teamElementCount',
+        'type',
+        'idx',
+        'index'
+      ])
+      const isStateLike = (k: string): boolean =>
+        /(?:state|buff|mode|stance|field|eye|enhanced|infus|active)/i.test(k) || /^skillEye$/i.test(k)
+
+      for (const k0 of boolDefaultFalseKeys) {
+        const k = String(k0 || '').trim()
+        if (!k) continue
+        if (k in out) continue
+        if (banned.has(k)) continue
+        if (k === 'e' || k === 'q') continue
+        if (/^c\d+$/i.test(k)) continue
+        if (keysInDetails.has(k)) continue
+        if (!isStateLike(k)) continue
+        out[k] = true
+      }
+    }
+
     // Moonsign is a special "state" param that can also affect artifact-set buffs.
     // If any detail already sets Moonsign explicitly, do NOT default it globally via defParams,
     // otherwise unrelated rows (e.g. mastery-scaling E) may be inflated.
@@ -752,6 +815,125 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     }
 
     return Object.keys(out).length ? out : undefined
+  }
+
+  const srInferRepeatHitsExpr = (opts: { talent: string; tableName: string; title: string }): string | null => {
+    if (input.game !== 'sr') return null
+    const talent = String(opts.talent || '').trim()
+    const tableName = String(opts.tableName || '').trim()
+    const titleNorm = normalizePromptText(opts.title)
+    const tableNorm = normalizePromptText(tableName)
+    if (!talent || !tableName) return null
+
+    const hint = `${titleNorm} ${tableNorm}`
+    if (!/伤害/.test(hint)) return null
+    // Per-hit rows should stay per-hit unless explicitly marked as total.
+    if (/(?:单次|单段|每次|每段|每跳|每次伤害|每段伤害)/.test(titleNorm)) return null
+    // SR memosprite kits: rows explicitly labeled "随机单体" are per-hit instances, not totals.
+    // (Totals should be provided as dedicated "(完整/合计/总计)" rows.)
+    if (/^m[et]\d*$/.test(talent) && /随机单体/.test(titleNorm)) return null
+
+    // Array/object tables (e.g. [pct, hits]) are handled by table schema logic; do not double-count here.
+    const sampleMap = (input.tableSamples as any)?.[talent]
+    const sample = sampleMap && typeof sampleMap === 'object' && !Array.isArray(sampleMap) ? sampleMap[tableName] : undefined
+    if (Array.isArray(sample) || (sample && typeof sample === 'object')) return null
+
+    const dmgTableCount = (() => {
+      const allTablesRaw = (input.tables as any)?.[talent]
+      const allTables = Array.isArray(allTablesRaw) ? allTablesRaw.map(String) : []
+      const dmgTables = allTables.filter((name) => {
+        const t = normalizePromptText(name)
+        if (!t) return false
+        if (!/伤害/.test(t)) return false
+        if (/(削韧|回复|治疗|护盾|固定值)/.test(t)) return false
+        return true
+      })
+      return dmgTables.length
+    })()
+
+    const isRepeatComponentHint = /(随机|额外|追加|弹跳|追击|溅射)/.test(hint)
+
+    const desc = normalizePromptText((input.talentDesc as any)?.[talent])
+    if (!desc) return null
+
+    const pickBaseHits = (): number | null => {
+      // 1) Explicit "...额外造成 N 次伤害": common for multi-hit skills (1 + N) and for repeated sub-components (N).
+      const mExtra = /额外造成\s*([0-9]+)\s*次(?:伤害|攻击)/.exec(desc)
+      if (mExtra) {
+        const n = Number(mExtra[1])
+        if (Number.isFinite(n) && n >= 1 && n <= 30) {
+          if (isRepeatComponentHint) return n
+          if (dmgTableCount === 1) return 1 + n
+        }
+      }
+
+      // 2) Generic "造成 N 次/段…" wording:
+      // - allow for explicit repeat-component rows even when the talent has multiple damage tables;
+      // - otherwise only apply when the talent has a single damage table to avoid over-counting mixed kits.
+      const allowGeneric = isRepeatComponentHint || dmgTableCount === 1
+      if (!allowGeneric) return null
+
+      const re = /造成\s*([0-9]+)\s*(?:次|段)\s*(?:伤害|攻击)/g
+      for (const m of desc.matchAll(re)) {
+        const idx = typeof (m as any).index === 'number' ? ((m as any).index as number) : -1
+        if (idx > 0) {
+          const prev = desc.slice(Math.max(0, idx - 2), idx)
+          if (prev.includes('额外') || prev.includes('追加')) continue
+        }
+        const n = Number(m[1])
+        if (Number.isFinite(n) && n >= 2 && n <= 30) return n
+      }
+
+      const reAtk = /攻击\s*([0-9]+)\s*次/g
+      for (const m of desc.matchAll(reAtk)) {
+        const n = Number(m[1])
+        if (Number.isFinite(n) && n >= 2 && n <= 30) return n
+      }
+
+      return null
+    }
+
+    const baseHits0 = pickBaseHits()
+    if (typeof baseHits0 !== 'number' || !Number.isFinite(baseHits0) || baseHits0 < 2 || baseHits0 > 30) return null
+    const baseHits = baseHits0
+
+    const core = (() => {
+      const src = titleNorm || tableNorm
+      const head = src.split(/[·•]/)[0] || ''
+      const t = head.replace(/[\s()（）【】[\]{}，,。.!！?？\-]/g, '').trim()
+      if (t.length >= 3) return t.slice(0, 4)
+      if (t.length >= 2) return t.slice(0, 2)
+      return ''
+    })()
+
+    const extraTerms: string[] = []
+    for (const h0 of input.buffHints || []) {
+      const h = normalizePromptText(h0)
+      const mCons = /([1-6])\s*(?:魂|命|星魂)\s*[:：]/.exec(h)
+      if (!mCons) continue
+      const consReq = Number(mCons[1])
+      if (!Number.isFinite(consReq) || consReq < 1 || consReq > 6) continue
+
+      // Only apply when the hint text looks related to this skill name (avoid global hit-count drift).
+      if (core) {
+        const short = core.slice(0, 2)
+        if (!h.includes(core) && (!short || !h.includes(short))) continue
+      }
+
+      const mDelta =
+        /额外.*?次数.*?增加\s*([0-9]+)\s*次/.exec(h) ||
+        /次数增加\s*([0-9]+)\s*次/.exec(h) ||
+        /额外造成.*?增加\s*([0-9]+)\s*次/.exec(h) ||
+        /攻击次数.*?增加\s*([0-9]+)\s*次/.exec(h)
+      if (!mDelta) continue
+      const delta = Number(mDelta[1])
+      if (!Number.isFinite(delta) || delta <= 0 || delta > 30) continue
+      extraTerms.push(`(cons >= ${Math.trunc(consReq)} ? ${Math.trunc(delta)} : 0)`)
+      if (extraTerms.length >= 3) break
+    }
+
+    if (!extraTerms.length) return String(Math.trunc(baseHits))
+    return `(${Math.trunc(baseHits)} + ${extraTerms.join(' + ')})`
   }
 
   const detailsLines: string[] = []
@@ -807,9 +989,7 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
           `    dmg: ({ talent, attr, calc, params, cons, weapon, trees, currentTalent }, { reaction }) => (${dmgExpr})`
         )
       } else {
-        detailsLines.push(
-          `    dmg: ({ talent, attr, calc, params, cons, weapon, trees, currentTalent }, dmg) => (${dmgExpr})`
-        )
+        detailsLines.push(`    dmg: ({ talent, attr, calc, params, cons, weapon, trees, currentTalent }, dmg) => (${dmgExpr})`)
       }
       detailsLines.push(idx === plan.details.length - 1 ? '  }' : '  },')
       return
@@ -921,9 +1101,12 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
     const inferDescBaseFor = (tkRaw: unknown): 'atk' | 'hp' | 'def' | 'mastery' => {
       const tk = String(tkRaw || '').trim()
       if (!tk) return 'atk'
-      // Normal attacks often have the broadest/least-structured descriptions (and can mention other mechanics
+      // GS normal attacks often have the broadest/least-structured descriptions (and can mention other mechanics
       // that do not affect the basic scaling table). Default to ATK unless per-table hints override it.
-      if (tk === 'a') return 'atk'
+      //
+      // SR basic attacks are usually ATK-scaling too, but some kits are explicitly HP/DEF-scaling in their A text
+      // while upstream tables may omit per-table unit hints. Allow desc inference for SR to avoid systematic undercount.
+      if (input.game === 'gs' && tk === 'a') return 'atk'
       return inferDmgBase((input.talentDesc as any)?.[tk])
     }
     const baseTalentOf = (tkRaw: unknown): string | null => {
@@ -981,15 +1164,17 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         ? 'atk'
         : descBase) ||
       'atk'
-    // SR: Remembrance/memosprite rows (me/mt) are commonly HP-based, and upstream tables often lack explicit
-    // per-table unit hints. When we see a Remembrance kit, bias me/mt to HP to avoid generating `dmg(...)`
-    // (ATK-based) and collapsing memosprite showcase numbers.
+    // SR: Remembrance/memosprite rows (me/mt) sometimes scale with HP/DEF, but not always (e.g. TB Memory memosprite is ATK-based).
+    // When per-table unit hints are missing, only bias away from ATK if the *description* strongly suggests HP/DEF scaling.
     if (input.game === 'sr' && kind === 'dmg' && !hasPerTableHint) {
       const tk = String(talent || '').trim()
       const isMem = /^m[et]/.test(tk)
       if (isMem) {
         const path = normalizePromptText(input.weapon)
-        if (/记忆/.test(path) && baseInferred === 'atk') baseInferred = 'hp'
+        if (/记忆/.test(path) && baseInferred === 'atk') {
+          if (/(生命上限|生命值上限|最大生命值|生命值)/.test(descNorm)) baseInferred = 'hp'
+          else if (/防御/.test(descNorm)) baseInferred = 'def'
+        }
       }
     }
     // SR: Basic attacks are ATK-scaling for the vast majority of kits. Some descriptions mention HP/DEF for other
@@ -1177,24 +1362,37 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
         `    check: ({ talent, attr, calc, params, cons, weapon, trees, currentTalent }) => (${d.check.trim()}),`
       )
     }
-	    detailsLines.push(`    dmg: ({ talent, attr, calc }, dmg) => {`)
+
+    const hitMulExpr =
+      kind === 'dmg' && input.game === 'sr'
+        ? srInferRepeatHitsExpr({ talent: String(talent || ''), tableName, title: String(d.title || '') })
+        : null
+    const wantsHitMul = typeof hitMulExpr === 'string' && !!hitMulExpr.trim()
+    const mul = wantsHitMul ? ' * hitMul' : ''
+
+	    detailsLines.push(
+      wantsHitMul
+        ? `    dmg: ({ talent, attr, calc, params, cons, weapon, trees, currentTalent }, dmg) => {`
+        : `    dmg: ({ talent, attr, calc }, dmg) => {`
+    )
 	    detailsLines.push(`      const { basic } = dmg`)
 	    detailsLines.push(`      const t = talent.${talent}[${table}]`)
+    if (wantsHitMul) detailsLines.push(`      const hitMul = Math.max(1, ${hitMulExpr.trim()})`)
 	    detailsLines.push(`      if (Array.isArray(t)) {`)
 	    if (typeof pick === 'number' && Number.isFinite(pick)) {
 	      // Array variant selector (e.g. "低空/高空..." or "X/Y..." tables).
 	      detailsLines.push(`        const v = Number(t[${Math.max(0, Math.min(10, pick))}]) || 0`)
 	      if (useBasic) {
-	        detailsLines.push(`        return basic(calc(attr.${base}) * toRatio(v), ${keyArg}${eleArg})`)
+	        detailsLines.push(`        return basic(calc(attr.${base}) * toRatio(v)${mul}, ${keyArg}${eleArg})`)
 	      } else {
-	        detailsLines.push(`        return dmg(v, ${keyArg}${eleArg})`)
+	        detailsLines.push(`        return dmg(v${mul}, ${keyArg}${eleArg})`)
 	      }
 	    } else {
 	      const schema = inferArrayTableSchema(input, talent, tableName)
 	      if (schema?.kind === 'statStat') {
 	        const [s0, s1] = schema.stats
 	        detailsLines.push(
-	          `        return basic(calc(attr.${s0}) * toRatio(t[0]) + calc(attr.${s1}) * toRatio(t[1]), ${keyArg}${eleArg})`
+	          `        return basic((calc(attr.${s0}) * toRatio(t[0]) + calc(attr.${s1}) * toRatio(t[1]))${mul}, ${keyArg}${eleArg})`
 	        )
 	      } else if (schema?.kind === 'statTimes') {
           // e.g. [pct, hits] from `...2` tables where text sample is like "1.41%HP*5".
@@ -1206,49 +1404,49 @@ export function renderCalcJs(input: CalcSuggestInput, plan: CalcSuggestResult, c
             !/(?:单次|单段|每段|每跳|每次)/.test(titleHint)
           if (wantsTotal) {
             if (schema.stat === 'atk' && !useBasic) {
-              detailsLines.push(`        return dmg((Number(t[0]) || 0) * (Number(t[1]) || 0), ${keyArg}${eleArg})`)
+              detailsLines.push(`        return dmg(((Number(t[0]) || 0) * (Number(t[1]) || 0))${mul}, ${keyArg}${eleArg})`)
             } else {
               detailsLines.push(
-                `        return basic(calc(attr.${schema.stat}) * toRatio(t[0]) * (Number(t[1]) || 0), ${keyArg}${eleArg})`
+                `        return basic(calc(attr.${schema.stat}) * toRatio(t[0]) * (Number(t[1]) || 0)${mul}, ${keyArg}${eleArg})`
               )
             }
           } else {
             if (schema.stat === 'atk' && !useBasic) {
-              detailsLines.push(`        return dmg(Number(t[0]) || 0, ${keyArg}${eleArg})`)
+              detailsLines.push(`        return dmg((Number(t[0]) || 0)${mul}, ${keyArg}${eleArg})`)
             } else {
-              detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(t[0]), ${keyArg}${eleArg})`)
+              detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(t[0])${mul}, ${keyArg}${eleArg})`)
             }
           }
 	      } else if (schema?.kind === 'pctList') {
 	        detailsLines.push(`        const sum = t.reduce((acc, x) => acc + (Number(x) || 0), 0)`)
 	        if (schema.stat === 'atk' && !useBasic) {
-	          detailsLines.push(`        return dmg(sum, ${keyArg}${eleArg})`)
+	          detailsLines.push(`        return dmg(sum${mul}, ${keyArg}${eleArg})`)
 	        } else {
-	          detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(sum), ${keyArg}${eleArg})`)
+	          detailsLines.push(`        return basic(calc(attr.${schema.stat}) * toRatio(sum)${mul}, ${keyArg}${eleArg})`)
 	        }
 	      } else if (schema?.kind === 'statFlat') {
           // "[pct, flat]" (e.g. "%HP + 800" / "%ATK + 500"). Always render as a basic damage number.
           // NOTE: miao-plugin's `dmg()` does NOT accept array pctNum; passing arrays can yield NaN damage.
           detailsLines.push(
-            `        return basic(calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0), ${keyArg}${eleArg})`
+            `        return basic((calc(attr.${schema.stat}) * toRatio(t[0]) + (Number(t[1]) || 0))${mul}, ${keyArg}${eleArg})`
           )
 	      } else if (useBasic) {
 	        detailsLines.push(`        const base = calc(attr.${base})`)
 	        detailsLines.push(`        const v = Number(t[0]) || 0`)
-	        detailsLines.push(`        return basic(base * toRatio(v), ${keyArg}${eleArg})`)
+	        detailsLines.push(`        return basic(base * toRatio(v)${mul}, ${keyArg}${eleArg})`)
 	      } else {
           // Fallback: treat unknown arrays as variant lists and pick the first component as pctNum.
           // (Passing arrays into `dmg()` would yield NaN in miao-plugin runtime.)
           detailsLines.push(`        const v = Number(t[0]) || 0`)
-          detailsLines.push(`        return dmg(v, ${keyArg}${eleArg})`)
+          detailsLines.push(`        return dmg(v${mul}, ${keyArg}${eleArg})`)
 	      }
 	    }
 	    detailsLines.push(`      }`)
 	    if (useBasic) {
 	      detailsLines.push(`      const base = calc(attr.${base})`)
-	      detailsLines.push(`      return basic(base * toRatio(t), ${keyArg}${eleArg})`)
+	      detailsLines.push(`      return basic(base * toRatio(t)${mul}, ${keyArg}${eleArg})`)
 	    } else {
-	      detailsLines.push(`      return dmg(t, ${keyArg}${eleArg})`)
+	      detailsLines.push(`      return dmg(t${mul}, ${keyArg}${eleArg})`)
 	    }
 	    detailsLines.push(`    }`)
 	    detailsLines.push(idx === plan.details.length - 1 ? '  }' : '  },')
