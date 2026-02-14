@@ -204,25 +204,62 @@ function mergePlanBuffs(opts: {
     const shouldReplace =
       (opts.preferUpstream && source === 'upstream' && existing.source === 'base') ||
       (!opts.preferUpstream && source === 'base' && existing.source === 'upstream')
-    if (!shouldReplace) return
+    if (!shouldReplace) {
+      // Upstream can legitimately emit duplicate semantic buffs (SR `x` + `x.m` dual namespace, or multi-element RES_PEN).
+      // Do not drop them: merge by summing values so semantic totals stay aligned while keeping buff count stable.
+      if (opts.preferUpstream && source === 'upstream' && existing.source === 'upstream') {
+        const prev = out[existing.idx]
+        if (isRecord(prev)) {
+          const dataPrev = (prev as any).data
+          const dataNext = (buffRaw as any).data
+          if (isRecord(dataPrev) && isRecord(dataNext)) {
+            const add = (a: unknown, b: unknown): number | string => {
+              if (typeof a === 'number' && Number.isFinite(a) && typeof b === 'number' && Number.isFinite(b)) return a + b
+              const sa =
+                typeof a === 'number' && Number.isFinite(a) ? String(a) : typeof a === 'string' && a.trim() ? a.trim() : '0'
+              const sb =
+                typeof b === 'number' && Number.isFinite(b) ? String(b) : typeof b === 'string' && b.trim() ? b.trim() : '0'
+              if (sa === '0') return sb
+              if (sb === '0') return sa
+              return `((${sa}) + (${sb}))`
+            }
+            for (const [k0, v] of Object.entries(dataNext)) {
+              const k = String(k0 || '').trim()
+              if (!k) continue
+              if (Object.prototype.hasOwnProperty.call(dataPrev, k0)) (dataPrev as any)[k0] = add((dataPrev as any)[k0], v)
+              else (dataPrev as any)[k0] = v as any
+            }
+            ;(prev as any).data = dataPrev
+            out[existing.idx] = prev as any
+          }
+        }
+      }
+      return
+    }
 
     out[existing.idx] = buffRaw as unknown as CalcSuggestBuff
     seenBuff.set(sig, { idx: existing.idx, source })
   }
 
+  // Preserve string buff ids (e.g. GS reactions) regardless of upstream preference.
   for (const b of base) {
-    if (typeof b === 'string') {
-      pushStr(b)
-      continue
-    }
-    pushBuff(b, 'base')
+    if (typeof b === 'string') pushStr(b)
   }
 
-  for (const b of upstream) {
-    if (opts.preferUpstream) {
-      pushBuff(b, 'upstream')
-      continue
+  // Important: validatePlan() clamps to the first ~30 buff objects in order.
+  // When preferring upstream, place upstream buffs first so they are not dropped by the clamp.
+  if (opts.preferUpstream) {
+    for (const b of upstream) pushBuff(b, 'upstream')
+    for (const b of base) {
+      if (typeof b === 'string') continue
+      pushBuff(b, 'base')
     }
+  } else {
+    for (const b of base) {
+      if (typeof b === 'string') continue
+      pushBuff(b, 'base')
+    }
+    for (const b of upstream) {
 
     // Prefer heuristic when upstream is disabled: upstream total-stat nodes (e.g. Hu Tao's E: HP->ATK)
     // can duplicate heuristic buffs that already model the same conversion with proper params gating.
@@ -244,7 +281,8 @@ function mergePlanBuffs(opts: {
       if (Object.keys(next).length === 0) return null
       return { ...(b as any), data: next } as CalcSuggestBuff
     })()
-    if (filtered) pushBuff(filtered, 'upstream')
+      if (filtered) pushBuff(filtered, 'upstream')
+    }
   }
 
   return out.length ? out : undefined
@@ -258,6 +296,7 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
     genshinOptimizerRoot?: string
     hsrOptimizerRoot?: string
     includeTeamBuffs?: boolean
+    preferUpstreamDefaults?: boolean
     preferUpstream?: boolean
   }
 }): Promise<{ js: string; usedLlm: boolean; error?: string }> {
@@ -276,7 +315,8 @@ export async function buildCalcJsWithUpstreamDirect(opts: {
             input,
             upstream: {
               hsrOptimizerRoot: opts.upstream?.hsrOptimizerRoot,
-              includeTeamBuffs: opts.upstream?.includeTeamBuffs
+              includeTeamBuffs: opts.upstream?.includeTeamBuffs,
+              preferUpstreamDefaults: opts.upstream?.preferUpstreamDefaults
             }
           })
         : buildGsUpstreamDirectBuffs({

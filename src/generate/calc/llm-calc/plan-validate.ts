@@ -6912,7 +6912,11 @@ export function validatePlan(input: CalcSuggestInput, plan: CalcSuggestResult): 
     })
   }
 
-  if (wantsLaumaShowcase && input.game === 'gs') {
+  // NOTE: When following upstream directly, keep upstream-derived buffs as the source of truth.
+  // The Lauma showcase override below is a baseline-like heuristic intended for LLM channels and
+  // can incorrectly gate always-on upstream premods (e.g. A4 skill dmg bonus) or inject team-only
+  // debuffs (e.g. enemy RES shred) into the default context.
+  if (wantsLaumaShowcase && input.game === 'gs' && !input.upstreamDirect) {
     // Use deterministic, baseline-like param gates & buff math for Lauma.
     // This is derived from unique official table names / numeric rules (no baseline code reuse).
     buffsOut.length = 0
@@ -7962,7 +7966,9 @@ function rewriteGsBuffStatScalingConstRatiosToTalentTables(input: CalcSuggestInp
 
     if (!cands.length) return
 
-    const tol = 0.35 // percent points
+    // Only rewrite when the constant matches a talent-table entry *numerically*.
+    // Otherwise, we would drift from upstream semantics (some upstream ratios carry more precision than Hakush tables).
+    const tol = 1e-6 // percent points
     const findTableForPct = (stat: 'atk' | 'def' | 'hp', pct: number): Cand | null => {
       let best: Cand | null = null
       let hits = 0
@@ -8093,7 +8099,7 @@ function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
             if (isPercentLikeKey(k)) {
               const isBigDmgKey = k === 'dmg' || /Dmg$/.test(k)
               // SR: keep within js-validate bounds; tighten a few known buckets.
-              if (k === 'kx') (data as any)[k] = wrapClampExpr(expr, -80, 100)
+              if (k === 'kx') (data as any)[k] = wrapClampExpr(expr, -500, 500)
               else if (k === 'enemydmg') (data as any)[k] = wrapClampExpr(expr, -80, 250)
               else if (k === 'enemyDef' || k === 'enemyIgnore' || k === 'ignore') (data as any)[k] = wrapClampExpr(expr, 0, 120)
               else (data as any)[k] = wrapClampExpr(expr, -80, isBigDmgKey ? 5000 : 500)
@@ -8117,14 +8123,9 @@ function patchSrBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
               else if (Math.abs(v10) <= 500) v = v10
               else v = clamp(v, -500, 500)
             }
-            if (v < -80) v = -80
+            if (k !== 'kx' && v < -80) v = -80
 
             // SR-only tighter bounds for some debuff buckets.
-            if (k === 'kx' && Math.abs(v) > 100) {
-              const v100 = v / 100
-              if (Math.abs(v100) <= 100) v = v100
-              else v = clamp(v, -100, 100)
-            }
             if ((k === 'enemyDef' || k === 'enemyIgnore' || k === 'ignore') && Math.abs(v) > 120) {
               const v100 = v / 100
               if (Math.abs(v100) <= 120) v = v100
@@ -8196,17 +8197,18 @@ function patchGsBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
         const k = String(kRaw || '').trim()
         if (!k) continue
 
-        // Clamp runtime outputs (avoid rejecting whole LLM plans in js-validate).
-        if (typeof vRaw === 'string') {
-          const expr = vRaw.trim()
-          if (!expr) continue
-          if (isCritRateKey(k)) {
-            ;(data as any)[k] = wrapClampExpr(expr, 0, 100)
-          } else if (isPercentLikeKey(k)) {
-            // Keep within validator bounds; negative outgoing percent-like buffs are almost always misreads.
-            ;(data as any)[k] = wrapClampExpr(expr, -80, 500)
-          }
-          continue
+          // Clamp runtime outputs (avoid rejecting whole LLM plans in js-validate).
+          if (typeof vRaw === 'string') {
+            const expr = vRaw.trim()
+            if (!expr) continue
+            if (isCritRateKey(k)) {
+            // NOTE: allow negative crit rate (e.g. Kokomi's -100% crit) while staying within validator bounds.
+            ;(data as any)[k] = wrapClampExpr(expr, -100, 100)
+            } else if (isPercentLikeKey(k)) {
+              // Keep within validator bounds; negative outgoing percent-like buffs are almost always misreads.
+              ;(data as any)[k] = wrapClampExpr(expr, -80, 500)
+            }
+            continue
         }
 
         if (typeof vRaw !== 'number' || !Number.isFinite(vRaw)) continue
@@ -8214,11 +8216,8 @@ function patchGsBuffGateFieldsFromTitles(buffs: CalcSuggestBuff[]): void {
 
         if (isCritRateKey(k)) {
           v = rescalePercentLike(v, 100)
-          if (v < 0) {
-            delete (data as any)[k]
-            continue
-          }
-          v = clamp(v, 0, 100)
+          // NOTE: allow negative crit rate (e.g. Kokomi's -100% crit) while staying within validator bounds.
+          v = clamp(v, -100, 100)
         } else if (isPercentLikeKey(k)) {
           // Guardrail for unit mistakes like 6000% (should be 60%).
           v = rescalePercentLike(v, 500)

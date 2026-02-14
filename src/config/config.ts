@@ -38,6 +38,16 @@ export interface ToolConfig {
        */
       includeTeamBuffs?: boolean
       /**
+       * Whether to keep upstream param defaults as-is.
+       *
+       * Upstream optimizers often pick UI-centric defaults (buffs on / max stacks) that are not always desirable
+       * for single-avatar showcase meta. When set to false, we apply conservative overrides to reduce always-on
+       * state drift (baseline-like behavior).
+       *
+       * Default: true
+       */
+      preferUpstreamDefaults?: boolean
+      /**
        * When upstream-derived buff keys conflict with existing plan buffs, prefer upstream values.
        *
        * Default: true

@@ -314,7 +314,14 @@ function mapSrParamKey(kRaw: string): string {
   return k
 }
 
-function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<string, string> {
+function applySrDefaultsExprOverrides(
+  defaults: Record<string, string>,
+  opts?: { preferUpstreamDefaults?: boolean }
+): Record<string, string> {
+  // Default: keep upstream defaults as-is (align with upstream optimizer behavior).
+  // When preferUpstreamDefaults=false, apply conservative overrides to reduce always-on showcase drift.
+  if (opts?.preferUpstreamDefaults !== false) return { ...defaults }
+
   // Defaults are UI-centric in upstream optimizers and frequently assume "buffs on / max stacks" for convenience.
   // For meta showcase rows (and baseline-like behavior), prefer conservative defaults:
   // - stance/enhanced-state switches default to off
@@ -435,7 +442,11 @@ function applySrDefaultsExprOverrides(defaults: Record<string, string>): Record<
   return out
 }
 
-function extractDefaultsExprMap(text: string, constMap: Record<string, string>): Record<string, string> {
+function extractDefaultsExprMap(
+  text: string,
+  constMap: Record<string, string>,
+  opts?: { preferUpstreamDefaults?: boolean }
+): Record<string, string> {
   const idx = text.indexOf('const defaults')
   if (idx < 0) return {}
   const idxBrace = text.indexOf('{', idx)
@@ -473,7 +484,7 @@ function extractDefaultsExprMap(text: string, constMap: Record<string, string>):
     if (hasUnknownFreeIdentifiers(expr)) continue
     out[key] = expr
   }
-  return applySrDefaultsExprOverrides(out)
+  return applySrDefaultsExprOverrides(out, opts)
 }
 
 function applyDefaultsToParamsExpr(expr: string, defaults: Record<string, string>): string {
@@ -1234,6 +1245,7 @@ export function buildSrUpstreamDirectBuffs(opts: {
   upstream?: {
     hsrOptimizerRoot?: string
     includeTeamBuffs?: boolean
+    preferUpstreamDefaults?: boolean
   }
 }): CalcSuggestBuff[] {
   const id = typeof opts.id === 'number' && Number.isFinite(opts.id) ? Math.trunc(opts.id) : 0
@@ -1264,7 +1276,9 @@ export function buildSrUpstreamDirectBuffs(opts: {
   }
 
   const constMap = buildConstExprMap(text)
-  const defaultsExpr = extractDefaultsExprMap(text, constMap)
+  const defaultsExpr = extractDefaultsExprMap(text, constMap, {
+    preferUpstreamDefaults: opts.upstream?.preferUpstreamDefaults
+  })
   const abilityTypeAliases = extractAbilityTypeAliasesFromInitializeConfigurations(text)
 
   const blocks: string[] = []

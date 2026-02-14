@@ -38,6 +38,8 @@
       "hsrOptimizerRoot": "upstream/hsr-optimizer",
       "//includeTeamBuffs": "可选：是否包含上游的队友/团队 Buff（默认 false，避免引入队伍状态导致面板回归漂移）",
       "includeTeamBuffs": false,
+      "//preferUpstreamDefaults": "可选：是否保留上游 defaults（默认 true；false 时会改为更保守的 showcase/baseline-like defaults）",
+      "preferUpstreamDefaults": true,
       "//preferUpstream": "可选：当上游推导出的 buff 与现有计划冲突时，是否优先采用上游（默认 true）",
       "preferUpstream": true
     }

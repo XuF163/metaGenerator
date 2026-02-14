@@ -480,7 +480,8 @@ export function validateCalcJsRuntime(js: string, input: CalcSuggestInput): void
       // Large values are almost always a unit mistake (e.g. 3% -> 300).
       if (game === 'sr') {
         const abs = Math.abs(ret)
-        if (key === 'kx' && abs > 100) {
+        // NOTE: upstream SR kits can legitimately exceed 100% RES PEN in edge cases; keep within percent-like bounds.
+        if (key === 'kx' && abs > 500) {
           throw new Error(`buff.data() returned unreasonable kx value: ${key}=${ret}`)
         }
         if ((key === 'enemyDef' || key === 'enemyIgnore' || key === 'ignore') && abs > 120) {

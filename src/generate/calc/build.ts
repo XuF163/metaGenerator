@@ -28,6 +28,7 @@ export async function buildCalcJsWithChannel(opts: {
     genshinOptimizerRoot?: string
     hsrOptimizerRoot?: string
     includeTeamBuffs?: boolean
+    preferUpstreamDefaults?: boolean
     preferUpstream?: boolean
   }
 }): Promise<{ js: string; usedLlm: boolean; error?: string }> {
